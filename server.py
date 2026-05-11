@@ -221,7 +221,7 @@ async def shutdown():
 
 # ---------------- Auth routes ----------------
 @api_router.post("/auth/register")
-async def register(payload: UserRegister, admin: dict = Depends(require_role("admin"))):
+async def register(payload: UserRegister):
     email = payload.email.lower()
     existing = await db.users.find_one({"email": email})
     if existing:
