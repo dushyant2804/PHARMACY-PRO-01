@@ -23,6 +23,10 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 app = FastAPI(title="Pharmacy Management API")
+
+@app.get("/")
+def home():
+    return {"message": "Pharmacy backend is running"}
 api_router = APIRouter(prefix="/api")
 
 JWT_ALGORITHM = "HS256"
