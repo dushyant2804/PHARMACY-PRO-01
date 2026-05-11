@@ -4,3 +4,4 @@ python-dotenv
 bcrypt
 PyJWT
 motor
+email-validator
