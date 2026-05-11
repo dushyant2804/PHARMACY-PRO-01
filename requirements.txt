@@ -2,3 +2,4 @@ fastapi==0.110.1
 uvicorn==0.25.0
 python-dotenv
 bcrypt
+PyJWT
