@@ -189,7 +189,7 @@ class PaymentCreate(BaseModel):
     amount: float
     mode: str = "cash"
     notes: str = ""
-
+    date: str| None = None
 
 # ---------------- Startup ----------------
 @app.on_event("startup")
@@ -576,7 +576,7 @@ async def add_purchase(did: str, p: PaymentCreate, user: dict = Depends(require_
         "amount": p.amount,
         "mode": p.mode,
         "notes": p.notes,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": p.date or datetime.now(timezone.utc).isoformat(),
     }
     await db.distributor_transactions.insert_one(txn)
     txn.pop("_id", None)
@@ -592,7 +592,7 @@ async def add_dist_payment(did: str, p: PaymentCreate, user: dict = Depends(requ
         "amount": p.amount,
         "mode": p.mode,
         "notes": p.notes,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": p.date or datetime.now(timezone.utc).isoformat(),
     }
     await db.distributor_transactions.insert_one(txn)
     txn.pop("_id", None)
