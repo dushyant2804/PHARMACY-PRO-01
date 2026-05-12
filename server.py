@@ -550,6 +550,23 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
     return {"distributor": dist, "transactions": running, "balance": round(balance, 2)}
 
 
+@api_router.delete("/ledger/distributor/{did}/transaction/{txn_id}")
+async def delete_distributor_txn(
+    did: str,
+    txn_id: str,
+    user: dict = Depends(require_role("admin", "pharmacist"))
+):
+    result = await db.distributor_transactions.delete_one({
+        "id": txn_id,
+        "distributor_id": did
+    })
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    return {"ok": True}
+
+    
 @api_router.post("/ledger/distributor/{did}/purchase")
 async def add_purchase(did: str, p: PaymentCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
     txn = {
@@ -597,6 +614,23 @@ async def customer_ledger(cid: str, user: dict = Depends(get_current_user)):
             balance -= t["amount"]
         running.append({**t, "running_balance": round(balance, 2)})
     return {"customer": cust, "transactions": running, "balance": round(balance, 2)}
+
+
+@api_router.delete("/ledger/customer/{cid}/transaction/{txn_id}")
+async def delete_customer_txn(
+    cid: str,
+    txn_id: str,
+    user: dict = Depends(get_current_user)
+):
+    result = await db.customer_transactions.delete_one({
+        "id": txn_id,
+        "customer_id": cid
+    })
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    return {"ok": True}
 
 
 @api_router.post("/ledger/customer/{cid}/payment")
