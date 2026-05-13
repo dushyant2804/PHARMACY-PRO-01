@@ -633,19 +633,26 @@ async def delete_customer_txn(
     return {"ok": True}
 
 
-@api_router.post("/ledger/customer/{cid}/payment")
-async def add_cust_payment(cid: str, p: PaymentCreate, user: dict = Depends(get_current_user)):
+@api_router.post("/ledger/customer/{cid}/sale")
+async def add_customer_sale(
+    cid: str,
+    p: PaymentCreate,
+    user: dict = Depends(get_current_user)
+):
     txn = {
         "id": str(uuid.uuid4()),
         "customer_id": cid,
-        "type": "payment",
+        "type": "sale",
         "amount": p.amount,
         "mode": p.mode,
         "notes": p.notes,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": p.date or datetime.now(timezone.utc).isoformat(),
     }
+
     await db.customer_transactions.insert_one(txn)
+
     txn.pop("_id", None)
+
     return txn
 
 
