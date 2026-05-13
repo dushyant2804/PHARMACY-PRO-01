@@ -307,15 +307,15 @@ async def create_medicine(payload: MedicineCreate, user: dict = Depends(require_
         data["quantity"] = boxes * upb + loose
     elif data.get("quantity"):
         data["loose_units"] = int(data["quantity"])
-   current_boxes = int(data.get("current_boxes") or 0)
-   current_strips = int(data.get("current_strips") or 0)
-   current_loose = int(data.get("current_loose_units") or 0)
+        current_boxes = int(data.get("current_boxes") or 0)
+          current_strips = int(data.get("current_strips") or 0)
+          current_loose = int(data.get("current_loose_units") or 0)
 
-   data["current_quantity"] = (
-     (current_boxes * upb)
-     + current_strips
-     + current_loose
-   )
+          data["current_quantity"] = (
+            (current_boxes * upb)
+            + current_strips
+            + current_loose
+          )
     data["units_per_box"] = upb
     med = Medicine(**data)
     await db.medicines.insert_one(med.model_dump())
