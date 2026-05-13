@@ -633,7 +633,7 @@ async def delete_customer_txn(
     return {"ok": True}
 
 
-  @api_router.post("/ledger/customer/{cid}/payment")
+@api_router.post("/ledger/customer/{cid}/payment")
 async def add_cust_payment(
     cid: str,
     p: PaymentCreate,
@@ -677,7 +677,6 @@ async def add_customer_sale(
     txn.pop("_id", None)
 
     return txn
-
 
 # ---------------- Dashboard & Reports ----------------
 @api_router.get("/dashboard")
