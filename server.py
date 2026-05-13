@@ -129,6 +129,9 @@ class MedicineCreate(BaseModel):
     boxes: int = 0
     units_per_box: int = 1
     loose_units: int = 0
+    current_boxes: int = 0
+    current_strips: int = 0
+    current_loose_units: int = 0
     category: str = "OTC"
     gst_rate: float = 12.0
     barcode: Optional[str] = None
