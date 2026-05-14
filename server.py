@@ -304,6 +304,35 @@ async def list_medicines(
     return items
 
 
+@api_router.post("/historical-sales")
+async def create_historical_sale(
+    payload: HistoricalSaleCreate,
+    user: dict = Depends(require_role("admin", "pharmacist"))
+):
+    data = payload.model_dump()
+
+    total = (
+        float(data.get("cash_amount") or 0)
+        + float(data.get("upi_amount") or 0)
+        + float(data.get("pending_amount") or 0)
+    )
+
+    sale = {
+        "id": str(uuid.uuid4()),
+        "date": data["date"],
+        "cash_amount": data["cash_amount"],
+        "upi_amount": data["upi_amount"],
+        "pending_amount": data["pending_amount"],
+        "total_amount": total,
+        "notes": data.get("notes", ""),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await db.historical_sales.insert_one(sale)
+
+    return sale
+
+
 @api_router.post("/medicines")
 async def create_medicine(payload: MedicineCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
     data = payload.model_dump()
