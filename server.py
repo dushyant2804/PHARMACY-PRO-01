@@ -1086,38 +1086,59 @@ async def list_daily_sales(
 
 
 @api_router.get("/daily-sales/summary")
-async def daily_sales_summary(date: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def daily_sales_summary(
+    date: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
     target = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    items = await db.daily_sales.find({"sale_date": target}, {"_id": 0}).to_list(2000)
-   historical = await db.historical_sales.find(
-    {"date": target},
-    {"_id": 0}
-).to_list(2000)
-    live_total = sum(i.get("total_amount", 0) for i in items)
-live_paid = sum(
-    i.get("total_amount", 0)
-    for i in items
-    if i.get("payment_status") == "paid"
-)
-live_pending = sum(
-    i.get("total_amount", 0)
-    for i in items
-    if i.get("payment_status") == "pending"
-)
 
-historical_total = sum(h.get("total_amount", 0) for h in historical)
-historical_paid = sum(
-    (h.get("cash_amount", 0) + h.get("upi_amount", 0))
-    for h in historical
-)
-historical_pending = sum(
-    h.get("pending_amount", 0)
-    for h in historical
-)
+    items = await db.daily_sales.find(
+        {"sale_date": target},
+        {"_id": 0}
+    ).to_list(2000)
 
-total = live_total + historical_total
-paid = live_paid + historical_paid
-pending = live_pending + historical_pending
+    historical = await db.historical_sales.find(
+        {"date": target},
+        {"_id": 0}
+    ).to_list(2000)
+
+    live_total = sum(
+        i.get("total_amount", 0)
+        for i in items
+    )
+
+    live_paid = sum(
+        i.get("total_amount", 0)
+        for i in items
+        if i.get("payment_status") == "paid"
+    )
+
+    live_pending = sum(
+        i.get("total_amount", 0)
+        for i in items
+        if i.get("payment_status") == "pending"
+    )
+
+    historical_total = sum(
+        h.get("total_amount", 0)
+        for h in historical
+    )
+
+    historical_paid = sum(
+        h.get("cash_amount", 0)
+        + h.get("upi_amount", 0)
+        for h in historical
+    )
+
+    historical_pending = sum(
+        h.get("pending_amount", 0)
+        for h in historical
+    )
+
+    total = live_total + historical_total
+    paid = live_paid + historical_paid
+    pending = live_pending + historical_pending
+
     return {
         "date": target,
         "count": len(items) + len(historical),
@@ -1125,7 +1146,6 @@ pending = live_pending + historical_pending
         "paid": round(paid, 2),
         "pending": round(pending, 2),
     }
-
 
 @api_router.delete("/daily-sales/{sale_id}")
 async def delete_daily_sale(sale_id: str, user: dict = Depends(require_role("admin", "pharmacist"))):
