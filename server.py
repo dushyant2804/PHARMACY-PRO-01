@@ -194,6 +194,14 @@ class PaymentCreate(BaseModel):
     notes: str = ""
     date: str| None = None
 
+
+class HistoricalSaleCreate(BaseModel):
+    date: str
+    cash_amount: float = 0
+    upi_amount: float = 0
+    pending_amount: float = 0
+    notes: Optional[str] = None
+    
 # ---------------- Startup ----------------
 @app.on_event("startup")
 async def startup():
