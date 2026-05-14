@@ -923,6 +923,24 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
     return {"customers": cust_out, "distributors": dist_out}
 
 
+
+@api_router.post("/daily-summary")
+async def add_daily_summary(payload: dict, user: dict = Depends(get_current_user)):
+    doc = {
+        "id": str(uuid.uuid4()),
+        "date": payload.get("date"),
+        "total_sales": payload.get("total_sales", 0),
+        "cash": payload.get("cash", 0),
+        "upi": payload.get("upi", 0),
+        "pending": payload.get("pending", 0),
+        "notes": payload.get("notes", ""),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    await db.daily_summary.insert_one(doc)
+    return doc
+    
+
 @api_router.get("/reports/expiry")
 async def expiry_report(user: dict = Depends(get_current_user)):
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
