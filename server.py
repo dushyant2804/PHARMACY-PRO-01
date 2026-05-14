@@ -941,6 +941,38 @@ async def expiry_report(user: dict = Depends(get_current_user)):
     return {"expired": expired, "near_expiry": sorted(near, key=lambda x: x["days_to_expiry"])}
 
 
+@api_router.get("/reports/top-medicines")
+async def top_medicines(start: str, end: str, user: dict = Depends(get_current_user)):
+    sales = await db.daily_sales.find({
+        "sale_date": {"$gte": start, "$lte": end}
+    }, {"_id": 0}).to_list(5000)
+
+    map_data = {}
+
+    for s in sales:
+        mid = s.get("medicine_id")
+        if not mid:
+            continue
+
+        qty = float(s.get("quantity", 0))
+        amt = float(s.get("total_amount", 0))
+
+        if mid not in map_data:
+            map_data[mid] = {
+                "medicine_id": mid,
+                "medicine_name": s.get("medicine_name"),
+                "total_qty": 0,
+                "revenue": 0
+            }
+
+        map_data[mid]["total_qty"] += qty
+        map_data[mid]["revenue"] += amt
+
+    result = sorted(map_data.values(), key=lambda x: x["revenue"], reverse=True)
+
+    return result[:20]
+
+
 # ---------------- Backup ----------------
 @api_router.get("/backup/export")
 async def backup_export(user: dict = Depends(require_role("admin"))):
