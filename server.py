@@ -201,6 +201,12 @@ class HistoricalSaleCreate(BaseModel):
     upi_amount: float = 0
     pending_amount: float = 0
     notes: Optional[str] = None
+
+class ExpenseCreate(BaseModel):
+    date: str
+    category: str
+    amount: float
+    notes: Optional[str] = None
     
 # ---------------- Startup ----------------
 @app.on_event("startup")
