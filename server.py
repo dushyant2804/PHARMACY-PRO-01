@@ -139,6 +139,19 @@ class MedicineCreate(BaseModel):
     auto_ledger: bool = True  # if true, create distributor payable transaction
 
 
+class RegularPatient(BaseModel):
+    name: str
+    age: int
+    phone: str
+    address: Optional[str] = None
+
+    medicine_name: str
+    duration_days: int
+    last_refill_date: str
+
+    condition: str = "general" 
+
+
 class Distributor(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
@@ -458,6 +471,41 @@ async def lookup_barcode(barcode: str, user: dict = Depends(get_current_user)):
     if not med:
         raise HTTPException(status_code=404, detail="Not found")
     return med
+
+
+@api_router.post("/patients")
+async def add_patient(payload: RegularPatient):
+    data = payload.model_dump()
+    await db.regular_patients.insert_one(data)
+    return {"success": True}
+
+
+@api_router.get("/patients")
+async def list_patients():
+    items = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
+    return items
+
+
+@api_router.get("/patients/alerts")
+async def patient_alerts():
+    from datetime import datetime
+
+    today = datetime.now().date()
+    patients = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
+
+    alerts = []
+
+    for p in patients:
+        try:
+            last = datetime.fromisoformat(p["last_refill_date"]).date()
+            days = int(p.get("duration_days") or 0)
+
+            if (today - last).days >= days:
+                alerts.append(p)
+        except:
+            continue
+
+    return alerts
 
 
 @api_router.put("/medicines/{med_id}")
