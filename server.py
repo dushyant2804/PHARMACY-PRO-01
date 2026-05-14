@@ -449,19 +449,6 @@ async def create_medicine(payload: MedicineCreate, user: dict = Depends(require_
     med = Medicine(**data)
     await db.medicines.insert_one(med.model_dump())
 
-    if auto_ledger and data.get("distributor_id") and data.get("quantity") and data.get("purchase_price"):
-        amount = round(float(data["purchase_price"]) * int(data["quantity"]), 2)
-        if amount > 0:
-            await db.distributor_transactions.insert_one({
-                "id": str(uuid.uuid4()),
-                "distributor_id": data["distributor_id"],
-                "type": "purchase",
-                "amount": amount,
-                "reference": f"STOCK:{med.batch_no}",
-                "notes": f"Manual stock entry: {med.name}",
-                "mode": "",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
     return med.model_dump()
 
 
@@ -1172,17 +1159,6 @@ async def receive_po(pid: str, user: dict = Depends(require_role("admin", "pharm
             )
             await db.medicines.insert_one(med.model_dump())
 
-    # Distributor ledger: add purchase transaction
-    await db.distributor_transactions.insert_one({
-        "id": str(uuid.uuid4()),
-        "distributor_id": po["distributor_id"],
-        "type": "purchase",
-        "amount": po["total"],
-        "reference": po["po_no"],
-        "notes": f"GRN for {po.get('invoice_ref') or po['po_no']}",
-        "mode": "",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
 
     received_at = datetime.now(timezone.utc).isoformat()
     await db.purchase_orders.update_one(
