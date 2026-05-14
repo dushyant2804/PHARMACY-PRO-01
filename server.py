@@ -359,6 +359,58 @@ async def create_expense(
 
     return expense
 
+
+@api_router.get("/reports/monthly-summary")
+async def monthly_summary(
+    month: str,
+    user: dict = Depends(get_current_user)
+):
+    # month format: YYYY-MM
+
+    live_sales = await db.daily_sales.find(
+        {"sale_date": {"$regex": f"^{month}"}},
+        {"_id": 0}
+    ).to_list(5000)
+
+    historical_sales = await db.historical_sales.find(
+        {"date": {"$regex": f"^{month}"}},
+        {"_id": 0}
+    ).to_list(5000)
+
+    expenses = await db.expenses.find(
+        {"date": {"$regex": f"^{month}"}},
+        {"_id": 0}
+    ).to_list(5000)
+
+    live_total = sum(
+        s.get("total_amount", 0)
+        for s in live_sales
+    )
+
+    historical_total = sum(
+        s.get("total_amount", 0)
+        for s in historical_sales
+    )
+
+    sales_total = live_total + historical_total
+
+    expense_total = sum(
+        e.get("amount", 0)
+        for e in expenses
+    )
+
+    estimated_profit = sales_total - expense_total
+
+    return {
+        "month": month,
+        "sales": round(sales_total, 2),
+        "expenses": round(expense_total, 2),
+        "estimated_profit": round(estimated_profit, 2),
+        "live_sales_count": len(live_sales),
+        "historical_sales_count": len(historical_sales),
+        "expense_count": len(expenses),
+    }
+
     
 @api_router.post("/medicines")
 async def create_medicine(payload: MedicineCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
