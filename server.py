@@ -508,6 +508,27 @@ async def patient_alerts():
     return alerts
 
 
+@api_router.delete("/patients/{phone}")
+async def delete_patient(phone: str):
+    await db.regular_patients.delete_one({"phone": phone})
+    return {"success": True}
+
+
+from datetime import datetime, timezone
+
+@api_router.post("/patients/contacted/{phone}")
+async def mark_contacted(phone: str):
+    await db.regular_patients.update_one(
+        {"phone": phone},
+        {
+            "$set": {
+                "last_contacted": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
+    return {"success": True}
+
+
 @api_router.put("/medicines/{med_id}")
 async def update_medicine(med_id: str, payload: MedicineCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
     data = payload.model_dump()
