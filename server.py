@@ -339,6 +339,27 @@ async def create_historical_sale(
     return sale
 
 
+@api_router.post("/expenses")
+async def create_expense(
+    payload: ExpenseCreate,
+    user: dict = Depends(require_role("admin", "pharmacist"))
+):
+    data = payload.model_dump()
+
+    expense = {
+        "id": str(uuid.uuid4()),
+        "date": data["date"],
+        "category": data["category"],
+        "amount": data["amount"],
+        "notes": data.get("notes", ""),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await db.expenses.insert_one(expense)
+
+    return expense
+
+    
 @api_router.post("/medicines")
 async def create_medicine(payload: MedicineCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
     data = payload.model_dump()
