@@ -107,8 +107,8 @@ class Medicine(BaseModel):
     purchase_price: float  # per unit
     mrp: float  # per unit
 
-    # ⭐ SINGLE SOURCE OF TRUTH
-    quantity_units: int = 0
+    # 🔥 BASE STOCK (ONLY INITIAL PURCHASE)
+    purchased_units: int = 0
 
     category: str = "OTC"
     gst_rate: float = 12.0
@@ -116,7 +116,7 @@ class Medicine(BaseModel):
     low_stock_threshold: int = 10
 
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-
+    
 class MedicineCreate(BaseModel):
     name: str
     batch_no: str
@@ -128,16 +128,16 @@ class MedicineCreate(BaseModel):
     purchase_price: float
     mrp: float
 
-    # ⭐ SINGLE SOURCE OF TRUTH
-    quantity_units: int = 0
+    # 🔥 INITIAL STOCK ENTRY ONLY (purchase time)
+    purchased_units: int = 0
 
     category: str = "OTC"
     gst_rate: float = 12.0
     barcode: Optional[str] = None
     low_stock_threshold: int = 10
 
-    auto_ledger: bool = True  # if true, create distributor payable transaction
-
+    auto_ledger: bool = True
+    
 class RegularPatient(BaseModel):
     name: str
     age: int
