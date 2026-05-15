@@ -103,18 +103,19 @@ class Medicine(BaseModel):
     manufacturer: str
     distributor: str
     distributor_id: Optional[str] = None
+
     purchase_price: float  # per unit
     mrp: float  # per unit
-    quantity: int  # total units (boxes * units_per_box + loose_units)
-    boxes: int = 0
-    units_per_box: int = 1
-    loose_units: int = 0
+
+    # ⭐ SINGLE SOURCE OF TRUTH
+    quantity_units: int = 0
+
     category: str = "OTC"
     gst_rate: float = 12.0
     barcode: Optional[str] = None
     low_stock_threshold: int = 10
-    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 class MedicineCreate(BaseModel):
     name: str
@@ -123,21 +124,19 @@ class MedicineCreate(BaseModel):
     manufacturer: str
     distributor: str
     distributor_id: Optional[str] = None
+
     purchase_price: float
     mrp: float
-    quantity: int = 0
-    boxes: int = 0
-    units_per_box: int = 1
-    loose_units: int = 0
-    current_boxes: int = 0
-    current_strips: int = 0
-    current_loose_units: int = 0
+
+    # ⭐ SINGLE SOURCE OF TRUTH
+    quantity_units: int = 0
+
     category: str = "OTC"
     gst_rate: float = 12.0
     barcode: Optional[str] = None
     low_stock_threshold: int = 10
-    auto_ledger: bool = True  # if true, create distributor payable transaction
 
+    auto_ledger: bool = True  # if true, create distributor payable transaction
 
 class RegularPatient(BaseModel):
     name: str
