@@ -897,47 +897,87 @@ async def add_customer_sale(
     return txn
 
 # ---------------- Dashboard & Reports ----------------
-@api_router.get("/dashboard")
-async def dashboard(user: dict = Depends(get_current_user)):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_invoices = await db.invoices.find({"created_at": {"$gte": today}}, {"_id": 0}).to_list(1000)
-    today_sales = sum(i.get("total", 0) for i in today_invoices)
+@api_router.get("/dashboard/summary")
+async def dashboard_summary(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    q = {}
 
-    medicines = await db.medicines.find({}, {"_id": 0}).to_list(2000)
-    low_stock = [m for m in medicines if m["quantity"] <= m.get("low_stock_threshold", 10)]
+    if start or end:
+        q["created_at"] = {}
+        if start:
+            q["created_at"]["$gte"] = start
+        if end:
+            q["created_at"]["$lte"] = end
 
-    today_dt = datetime.now(timezone.utc).date()
-    near_expiry = []
-    expired = []
+    # ---------------- SALES (LIVE INVOICES) ----------------
+    invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
+
+    total_sales = sum(i.get("total", 0) for i in invoices)
+    total_gst = sum(i.get("gst_total", 0) for i in invoices)
+    total_discount = sum(i.get("bill_discount", 0) for i in invoices)
+
+    # ---------------- EXPENSES ----------------
+    expenses = await db.expenses.find(q, {"_id": 0}).to_list(5000)
+    total_expenses = sum(e.get("amount", 0) for e in expenses)
+
+    # ---------------- STOCK VALUE ----------------
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
+
+    stock_value = sum(
+        (m.get("quantity_units", 0) * m.get("purchase_price", 0))
+        for m in medicines
+    )
+
+    # ---------------- LOW STOCK ITEMS ----------------
+    low_stock_items = [
+        {
+            "id": m["id"],
+            "name": m["name"],
+            "qty": m.get("quantity_units", 0),
+            "threshold": m.get("low_stock_threshold", 10),
+        }
+        for m in medicines
+        if m.get("quantity_units", 0) <= m.get("low_stock_threshold", 10)
+    ]
+
+    # ---------------- EXPIRED / EXPIRING ----------------
+    today = datetime.now(timezone.utc).date()
+
+    expiring = []
     for m in medicines:
         try:
             exp = datetime.strptime(m["expiry_date"], "%Y-%m-%d").date()
-            days = (exp - today_dt).days
-            if days < 0:
-                expired.append({**m, "days_to_expiry": days})
-            elif days <= 60:
-                near_expiry.append({**m, "days_to_expiry": days})
-        except Exception:
-            pass
+            days_left = (exp - today).days
 
-    # Pending payments
-    cust_txns = await db.customer_transactions.find({}, {"_id": 0}).to_list(5000)
-    pending_by_cust = {}
-    for t in cust_txns:
-        cid = t["customer_id"]
-        pending_by_cust[cid] = pending_by_cust.get(cid, 0) + (t["amount"] if t["type"] == "sale" else -t["amount"])
-    pending_total = sum(v for v in pending_by_cust.values() if v > 0)
+            if days_left <= 60:
+                expiring.append({
+                    "name": m["name"],
+                    "batch_no": m["batch_no"],
+                    "days_left": days_left
+                })
+        except:
+            continue
+
+    # ---------------- PROFIT ----------------
+    profit = total_sales - total_expenses
 
     return {
-        "today_sales": round(today_sales, 2),
-        "today_invoice_count": len(today_invoices),
-        "low_stock_count": len(low_stock),
-        "low_stock": low_stock[:10],
-        "near_expiry_count": len(near_expiry),
-        "near_expiry": sorted(near_expiry, key=lambda x: x["days_to_expiry"])[:10],
-        "expired_count": len(expired),
-        "pending_payments": round(pending_total, 2),
-        "total_medicines": len(medicines),
+        "sales": round(total_sales, 2),
+        "gst_collected": round(total_gst, 2),
+        "discount_given": round(total_discount, 2),
+        "expenses": round(total_expenses, 2),
+        "profit": round(profit, 2),
+
+        "stock_value": round(stock_value, 2),
+
+        "low_stock_count": len(low_stock_items),
+        "low_stock_items": low_stock_items,
+
+        "expiring_soon_count": len(expiring),
+        "expiring_soon": expiring,
     }
 
 
