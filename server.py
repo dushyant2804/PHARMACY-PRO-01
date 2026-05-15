@@ -613,7 +613,15 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
             raise HTTPException(status_code=400, detail=f"Medicine not found: {item.name}")
         upb = max(int(med.get("units_per_box") or item.units_per_box or 1), 1)
         units_needed = item.quantity * (upb if item.unit_type == "box" else 1)
-        if med["quantity"] < units_needed:
+       purchased = int(med.get("purchased_units", 0))
+       sold = int(med.get("sold_units", 0))
+       available = purchased - sold
+
+    if available < units_needed:
+    raise HTTPException(
+        status_code=400,
+        detail=f"Insufficient stock for {item.name}"
+    )
             raise HTTPException(status_code=400, detail=f"Insufficient stock for {item.name}")
 
         unit_price = item.mrp * (upb if item.unit_type == "box" else 1)
@@ -627,7 +635,10 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
             "units_dispensed": units_needed,
             "line_total": round(taxable, 2),
         })
-        await db.medicines.update_one({"id": item.medicine_id}, {"$inc": {"quantity": -units_needed}})
+        await db.medicines.update_one(
+    {"id": item.medicine_id},
+    {"$inc": {"sold_units": units_needed}}
+)
 
     # Bill-level discount: prefer fixed amount if provided, else %
     bill_disc = float(payload.bill_discount_amount or 0.0)
