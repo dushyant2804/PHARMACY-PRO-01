@@ -307,6 +307,7 @@ async def list_medicines(
     user: dict = Depends(get_current_user),
 ):
     q = {}
+
     if search:
         q["name"] = {"$regex": search, "$options": "i"}
     if category:
@@ -317,8 +318,18 @@ async def list_medicines(
         q["manufacturer"] = manufacturer
     if batch_no:
         q["batch_no"] = batch_no
-    sort_field = sort_by if sort_by in ("name", "expiry_date", "quantity", "mrp") else "name"
-    items = await db.medicines.find(q, {"_id": 0}).sort(sort_field, 1).to_list(2000)
+
+    sort_field = sort_by if sort_by in ("name", "expiry_date", "mrp") else "name"
+
+    items = await db.medicines.find(q, {"_id": 0}).sort(sort_field, 1).to_list(5000)
+
+    # 🔥 IMPORTANT: compute stock properly here (temporary until invoice system)
+    for m in items:
+        purchased = int(m.get("purchased_units", 0))
+        sold = int(m.get("sold_units", 0))
+
+        m["quantity_units"] = max(purchased - sold, 0)
+
     return items
 
 
@@ -425,31 +436,20 @@ async def monthly_summary(
 
     
 @api_router.post("/medicines")
-async def create_medicine(payload: MedicineCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
+async def create_medicine(
+    payload: MedicineCreate,
+    user: dict = Depends(require_role("admin", "pharmacist"))
+):
     data = payload.model_dump()
-    auto_ledger = data.pop("auto_ledger", True)
-    upb = max(int(data.get("units_per_box") or 1), 1)
-    boxes = int(data.get("boxes") or 0)
-    loose = int(data.get("loose_units") or 0)
-    if boxes or loose:
-        data["quantity"] = boxes * upb + loose
-    elif data.get("quantity"):
-        data["loose_units"] = int(data["quantity"])
-        current_boxes = int(data.get("current_boxes") or 0)
-        current_strips = int(data.get("current_strips") or 0)
-        current_loose = int(data.get("current_loose_units") or 0)
+    data.pop("auto_ledger", None)
 
-        data["current_quantity"] = (
-        (current_boxes * upb)
-        + current_strips
-        + current_loose
-        )
-    data["units_per_box"] = upb
-    med = Medicine(**data)
+    med = Medicine(
+        **data,
+        purchased_units=data.get("purchased_units", 0),
+    )
+
     await db.medicines.insert_one(med.model_dump())
-
     return med.model_dump()
-
 
 @api_router.get("/medicines/lookup/{barcode}")
 async def lookup_barcode(barcode: str, user: dict = Depends(get_current_user)):
@@ -516,20 +516,23 @@ async def mark_contacted(phone: str):
 
 
 @api_router.put("/medicines/{med_id}")
-async def update_medicine(med_id: str, payload: MedicineCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
+async def update_medicine(
+    med_id: str,
+    payload: MedicineCreate,
+    user: dict = Depends(require_role("admin", "pharmacist"))
+):
     data = payload.model_dump()
     data.pop("auto_ledger", None)
-    upb = max(int(data.get("units_per_box") or 1), 1)
-    boxes = int(data.get("boxes") or 0)
-    loose = int(data.get("loose_units") or 0)
-    if boxes or loose:
-        data["quantity"] = boxes * upb + loose
-    data["units_per_box"] = upb
-    res = await db.medicines.update_one({"id": med_id}, {"$set": data})
+
+    res = await db.medicines.update_one(
+        {"id": med_id},
+        {"$set": data}
+    )
+
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Medicine not found")
-    med = await db.medicines.find_one({"id": med_id}, {"_id": 0})
-    return med
+
+    return await db.medicines.find_one({"id": med_id}, {"_id": 0})
 
 
 @api_router.delete("/medicines/{med_id}")
