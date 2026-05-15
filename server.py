@@ -898,10 +898,7 @@ async def add_customer_sale(
     return txn
 
 # ---------------- Dashboard & Reports ----------------
-api_router.get("/reports/sales")
-
-
-@
+@api_router.get("/reports/sales")
 async def sales_report(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
     q = {}
     if start or end:
