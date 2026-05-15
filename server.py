@@ -605,61 +605,81 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
     subtotal = 0.0
     gst_total = 0.0
     items_out = []
-    line_total_raw = 0.0  # taxable before bill-level discount
+    line_total_raw = 0.0
 
     for item in payload.items:
         med = await db.medicines.find_one({"id": item.medicine_id})
         if not med:
             raise HTTPException(status_code=400, detail=f"Medicine not found: {item.name}")
-        upb = max(int(med.get("units_per_box") or item.units_per_box or 1), 1)
-        units_needed = item.quantity * (upb if item.unit_type == "box" else 1)
-       purchased = int(med.get("purchased_units", 0))
-       sold = int(med.get("sold_units", 0))
-       available = purchased - sold
 
-    if available < units_needed:
-    raise HTTPException(
-        status_code=400,
-        detail=f"Insufficient stock for {item.name}"
-    )
-            raise HTTPException(status_code=400, detail=f"Insufficient stock for {item.name}")
+        upb = max(int(med.get("units_per_box") or item.units_per_box or 1), 1)
+
+        units_needed = item.quantity * (upb if item.unit_type == "box" else 1)
+
+        # ✅ SINGLE SOURCE OF TRUTH STOCK CHECK
+        available = int(med.get("quantity_units", 0))
+
+        if available < units_needed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient stock for {item.name}"
+            )
+
+        # reduce stock immediately
+        await db.medicines.update_one(
+            {"id": item.medicine_id},
+            {"$inc": {"quantity_units": -units_needed}}
+        )
 
         unit_price = item.mrp * (upb if item.unit_type == "box" else 1)
         line_base = unit_price * item.quantity
         line_discount = line_base * (item.discount_pct / 100.0)
         taxable = line_base - line_discount
+
         line_total_raw += taxable
+
         items_out.append({
             **item.model_dump(),
             "units_per_box": upb,
             "units_dispensed": units_needed,
             "line_total": round(taxable, 2),
         })
-        await db.medicines.update_one(
-    {"id": item.medicine_id},
-    {"$inc": {"sold_units": units_needed}}
-)
 
-    # Bill-level discount: prefer fixed amount if provided, else %
+    # bill-level discount
     bill_disc = float(payload.bill_discount_amount or 0.0)
+
     if not bill_disc and payload.bill_discount_pct:
         bill_disc = line_total_raw * (float(payload.bill_discount_pct) / 100.0)
+
     bill_disc = min(bill_disc, line_total_raw)
     after_disc = max(line_total_raw - bill_disc, 0.0)
 
-    # Distribute discount + GST split per item
+    # GST + final calculation
     final_items = []
+
     for it, raw in zip(items_out, [i["line_total"] for i in items_out]):
         share = (raw / line_total_raw) if line_total_raw else 0
         item_after = raw - bill_disc * share
+
         gst_amount = item_after - (item_after / (1 + it["gst_rate"] / 100.0))
         net = item_after - gst_amount
+
         gst_total += gst_amount
         subtotal += net
-        final_items.append({**it, "gst_amount": round(gst_amount, 2), "net_amount": round(net, 2)})
+
+        final_items.append({
+            **it,
+            "gst_amount": round(gst_amount, 2),
+            "net_amount": round(net, 2),
+        })
 
     total = round(subtotal + gst_total, 2)
-    paid = float(payload.paid_amount if payload.payment_mode != "cash" else (payload.paid_amount or total))
+
+    paid = float(
+        payload.paid_amount if payload.payment_mode != "cash"
+        else (payload.paid_amount or total)
+    )
+
     invoice = {
         "id": str(uuid.uuid4()),
         "invoice_no": await _next_invoice_no(),
@@ -680,9 +700,10 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
         "created_at": datetime.now(timezone.utc).isoformat(),
         "created_by": user.get("name", ""),
     }
+
     await db.invoices.insert_one(invoice)
 
-    # Track doctor history
+    # doctor history
     if invoice["referring_doctor"]:
         await db.doctor_history.update_one(
             {"name": invoice["referring_doctor"]},
@@ -690,6 +711,7 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
             upsert=True,
         )
 
+    # credit customer tracking
     if payload.customer_id and invoice["due_amount"] > 0:
         await db.customer_transactions.insert_one({
             "id": str(uuid.uuid4()),
@@ -700,9 +722,8 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
             "notes": "Credit sale",
             "created_at": invoice["created_at"],
         })
-    invoice.pop("_id", None)
-    return invoice
 
+    return invoice
 
 @api_router.get("/invoices")
 async def list_invoices(
