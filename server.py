@@ -1411,11 +1411,15 @@ class POCreate(BaseModel):
 
 
 @api_router.post("/purchase-orders")
-async def create_po(payload: POCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
+async def create_po(
+    payload: POCreate,
+    user: dict = Depends(require_role("admin", "pharmacist"))
+):
     total = sum(
-    i.purchase_price * i.quantity * (i.pack_size or 1)
-    for i in payload.items
-)
+        i.purchase_price * i.quantity * (i.pack_size or 1)
+        for i in payload.items
+    )
+
     po = {
         "id": str(uuid.uuid4()),
         "po_no": f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-{await db.purchase_orders.count_documents({}) + 1:04d}",
@@ -1429,27 +1433,28 @@ async def create_po(payload: POCreate, user: dict = Depends(require_role("admin"
         "created_at": datetime.now(timezone.utc).isoformat(),
         "received_at": None,
     }
+
     await db.purchase_orders.insert_one(po)
 
+    # 🔥 STOCK UPDATE BLOCK (FIXED INDENTATION)
     for i in payload.items:
-      medicine = await db.medicines.find_one({
-       "name": i.name,
-       "batch_no": i.batch_no
-     })
+        medicine = await db.medicines.find_one({
+            "name": i.name,
+            "batch_no": i.batch_no
+        })
 
-     if medicine:
-        await db.medicines.update_one(
-         {"_id": medicine["_id"]},
-         {
-            "$inc": {
-              "purchased_units": i.quantity * (i.pack_size or 1)
-            }
-         }
-        )
+        if medicine:
+            await db.medicines.update_one(
+                {"_id": medicine["_id"]},
+                {
+                    "$inc": {
+                        "purchased_units": i.quantity * (i.pack_size or 1)
+                    }
+                }
+            )
 
     po.pop("_id", None)
     return po
-
 
 @api_router.get("/purchase-orders")
 async def list_pos(user: dict = Depends(get_current_user)):
