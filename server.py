@@ -906,9 +906,11 @@ async def dashboard_summary(
     end: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
+
     q = {}
 
     if start or end:
+
         q["created_at"] = {}
 
         if start:
@@ -917,7 +919,7 @@ async def dashboard_summary(
         if end:
             q["created_at"]["$lte"] = end
 
-    # ---------------- SALES ----------------
+    # SALES
 
     invoices = await db.invoices.find(
         q,
@@ -939,187 +941,7 @@ async def dashboard_summary(
         for i in invoices
     )
 
-    # ---------------- STOCK ----------------
-
-    medicines = await db.medicines.find(
-        {},
-        {"_id": 0}
-    ).to_list(5000)
-stock_value = 0
-    low_stock_items = []
-
-    for m in medicines:
-
-        purchased = int(
-            m.get("purchased_units", 0)
-        )
-
-        sold = int(
-            m.get("sold_units", 0)
-        )
-
-        available = purchased - sold
-
-        stock_value += (
-            available *
-            float(m.get("purchase_price", 0))
-        )
-
-        if available <= int(
-            m.get("low_stock_threshold", 10)
-        ):
-
-            low_stock_items.append({
-                "id": m["id"],
-                "name": m["name"],
-                "qty": available,
-                "threshold": m.get(
-                    "low_stock_threshold",
-                    10
-                ),
-            })
-
-        low_stock_items.append({
-            "id": m["id"],
-            "name": m["name"],
-            "qty": available,
-            "threshold": m.get(
-                "low_stock_threshold",
-                10
-            ),
-        })
-
-    # ---------------- OUTSTANDING ----------------
-
-    customer_txns = await db.customer_transactions.find(
-        {},
-        {"_id": 0}
-    ).to_list(5000)
-
-    customer_outstanding = 0
-
-    for t in customer_txns:
-
-        if t.get("type") == "sale":
-            customer_outstanding += float(
-                t.get("amount", 0)
-            )
-
-        elif t.get("type") == "payment":
-            customer_outstanding -= float(
-                t.get("amount", 0)
-            )
-
-    distributors = await db.distributors.find(
-        {},
-        {"_id": 0}
-    ).to_list(1000)
-
-    distributor_outstanding = 0
-
-    for d in distributors:
-
-        bal = float(
-            d.get("opening_balance", 0)
-        )
-
-        txns = await db.distributor_transactions.find(
-            {"distributor_id": d["id"]},
-            {"_id": 0}
-        ).to_list(1000)
-
-        for t in txns:
-
-            if t.get("type") == "purchase":
-                bal += float(t.get("amount", 0))
-@api_router.get("/dashboard/summary")
-async def dashboard_summary(
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    user: dict = Depends(get_current_user),
-):
-    q = {}
-
-    if start or end:
-        q["created_at"] = {}
-
-        if start:
-            q["created_at"]["$gte"] = start
-
-        if end:
-            q["created_at"]["$lte"] = end
-
-    # ---------------- SALES ----------------
-
-    invoices = await db.invoices.find(
-        q,
-        {"_id": 0}
-    ).to_list(5000)
-
-    total_sales = sum(
-        i.get("total", 0)
-        for i in invoices
-    )
-
-    total_gst = sum(
-        i.get("gst_total", 0)
-        for i in invoices
-    )
-
-    total_discount = sum(
-        i.get("bill_discount", 0)
-        for i in invoices
-    )
-
-    # ---------------- STOCK ----------------
-
-    medicines = await db.medicines.find(
-        {},
-        {"_id": 0}
-    ).to_list(5000)
-
-    stock_value = 0
-    low_stock_items = []
-@api_router.get("/dashboard/summary")
-async def dashboard_summary(
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    user: dict = Depends(get_current_user),
-):
-    q = {}
-
-    if start or end:
-        q["created_at"] = {}
-
-        if start:
-            q["created_at"]["$gte"] = start
-
-        if end:
-            q["created_at"]["$lte"] = end
-
-    # ---------------- SALES ----------------
-
-    invoices = await db.invoices.find(
-        q,
-        {"_id": 0}
-    ).to_list(5000)
-
-    total_sales = sum(
-        i.get("total", 0)
-        for i in invoices
-    )
-
-    total_gst = sum(
-        i.get("gst_total", 0)
-        for i in invoices
-    )
-
-    total_discount = sum(
-        i.get("bill_discount", 0)
-        for i in invoices
-    )
-
-    # ---------------- EXPENSES ----------------
+    # EXPENSES
 
     expenses = await db.expenses.find(
         q,
@@ -1133,7 +955,7 @@ async def dashboard_summary(
 
     profit = total_sales - total_expenses
 
-    # ---------------- STOCK ----------------
+    # STOCK
 
     medicines = await db.medicines.find(
         {},
@@ -1180,6 +1002,7 @@ async def dashboard_summary(
             })
 
         try:
+
             exp = datetime.strptime(
                 m["expiry_date"],
                 "%Y-%m-%d"
@@ -1203,7 +1026,7 @@ async def dashboard_summary(
         except Exception:
             pass
 
-    # ---------------- CUSTOMER OUTSTANDING ----------------
+    # CUSTOMER OUTSTANDING
 
     customer_txns = await db.customer_transactions.find(
         {},
@@ -1226,7 +1049,7 @@ async def dashboard_summary(
                 t.get("amount", 0)
             )
 
-    # ---------------- DISTRIBUTOR OUTSTANDING ----------------
+    # DISTRIBUTOR OUTSTANDING
 
     distributors = await db.distributors.find(
         {},
@@ -1264,6 +1087,7 @@ async def dashboard_summary(
             distributor_outstanding += bal
 
     return {
+
         "sales": round(total_sales, 2),
 
         "gst_collected": round(
