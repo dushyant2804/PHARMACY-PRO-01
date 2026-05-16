@@ -1430,21 +1430,23 @@ async def create_po(payload: POCreate, user: dict = Depends(require_role("admin"
         "received_at": None,
     }
     await db.purchase_orders.insert_one(po)
-    for i in payload.items:
-    medicine = await db.medicines.find_one({
-        "name": i.name,
-        "batch_no": i.batch_no
-    })
 
-    if medicine:
+    for i in payload.items:
+      medicine = await db.medicines.find_one({
+       "name": i.name,
+       "batch_no": i.batch_no
+     })
+
+     if medicine:
         await db.medicines.update_one(
-            {"_id": medicine["_id"]},
-            {
-                "$inc": {
-                    "purchased_units": i.quantity * (i.pack_size or 1)
-                }
+         {"_id": medicine["_id"]},
+         {
+            "$inc": {
+              "purchased_units": i.quantity * (i.pack_size or 1)
             }
+         }
         )
+
     po.pop("_id", None)
     return po
 
