@@ -898,6 +898,65 @@ async def add_customer_sale(
     return txn
 
 # ---------------- Dashboard & Reports ----------------
+@api_router.get("/dashboard/summary")
+async def dashboard_summary(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    q = {}
+
+    if start or end:
+        q["created_at"] = {}
+
+        if start:
+            q["created_at"]["$gte"] = start
+
+        if end:
+            q["created_at"]["$lte"] = end
+
+    invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
+
+    total_sales = sum(i.get("total", 0) for i in invoices)
+
+    total_gst = sum(i.get("gst_total", 0) for i in invoices)
+
+    total_discount = sum(i.get("bill_discount", 0) for i in invoices)
+
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
+
+    stock_value = 0
+    low_stock_items = []
+
+    for m in medicines:
+        purchased = int(m.get("purchased_units", 0))
+        sold = int(m.get("sold_units", 0))
+
+        available = purchased - sold
+
+        stock_value += (
+            available * float(m.get("purchase_price", 0))
+        )
+
+        if available <= int(m.get("low_stock_threshold", 10)):
+            low_stock_items.append({
+                "id": m["id"],
+                "name": m["name"],
+                "qty": available,
+                "threshold": m.get("low_stock_threshold", 10),
+            })
+
+    return {
+        "sales": round(total_sales, 2),
+        "gst_collected": round(total_gst, 2),
+        "discount_given": round(total_discount, 2),
+
+        "stock_value": round(stock_value, 2),
+
+        "low_stock_count": len(low_stock_items),
+        "low_stock_items": low_stock_items,
+    }
+
 @api_router.get("/reports/sales")
 async def sales_report(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
     q = {}
