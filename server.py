@@ -951,22 +951,30 @@ async def dashboard_summary(
 
     for m in medicines:
 
-        purchased = int(m.get("purchased_units", 0))
-        sold = int(m.get("sold_units", 0))
+    purchased = int(m.get("purchased_units", 0))
+    sold = int(m.get("sold_units", 0))
 
-        available = purchased - sold
+    available = purchased - sold
 
-stock_value += (
-            available * float(m.get("purchase_price", 0))
+    stock_value += (
+        available * float(
+            m.get("purchase_price", 0)
         )
+    )
 
-        if available <= int(m.get("low_stock_threshold", 10)):
-            low_stock_items.append({
-                "id": m["id"],
-                "name": m["name"],
-                "qty": available,
-                "threshold": m.get("low_stock_threshold", 10),
-            })
+    if available <= int(
+        m.get("low_stock_threshold", 10)
+    ):
+
+        low_stock_items.append({
+            "id": m["id"],
+            "name": m["name"],
+            "qty": available,
+            "threshold": m.get(
+                "low_stock_threshold",
+                10
+            ),
+        })
 
     # ---------------- OUTSTANDING ----------------
 
