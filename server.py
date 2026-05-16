@@ -1067,6 +1067,73 @@ async def dashboard_summary(
 
     stock_value = 0
     low_stock_items = []
+@api_router.get("/dashboard/summary")
+async def dashboard_summary(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    q = {}
+
+    if start or end:
+        q["created_at"] = {}
+
+        if start:
+            q["created_at"]["$gte"] = start
+
+        if end:
+            q["created_at"]["$lte"] = end
+
+    # ---------------- SALES ----------------
+
+    invoices = await db.invoices.find(
+        q,
+        {"_id": 0}
+    ).to_list(5000)
+
+    total_sales = sum(
+        i.get("total", 0)
+        for i in invoices
+    )
+
+    total_gst = sum(
+        i.get("gst_total", 0)
+        for i in invoices
+    )
+
+    total_discount = sum(
+        i.get("bill_discount", 0)
+        for i in invoices
+    )
+
+    # ---------------- EXPENSES ----------------
+
+    expenses = await db.expenses.find(
+        q,
+        {"_id": 0}
+    ).to_list(5000)
+
+    total_expenses = sum(
+        e.get("amount", 0)
+        for e in expenses
+    )
+
+    profit = total_sales - total_expenses
+
+    # ---------------- STOCK ----------------
+
+    medicines = await db.medicines.find(
+        {},
+        {"_id": 0}
+    ).to_list(5000)
+
+    stock_value = 0
+    low_stock_items = []
+    expiring = []
+
+    today = datetime.now(
+        timezone.utc
+    ).date()
 
     for m in medicines:
 
@@ -1098,6 +1165,30 @@ async def dashboard_summary(
                     10
                 ),
             })
+
+        try:
+            exp = datetime.strptime(
+                m["expiry_date"],
+                "%Y-%m-%d"
+            ).date()
+
+            days_left = (
+                exp - today
+            ).days
+
+            if days_left <= 60:
+
+                expiring.append({
+                    "name": m["name"],
+                    "batch_no": m.get(
+                        "batch_no",
+                        ""
+                    ),
+                    "days_left": days_left,
+                })
+
+        except Exception:
+            pass
 
     # ---------------- CUSTOMER OUTSTANDING ----------------
 
@@ -1159,65 +1250,33 @@ async def dashboard_summary(
         if bal > 0:
             distributor_outstanding += bal
 
-    # ---------------- EXPIRY ----------------
-
-    expiring = []
-
-    today = datetime.now(
-        timezone.utc
-    ).date()
-
-    for m in medicines:
-
-        try:
-
-            exp = datetime.strptime(
-                m["expiry_date"],
-                "%Y-%m-%d"
-            ).date()
-
-            days_left = (
-                exp - today
-            ).days
-
-            if days_left <= 60:
-
-                expiring.append({
-                    "name": m["name"],
-                    "batch_no": m["batch_no"],
-                    "days_left": days_left,
-                })
-
-        except:
-            pass
-
-    # ---------------- EXPENSES ----------------
-
-    expenses = await db.expenses.find(
-        q,
-        {"_id": 0}
-    ).to_list(5000)
-
-    total_expenses = sum(
-        float(e.get("amount", 0))
-        for e in expenses
-    )
-
-    # ---------------- PROFIT ----------------
-
-    profit = total_sales - total_expenses
-
     return {
-
         "sales": round(total_sales, 2),
 
-        "gst_collected": round(total_gst, 2),
+        "gst_collected": round(
+            total_gst,
+            2
+        ),
 
-        "discount_given": round(total_discount, 2),
+        "discount_given": round(
+            total_discount,
+            2
+        ),
 
-        "expenses": round(total_expenses, 2),
+        "expenses": round(
+            total_expenses,
+            2
+        ),
 
-        "profit": round(profit, 2),
+        "profit": round(
+            profit,
+            2
+        ),
+
+        "stock_value": round(
+            stock_value,
+            2
+        ),
 
         "customer_outstanding": round(
             customer_outstanding,
@@ -1228,8 +1287,6 @@ async def dashboard_summary(
             distributor_outstanding,
             2
         ),
-
-        "stock_value": round(stock_value, 2),
 
         "low_stock_count": len(
             low_stock_items
