@@ -948,10 +948,45 @@ async def dashboard_summary(
                 "threshold": m.get("low_stock_threshold", 10),
             })
 
+    # ---------------- OUTSTANDING ----------------
+
+    customer_txns = await db.customer_transactions.find(
+        {},
+        {"_id": 0}
+    ).to_list(5000)
+
+    customer_outstanding = 0
+
+    for t in customer_txns:
+        if t.get("type") == "sale":
+            customer_outstanding += float(t.get("amount", 0))
+
+        elif t.get("type") == "payment":
+            customer_outstanding -= float(t.get("amount", 0))
+
+
+    distributor_txns = await db.distributor_transactions.find(
+        {},
+        {"_id": 0}
+    ).to_list(5000)
+
+    distributor_outstanding = 0
+
+    for t in distributor_txns:
+        if t.get("type") == "purchase":
+            distributor_outstanding += float(t.get("amount", 0))
+
+        elif t.get("type") == "payment":
+            distributor_outstanding -= float(t.get("amount", 0))
+            
     return {
         "sales": round(total_sales, 2),
         "gst_collected": round(total_gst, 2),
         "discount_given": round(total_discount, 2),
+
+        "customer_outstanding": round(customer_outstanding, 2),
+
+        "distributor_outstanding": round(distributor_outstanding, 2),
 
         "stock_value": round(stock_value, 2),
 
@@ -1007,29 +1042,88 @@ async def stock_valuation(user: dict = Depends(get_current_user)):
 
 
 @api_router.get("/reports/outstanding")
-async def outstanding_report(user: dict = Depends(get_current_user)):
-    customers = await db.customers.find({}, {"_id": 0}).to_list(1000)
+async def outstanding_report(
+    user: dict = Depends(get_current_user)
+):
+    # ---------------- CUSTOMER OUTSTANDING ----------------
+
+    customers = await db.customers.find(
+        {},
+        {"_id": 0}
+    ).to_list(1000)
+
     cust_out = []
+    customer_total = 0
+
     for c in customers:
-        txns = await db.customer_transactions.find({"customer_id": c["id"]}).to_list(1000)
+        txns = await db.customer_transactions.find(
+            {"customer_id": c["id"]}
+        ).to_list(1000)
+
         bal = 0.0
-        for t in txns:
-            bal += t["amount"] if t["type"] == "sale" else -t["amount"]
-        if bal > 0:
-            cust_out.append({"id": c["id"], "name": c["name"], "phone": c.get("phone", ""), "balance": round(bal, 2)})
 
-    distributors = await db.distributors.find({}, {"_id": 0}).to_list(1000)
+        for t in txns:
+            if t.get("type") == "sale":
+                bal += float(t.get("amount", 0))
+
+            elif t.get("type") == "payment":
+                bal -= float(t.get("amount", 0))
+
+        if bal > 0:
+            bal = round(bal, 2)
+
+            customer_total += bal
+
+            cust_out.append({
+                "id": c["id"],
+                "name": c["name"],
+                "phone": c.get("phone", ""),
+                "balance": bal,
+            })
+
+    # ---------------- DISTRIBUTOR OUTSTANDING ----------------
+
+    distributors = await db.distributors.find(
+        {},
+        {"_id": 0}
+    ).to_list(1000)
+
     dist_out = []
+    distributor_total = 0
+
     for d in distributors:
-        txns = await db.distributor_transactions.find({"distributor_id": d["id"]}).to_list(1000)
-        bal = d.get("opening_balance", 0.0)
+        txns = await db.distributor_transactions.find(
+            {"distributor_id": d["id"]}
+        ).to_list(1000)
+
+        bal = float(d.get("opening_balance", 0.0))
+
         for t in txns:
-            bal += t["amount"] if t["type"] == "purchase" else -t["amount"]
+            if t.get("type") == "purchase":
+                bal += float(t.get("amount", 0))
+
+            elif t.get("type") == "payment":
+                bal -= float(t.get("amount", 0))
+
         if bal > 0:
-            dist_out.append({"id": d["id"], "name": d["name"], "balance": round(bal, 2)})
+            bal = round(bal, 2)
 
-    return {"customers": cust_out, "distributors": dist_out}
+            distributor_total += bal
 
+            dist_out.append({
+                "id": d["id"],
+                "name": d["name"],
+                "balance": bal,
+            })
+
+    return {
+        "customers": cust_out,
+        "distributors": dist_out,
+
+        "customer_total": round(customer_total, 2),
+
+        "distributor_total": round(distributor_total, 2),
+    }
 
 
 @api_router.post("/daily-summary")
