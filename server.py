@@ -107,6 +107,7 @@ class Medicine(BaseModel):
 
     purchase_price: float  # per unit
     mrp: float  # per unit
+    pack_size: str = ""
 
     # 🔥 BASE STOCK (ONLY INITIAL PURCHASE)
     purchased_units: int = 0
@@ -128,6 +129,7 @@ class MedicineCreate(BaseModel):
 
     purchase_price: float
     mrp: float
+    pack_size: str = ""
 
     # 🔥 INITIAL STOCK ENTRY ONLY (purchase time)
     purchased_units: int = 0
