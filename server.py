@@ -980,13 +980,36 @@ async def sales_report(start: Optional[str] = None, end: Optional[str] = None, u
             if med:
                 profit += (it["mrp"] - med.get("purchase_price", 0)) * it["quantity"]
     return {
-        "total_sales": round(total, 2),
-        "total_gst": round(gst, 2),
-        "invoice_count": len(invoices),
-        "estimated_profit": round(profit, 2),
-        "daily": [{"date": k, "total": round(v, 2)} for k, v in sorted(daily.items())],
-    }
+    "sales": round(total_sales, 2),
 
+    "gst_collected": round(total_gst, 2),
+
+    "discount_given": round(total_discount, 2),
+
+    "expenses": 0,
+
+    "profit": round(total_sales, 2),
+
+    "customer_outstanding": round(
+        customer_outstanding,
+        2
+    ),
+
+    "distributor_outstanding": round(
+        distributor_outstanding,
+        2
+    ),
+
+    "stock_value": round(stock_value, 2),
+
+    "low_stock_count": len(low_stock_items),
+
+    "low_stock_items": low_stock_items,
+
+    "expiring_soon_count": 0,
+
+    "expiring_soon": [],
+}
 
 @api_router.get("/reports/stock-valuation")
 async def stock_valuation(user: dict = Depends(get_current_user)):
