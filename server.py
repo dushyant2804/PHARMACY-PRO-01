@@ -919,7 +919,7 @@ async def dashboard_summary(
         if end:
             q["created_at"]["$lte"] = end
 
-        today = datetime.now(
+    today = datetime.now(
         timezone.utc
     ).date()
 
