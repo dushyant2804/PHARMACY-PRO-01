@@ -1104,30 +1104,31 @@ async def dashboard_summary(
 
     for t in customer_txns:
 
-if t.get("type") == "sale":
+        if t.get("type") == "sale":
 
-    amt = float(
-        t.get("amount", 0)
-    )
+            amt = float(
+                t.get("amount", 0)
+            )
 
-    customer_outstanding += amt
+            customer_outstanding += amt
 
-    try:
-        dt = datetime.fromisoformat(
-            t["created_at"]
-        ).date()
+            try:
 
-        if dt == today:
-            customer_outstanding_today += amt
+                dt = datetime.fromisoformat(
+                    t["created_at"]
+                ).date()
 
-        if (
-            dt.month == current_month and
-            dt.year == current_year
-        ):
-            customer_outstanding_month += amt
+                if dt == today:
+                    customer_outstanding_today += amt
 
-    except Exception:
-        pass
+                if (
+                    dt.month == current_month and
+                    dt.year == current_year
+                ):
+                    customer_outstanding_month += amt
+
+            except Exception:
+                pass
 
         elif t.get("type") == "payment":
 
@@ -1140,6 +1141,7 @@ if t.get("type") == "sale":
             received_total += amt
 
             try:
+
                 dt = datetime.fromisoformat(
                     t["created_at"]
                 ).date()
@@ -1153,9 +1155,9 @@ if t.get("type") == "sale":
                 ):
                     received_month += amt
 
-       except Exception:
-           pass
-
+            except Exception:
+                pass
+                
     # DISTRIBUTOR OUTSTANDING
 
     distributors = await db.distributors.find(
