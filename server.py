@@ -919,6 +919,29 @@ async def dashboard_summary(
         if end:
             q["created_at"]["$lte"] = end
 
+        today = datetime.now(
+        timezone.utc
+    ).date()
+
+    current_month = today.month
+    current_year = today.year
+
+    sales_today = 0
+    sales_month = 0
+
+    expenses_today = 0
+    expenses_month = 0
+
+    profit_today = 0
+    profit_month = 0
+
+    received_today = 0
+    received_month = 0
+    received_total = 0
+
+    customer_outstanding_today = 0
+    customer_outstanding_month = 0
+
     # SALES
 
     invoices = await db.invoices.find(
@@ -1013,29 +1036,6 @@ async def dashboard_summary(
     stock_value = 0
     low_stock_items = []
     expiring = []
-
-    today = datetime.now(
-        timezone.utc
-    ).date()
-
-    current_month = today.month
-    current_year = today.year
-
-    sales_today = 0
-    sales_month = 0
-
-    expenses_today = 0
-    expenses_month = 0
-
-    profit_today = 0
-    profit_month = 0
-
-    received_today = 0
-    received_month = 0
-    received_total = 0
-
-    customer_outstanding_today = 0
-    customer_outstanding_month = 0
 
     for m in medicines:
 
