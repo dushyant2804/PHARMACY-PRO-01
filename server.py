@@ -975,25 +975,29 @@ async def dashboard_summary(
 
     for e in expenses:
 
-    amt = float(e.get("amount", 0))
-    total_expenses += amt
+        amt = float(
+            e.get("amount", 0)
+        )
 
-    try:
-        dt = datetime.fromisoformat(
-            e["created_at"]
-        ).date()
+        total_expenses += amt
 
-        if dt == today:
-            expenses_today += amt
+        try:
 
-        if (
-            dt.month == current_month and
-            dt.year == current_year
-        ):
-            expenses_month += amt
+            dt = datetime.fromisoformat(
+                e["created_at"]
+            ).date()
 
-    except Exception:
-        pass
+            if dt == today:
+                expenses_today += amt
+
+            if (
+                dt.month == current_month and
+                dt.year == current_year
+            ):
+                expenses_month += amt
+
+        except Exception:
+            pass
 
     profit = total_sales - total_expenses
     profit_today = sales_today - expenses_today
