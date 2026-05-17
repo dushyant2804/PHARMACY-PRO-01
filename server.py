@@ -926,29 +926,33 @@ async def dashboard_summary(
         {"_id": 0}
     ).to_list(5000)
 
-  total_sales = 0
+    total_sales = 0
 
-  for i in invoices:
+    for i in invoices:
 
-    amt = float(i.get("total", 0))
-    total_sales += amt
+        amt = float(
+            i.get("total", 0)
+        )
 
-    try:
-        dt = datetime.fromisoformat(
-            i["created_at"]
-        ).date()
+        total_sales += amt
 
-        if dt == today:
-            sales_today += amt
+        try:
 
-        if (
-            dt.month == current_month and
-            dt.year == current_year
-        ):
-            sales_month += amt
+            dt = datetime.fromisoformat(
+                i["created_at"]
+            ).date()
 
-    except Exception:
-        pass
+            if dt == today:
+                sales_today += amt
+
+            if (
+                dt.month == current_month and
+                dt.year == current_year
+            ):
+                sales_month += amt
+
+        except Exception:
+            pass
 
     total_gst = sum(
         i.get("gst_total", 0)
