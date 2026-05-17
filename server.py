@@ -926,10 +926,29 @@ async def dashboard_summary(
         {"_id": 0}
     ).to_list(5000)
 
-    total_sales = sum(
-        i.get("total", 0)
-        for i in invoices
-    )
+  total_sales = 0
+
+  for i in invoices:
+
+    amt = float(i.get("total", 0))
+    total_sales += amt
+
+    try:
+        dt = datetime.fromisoformat(
+            i["created_at"]
+        ).date()
+
+        if dt == today:
+            sales_today += amt
+
+        if (
+            dt.month == current_month and
+            dt.year == current_year
+        ):
+            sales_month += amt
+
+    except Exception:
+        pass
 
     total_gst = sum(
         i.get("gst_total", 0)
@@ -948,12 +967,33 @@ async def dashboard_summary(
         {"_id": 0}
     ).to_list(5000)
 
-    total_expenses = sum(
-        e.get("amount", 0)
-        for e in expenses
-    )
+    total_expenses = 0
+
+    for e in expenses:
+
+    amt = float(e.get("amount", 0))
+    total_expenses += amt
+
+    try:
+        dt = datetime.fromisoformat(
+            e["created_at"]
+        ).date()
+
+        if dt == today:
+            expenses_today += amt
+
+        if (
+            dt.month == current_month and
+            dt.year == current_year
+        ):
+            expenses_month += amt
+
+    except Exception:
+        pass
 
     profit = total_sales - total_expenses
+    profit_today = sales_today - expenses_today
+    profit_month = sales_month - expenses_month
 
     # STOCK
 
@@ -969,6 +1009,25 @@ async def dashboard_summary(
     today = datetime.now(
         timezone.utc
     ).date()
+
+    current_month = today.month
+    current_year = today.year
+
+    sales_today = 0
+    sales_month = 0
+
+    expenses_today = 0
+    expenses_month = 0
+
+    profit_today = 0
+    profit_month = 0
+
+    received_today = 0
+    received_month = 0
+    received_total = 0
+
+    customer_outstanding_today = 0
+    customer_outstanding_month = 0
 
     for m in medicines:
 
@@ -1037,17 +1096,57 @@ async def dashboard_summary(
 
     for t in customer_txns:
 
-        if t.get("type") == "sale":
+if t.get("type") == "sale":
 
-            customer_outstanding += float(
-                t.get("amount", 0)
-            )
+    amt = float(
+        t.get("amount", 0)
+    )
+
+    customer_outstanding += amt
+
+    try:
+        dt = datetime.fromisoformat(
+            t["created_at"]
+        ).date()
+
+        if dt == today:
+            customer_outstanding_today += amt
+
+        if (
+            dt.month == current_month and
+            dt.year == current_year
+        ):
+            customer_outstanding_month += amt
+
+    except Exception:
+        pass
 
         elif t.get("type") == "payment":
 
-            customer_outstanding -= float(
+            amt = float(
                 t.get("amount", 0)
             )
+
+            customer_outstanding -= amt
+
+            received_total += amt
+
+            try:
+                dt = datetime.fromisoformat(
+                    t["created_at"]
+                ).date()
+
+                if dt == today:
+                    received_today += amt
+
+                if (
+                    dt.month == current_month and
+                    dt.year == current_year
+                ):
+                    received_month += amt
+
+       except Exception:
+           pass
 
     # DISTRIBUTOR OUTSTANDING
 
@@ -1089,6 +1188,8 @@ async def dashboard_summary(
     return {
 
         "sales": round(total_sales, 2),
+        "sales_month": round(sales_month, 2),
+        "sales_today": round(sales_today, 2),
 
         "gst_collected": round(
             total_gst,
@@ -1104,11 +1205,15 @@ async def dashboard_summary(
             total_expenses,
             2
         ),
+        "expenses_month": round(expenses_month, 2),
+        "expenses_today": round(expenses_today, 2),
 
         "profit": round(
             profit,
             2
         ),
+        "expenses_month": round(expenses_month, 2),
+        "expenses_today": round(expenses_today, 2),
 
         "stock_value": round(
             stock_value,
@@ -1119,11 +1224,31 @@ async def dashboard_summary(
             customer_outstanding,
             2
         ),
+        "customer_outstanding_month": round(
+    customer_outstanding_month,
+    2
+),
+
+"customer_outstanding_today": round(
+    customer_outstanding_today,
+    2
+),
 
         "distributor_outstanding": round(
             distributor_outstanding,
             2
         ),
+        "amount_received": round(received_total, 2),
+
+"amount_received_month": round(
+    received_month,
+    2
+),
+
+"amount_received_today": round(
+    received_today,
+    2
+),
 
         "low_stock_count": len(
             low_stock_items
