@@ -1563,7 +1563,7 @@ async def create_po(
         "invoice_ref": payload.invoice_ref,
         "items": [i.model_dump() for i in payload.items],
         "total": round(total, 2),
-        "status": "pending",  # pending | received
+        "status": "pending",
         "notes": payload.notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "received_at": None,
@@ -1571,26 +1571,64 @@ async def create_po(
 
     await db.purchase_orders.insert_one(po)
 
-    # 🔥 STOCK UPDATE BLOCK (FIXED INDENTATION)
     for i in payload.items:
+
+        purchased_units = (
+            i.quantity *
+            (i.pack_size or 1)
+        )
+
         medicine = await db.medicines.find_one({
             "name": i.name,
             "batch_no": i.batch_no
         })
 
         if medicine:
+
             await db.medicines.update_one(
                 {"_id": medicine["_id"]},
                 {
                     "$inc": {
-                        "purchased_units": i.quantity * (i.pack_size or 1)
+                        "purchased_units": purchased_units
+                    },
+                    "$set": {
+                        "expiry_date": i.expiry_date,
+                        "mrp": i.mrp,
+                        "purchase_price": i.purchase_price,
+                        "manufacturer": i.manufacturer,
+                        "category": i.category,
+                        "pack_size": i.pack_size,
                     }
                 }
             )
 
+        else:
+
+            await db.medicines.insert_one({
+                "id": str(uuid.uuid4()),
+
+                "name": i.name,
+                "batch_no": i.batch_no,
+
+                "expiry_date": i.expiry_date,
+
+                "manufacturer": i.manufacturer,
+                "category": i.category,
+
+                "purchase_price": i.purchase_price,
+                "mrp": i.mrp,
+
+                "pack_size": i.pack_size,
+
+                "purchased_units": purchased_units,
+
+                "sold_units": 0,
+
+                "low_stock_threshold": 10,
+            })
+
     po.pop("_id", None)
     return po
-
 @api_router.get("/purchase-orders")
 async def list_pos(user: dict = Depends(get_current_user)):
     return await db.purchase_orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000)
