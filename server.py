@@ -1553,10 +1553,10 @@ async def create_po(
     payload: POCreate,
     user: dict = Depends(require_role("admin", "pharmacist"))
 ):
-   total = sum(
+    total = sum(
     i.purchase_price * i.quantity
     for i in payload.items
-)
+    )
     po = {
         "id": str(uuid.uuid4()),
         "po_no": f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-{await db.purchase_orders.count_documents({}) + 1:04d}",
