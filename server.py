@@ -1638,6 +1638,150 @@ async def create_po(
 
     po.pop("_id", None)
     return po
+
+
+@api_router.delete("/purchase-orders/{po_id}")
+async def delete_po(
+    po_id: str,
+    user: dict = Depends(require_role("admin"))
+):
+
+    po = await db.purchase_orders.find_one({
+        "id": po_id
+    })
+
+    if not po:
+        raise HTTPException(
+            404,
+            "PO not found"
+        )
+
+    for i in po.get("items", []):
+
+        qty = (
+            int(i.get("quantity", 0)) +
+            int(i.get("free_quantity", 0))
+        )
+
+        medicine = await db.medicines.find_one({
+            "name": i.get("name"),
+            "batch_no": i.get("batch_no")
+        })
+
+        if medicine:
+
+            await db.medicines.update_one(
+                {"_id": medicine["_id"]},
+                {
+                    "$inc": {
+                        "purchased_units": -qty
+                    }
+                }
+            )
+
+    await db.purchase_orders.delete_one({
+        "id": po_id
+    })
+
+    return {
+        "message": "PO deleted"
+    }
+
+
+@api_router.put("/purchase-orders/{po_id}")
+async def update_po(
+    po_id: str,
+    payload: POCreate,
+    user: dict = Depends(require_role("admin"))
+):
+
+    old_po = await db.purchase_orders.find_one({
+        "id": po_id
+    })
+
+    if not old_po:
+        raise HTTPException(
+            404,
+            "PO not found"
+        )
+
+    # REVERSE OLD STOCK
+
+    for i in old_po.get("items", []):
+
+        qty = (
+            int(i.get("quantity", 0)) +
+            int(i.get("free_quantity", 0))
+        )
+
+        medicine = await db.medicines.find_one({
+            "name": i.get("name"),
+            "batch_no": i.get("batch_no")
+        })
+
+        if medicine:
+
+            await db.medicines.update_one(
+                {"_id": medicine["_id"]},
+                {
+                    "$inc": {
+                        "purchased_units": -qty
+                    }
+                }
+            )
+
+    # APPLY NEW STOCK
+
+    for i in payload.items:
+
+        qty = (
+            i.quantity +
+            i.free_quantity
+        )
+
+        medicine = await db.medicines.find_one({
+            "name": i.name,
+            "batch_no": i.batch_no
+        })
+
+        if medicine:
+
+            await db.medicines.update_one(
+                {"_id": medicine["_id"]},
+                {
+                    "$inc": {
+                        "purchased_units": qty
+                    }
+                }
+            )
+
+    total = sum(
+        i.purchase_price * i.quantity
+        for i in payload.items
+    )
+
+    await db.purchase_orders.update_one(
+        {"id": po_id},
+        {
+            "$set": {
+                "distributor_id": payload.distributor_id,
+                "distributor_name": payload.distributor_name,
+                "invoice_ref": payload.invoice_ref,
+                "notes": payload.notes,
+                "items": [
+                    i.model_dump()
+                    for i in payload.items
+                ],
+                "total": round(total, 2),
+            }
+        }
+    )
+
+    return {
+        "message": "PO updated"
+    }
+
+
 @api_router.get("/purchase-orders")
 async def list_pos(user: dict = Depends(get_current_user)):
     return await db.purchase_orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000)
