@@ -1532,6 +1532,7 @@ class POItem(BaseModel):
     manufacturer: str = ""
     category: str = "OTC"
     quantity: int
+    pack_size: str = ""
     purchase_price: float
     mrp: float
     gst_rate: float = 12.0
@@ -1552,11 +1553,10 @@ async def create_po(
     payload: POCreate,
     user: dict = Depends(require_role("admin", "pharmacist"))
 ):
-    total = sum(
-        i.purchase_price * i.quantity * (i.pack_size or 1)
-        for i in payload.items
-    )
-
+   total = sum(
+    i.purchase_price * i.quantity
+    for i in payload.items
+)
     po = {
         "id": str(uuid.uuid4()),
         "po_no": f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-{await db.purchase_orders.count_documents({}) + 1:04d}",
