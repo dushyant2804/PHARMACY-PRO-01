@@ -612,15 +612,27 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
 
     for item in payload.items:
         med = await db.medicines.find_one({"id": item.medicine_id})
+
         if not med:
-            raise HTTPException(status_code=400, detail=f"Medicine not found: {item.name}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Medicine not found: {item.name}"
+            )
 
-        upb = max(int(med.get("units_per_box") or item.units_per_box or 1), 1)
+        upb = max(
+            int(med.get("units_per_box") or item.units_per_box or 1),
+            1
+        )
 
-        units_needed = item.quantity * (upb if item.unit_type == "box" else 1)
+        units_needed = item.quantity * (
+            upb if item.unit_type == "box" else 1
+        )
 
-        # ✅ SINGLE SOURCE OF TRUTH STOCK CHECK
-        available = int(med.get("quantity_units", 0))
+        # FIXED STOCK SYSTEM
+        available = (
+            int(med.get("purchased_units", 0))
+            - int(med.get("sold_units", 0))
+        )
 
         if available < units_needed:
             raise HTTPException(
@@ -628,15 +640,27 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
                 detail=f"Insufficient stock for {item.name}"
             )
 
-        # reduce stock immediately
+        # INCREASE SOLD UNITS
         await db.medicines.update_one(
             {"id": item.medicine_id},
-            {"$inc": {"quantity_units": -units_needed}}
+            {
+                "$inc": {
+                    "sold_units": units_needed
+                }
+            }
         )
 
-        unit_price = item.mrp * (upb if item.unit_type == "box" else 1)
+        unit_price = item.mrp * (
+            upb if item.unit_type == "box" else 1
+        )
+
         line_base = unit_price * item.quantity
-        line_discount = line_base * (item.discount_pct / 100.0)
+
+        line_discount = (
+            line_base *
+            (item.discount_pct / 100.0)
+        )
+
         taxable = line_base - line_discount
 
         line_total_raw += taxable
@@ -648,23 +672,48 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
             "line_total": round(taxable, 2),
         })
 
-    # bill-level discount
-    bill_disc = float(payload.bill_discount_amount or 0.0)
+    bill_disc = float(
+        payload.bill_discount_amount or 0.0
+    )
 
     if not bill_disc and payload.bill_discount_pct:
-        bill_disc = line_total_raw * (float(payload.bill_discount_pct) / 100.0)
+        bill_disc = (
+            line_total_raw *
+            (float(payload.bill_discount_pct) / 100.0)
+        )
 
-    bill_disc = min(bill_disc, line_total_raw)
-    after_disc = max(line_total_raw - bill_disc, 0.0)
+    bill_disc = min(
+        bill_disc,
+        line_total_raw
+    )
 
-    # GST + final calculation
+    after_disc = max(
+        line_total_raw - bill_disc,
+        0.0
+    )
+
     final_items = []
 
-    for it, raw in zip(items_out, [i["line_total"] for i in items_out]):
-        share = (raw / line_total_raw) if line_total_raw else 0
+    for it, raw in zip(
+        items_out,
+        [i["line_total"] for i in items_out]
+    ):
+
+        share = (
+            (raw / line_total_raw)
+            if line_total_raw else 0
+        )
+
         item_after = raw - bill_disc * share
 
-        gst_amount = item_after - (item_after / (1 + it["gst_rate"] / 100.0))
+        gst_amount = (
+            item_after -
+            (
+                item_after /
+                (1 + it["gst_rate"] / 100.0)
+            )
+        )
+
         net = item_after - gst_amount
 
         gst_total += gst_amount
@@ -676,45 +725,72 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
             "net_amount": round(net, 2),
         })
 
-    total = round(subtotal + gst_total, 2)
+    total = round(
+        subtotal + gst_total,
+        2
+    )
 
     paid = float(
-        payload.paid_amount if payload.payment_mode != "cash"
+        payload.paid_amount
+        if payload.payment_mode != "cash"
         else (payload.paid_amount or total)
     )
 
     invoice = {
         "id": str(uuid.uuid4()),
         "invoice_no": await _next_invoice_no(),
+
         "customer_id": payload.customer_id,
         "customer_name": payload.customer_name,
         "customer_phone": payload.customer_phone,
         "customer_gstin": payload.customer_gstin,
-        "referring_doctor": payload.referring_doctor.strip() if payload.referring_doctor else "",
+
+        "referring_doctor": (
+            payload.referring_doctor.strip()
+            if payload.referring_doctor else ""
+        ),
+
         "items": final_items,
+
         "subtotal": round(subtotal, 2),
         "gst_total": round(gst_total, 2),
+
         "bill_discount": round(bill_disc, 2),
+
         "total": total,
+
         "payment_mode": payload.payment_mode,
+
         "paid_amount": paid,
-        "due_amount": round(total - paid, 2),
+
+        "due_amount": round(
+            total - paid,
+            2
+        ),
+
         "notes": payload.notes,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+
         "created_by": user.get("name", ""),
     }
 
     await db.invoices.insert_one(invoice)
 
-    # doctor history
     if invoice["referring_doctor"]:
         await db.doctor_history.update_one(
             {"name": invoice["referring_doctor"]},
-            {"$inc": {"count": 1}, "$set": {"last_used": invoice["created_at"]}},
+            {
+                "$inc": {"count": 1},
+                "$set": {
+                    "last_used": invoice["created_at"]
+                }
+            },
             upsert=True,
         )
 
-    # credit customer tracking
     if payload.customer_id and invoice["due_amount"] > 0:
         await db.customer_transactions.insert_one({
             "id": str(uuid.uuid4()),
@@ -727,7 +803,7 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
         })
 
     return invoice
-
+    
 @api_router.get("/invoices")
 async def list_invoices(
     start: Optional[str] = None,
@@ -1330,16 +1406,50 @@ async def sales_report(start: Optional[str] = None, end: Optional[str] = None, u
 }
 
 @api_router.get("/reports/stock-valuation")
-async def stock_valuation(user: dict = Depends(get_current_user)):
-    medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
-    cost_value = sum(m["purchase_price"] * m["quantity"] for m in medicines)
-    mrp_value = sum(m["mrp"] * m["quantity"] for m in medicines)
+async def stock_valuation(
+    user: dict = Depends(get_current_user)
+):
+    medicines = await db.medicines.find(
+        {},
+        {"_id": 0}
+    ).to_list(5000)
+
+    cost_value = 0
+    mrp_value = 0
+    total_units = 0
+
+    for m in medicines:
+
+        available = (
+            int(m.get("purchased_units", 0))
+            - int(m.get("sold_units", 0))
+        )
+
+        total_units += available
+
+        cost_value += (
+            available *
+            float(m.get("purchase_price", 0))
+        )
+
+        mrp_value += (
+            available *
+            float(m.get("mrp", 0))
+        )
+
     return {
         "total_items": len(medicines),
-        "total_units": sum(m["quantity"] for m in medicines),
+
+        "total_units": total_units,
+
         "cost_value": round(cost_value, 2),
+
         "mrp_value": round(mrp_value, 2),
-        "potential_profit": round(mrp_value - cost_value, 2),
+
+        "potential_profit": round(
+            mrp_value - cost_value,
+            2
+        ),
     }
 
 
@@ -1795,46 +1905,6 @@ async def get_po(pid: str, user: dict = Depends(get_current_user)):
     return po
 
 
-@api_router.post("/purchase-orders/{pid}/receive")
-async def receive_po(pid: str, user: dict = Depends(require_role("admin", "pharmacist"))):
-    po = await db.purchase_orders.find_one({"id": pid})
-    if not po:
-        raise HTTPException(status_code=404, detail="Purchase order not found")
-    if po["status"] == "received":
-        raise HTTPException(status_code=400, detail="Already received")
-
-    for it in po["items"]:
-        if it.get("medicine_id"):
-            existing = await db.medicines.find_one({"id": it["medicine_id"]})
-        else:
-            existing = await db.medicines.find_one({"name": it["name"], "batch_no": it["batch_no"]})
-        if existing:
-            await db.medicines.update_one(
-                {"id": existing["id"]},
-                {"$inc": {"quantity": it["quantity"]},
-                 "$set": {"purchase_price": it["purchase_price"], "mrp": it["mrp"], "expiry_date": it["expiry_date"]}},
-            )
-        else:
-            med = Medicine(
-                name=it["name"], batch_no=it["batch_no"], expiry_date=it["expiry_date"],
-                manufacturer=it.get("manufacturer", ""), distributor=po["distributor_name"],
-                purchase_price=it["purchase_price"], mrp=it["mrp"], quantity=it["quantity"],
-                category=it.get("category", "OTC"), gst_rate=it.get("gst_rate", 12.0),
-            )
-            await db.medicines.insert_one(med.model_dump())
-
-
-    received_at = datetime.now(timezone.utc).isoformat()
-    await db.purchase_orders.update_one(
-        {"id": pid},
-        {"$set": {"status": "received", "received_at": received_at}},
-    )
-    po["status"] = "received"
-    po["received_at"] = received_at
-    po.pop("_id", None)
-    return po
-
-
 # ---------------- Doctors (referring history) ----------------
 @api_router.get("/doctors")
 async def list_doctors(user: dict = Depends(get_current_user)):
@@ -1879,37 +1949,92 @@ class DailySaleCreate(BaseModel):
 
 
 @api_router.post("/daily-sales")
-async def create_daily_sale(payload: DailySaleCreate, user: dict = Depends(get_current_user)):
-    med = await db.medicines.find_one({"id": payload.medicine_id})
-    if not med:
-        raise HTTPException(status_code=400, detail="Medicine not found")
-    upb = max(int(med.get("units_per_box") or 1), 1)
-    units_needed = payload.quantity * (upb if payload.unit_type == "box" else 1)
-    if med["quantity"] < units_needed:
-        raise HTTPException(status_code=400, detail=f"Insufficient stock for {med['name']}")
+async def create_daily_sale(
+    payload: DailySaleCreate,
+    user: dict = Depends(get_current_user)
+):
+    med = await db.medicines.find_one({
+        "id": payload.medicine_id
+    })
 
-    sale_date = payload.sale_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not med:
+        raise HTTPException(
+            status_code=400,
+            detail="Medicine not found"
+        )
+
+    upb = max(
+        int(med.get("units_per_box") or 1),
+        1
+    )
+
+    units_needed = payload.quantity * (
+        upb if payload.unit_type == "box" else 1
+    )
+
+    # FIXED STOCK SYSTEM
+    available = (
+        int(med.get("purchased_units", 0))
+        - int(med.get("sold_units", 0))
+    )
+
+    if available < units_needed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient stock for {med['name']}"
+        )
+
+    sale_date = (
+        payload.sale_date
+        or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
+
     entry = {
         "id": str(uuid.uuid4()),
+
         "medicine_id": payload.medicine_id,
         "medicine_name": med["name"],
+
         "batch_no": med.get("batch_no", ""),
+
         "quantity": payload.quantity,
+
         "unit_type": payload.unit_type,
+
         "units_dispensed": units_needed,
+
         "total_amount": float(payload.total_amount),
+
         "customer_name": payload.customer_name or "Walk-in",
+
         "payment_status": payload.payment_status,
+
         "notes": payload.notes,
+
         "sale_date": sale_date,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+
         "created_by": user.get("name", ""),
     }
-    await db.daily_sales.insert_one(entry)
-    await db.medicines.update_one({"id": payload.medicine_id}, {"$inc": {"quantity": -units_needed}})
-    entry.pop("_id", None)
-    return entry
 
+    await db.daily_sales.insert_one(entry)
+
+    # INCREASE SOLD UNITS
+    await db.medicines.update_one(
+        {"id": payload.medicine_id},
+        {
+            "$inc": {
+                "sold_units": units_needed
+            }
+        }
+    )
+
+    entry.pop("_id", None)
+
+    return entry
 
 @api_router.get("/daily-sales")
 async def list_daily_sales(
@@ -1986,16 +2111,39 @@ async def daily_sales_summary(
     }
 
 @api_router.delete("/daily-sales/{sale_id}")
-async def delete_daily_sale(sale_id: str, user: dict = Depends(require_role("admin", "pharmacist"))):
-    sale = await db.daily_sales.find_one({"id": sale_id})
+async def delete_daily_sale(
+    sale_id: str,
+    user: dict = Depends(require_role("admin", "pharmacist"))
+):
+    sale = await db.daily_sales.find_one({
+        "id": sale_id
+    })
+
     if not sale:
-        raise HTTPException(status_code=404, detail="Entry not found")
-    # Restore stock
+        raise HTTPException(
+            status_code=404,
+            detail="Entry not found"
+        )
+
+    # RESTORE STOCK
     await db.medicines.update_one(
         {"id": sale["medicine_id"]},
-        {"$inc": {"quantity": int(sale.get("units_dispensed", sale.get("quantity", 0)))}},
+        {
+            "$inc": {
+                "sold_units": -int(
+                    sale.get(
+                        "units_dispensed",
+                        sale.get("quantity", 0)
+                    )
+                )
+            }
+        },
     )
-    await db.daily_sales.delete_one({"id": sale_id})
+
+    await db.daily_sales.delete_one({
+        "id": sale_id
+    })
+
     return {"ok": True}
 
 
