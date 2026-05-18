@@ -1535,6 +1535,8 @@ class POItem(BaseModel):
     purchase_price: float
     mrp: float
     gst_rate: float = 12.0
+    free_quantity: int = 0
+    low_stock_threshold: int = 10
 
 
 class POCreate(BaseModel):
@@ -1574,8 +1576,8 @@ async def create_po(
     for i in payload.items:
 
         purchased_units = (
-            i.quantity *
-            (i.pack_size or 1)
+            Number(i.quantity or 0) +
+            Number(i.free_quantity or 0)
         )
 
         medicine = await db.medicines.find_one({
