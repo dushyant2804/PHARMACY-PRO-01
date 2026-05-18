@@ -1525,18 +1525,25 @@ async def backup_import(payload: dict, user: dict = Depends(require_role("admin"
 
 # ---------------- Purchase Orders / GRN ----------------
 class POItem(BaseModel):
-    medicine_id: Optional[str] = None  # may be None for new medicines
+
+    medicine_id: Optional[str] = None
+
     name: str
     batch_no: str
     expiry_date: str
+
     manufacturer: str = ""
     category: str = "OTC"
+
     quantity: int
-    pack_size: str = ""
+    free_quantity: int = 0
+
     purchase_price: float
     mrp: float
     gst_rate: float = 12.0
-    free_quantity: int = 0
+
+    pack_size: str = ""
+
     low_stock_threshold: int = 10
 
 
@@ -1576,9 +1583,9 @@ async def create_po(
     for i in payload.items:
 
         purchased_units = (
-            Number(i.quantity or 0) +
-            Number(i.free_quantity or 0)
-        )
+    i.quantity +
+    i.free_quantity
+)
 
         medicine = await db.medicines.find_one({
             "name": i.name,
