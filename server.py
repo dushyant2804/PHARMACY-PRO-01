@@ -1671,9 +1671,10 @@ async def create_po(
     user: dict = Depends(require_role("admin", "pharmacist"))
 ):
     total = sum(
-    i.purchase_price * i.quantity
-    for i in payload.items
+        i.purchase_price * i.quantity
+        for i in payload.items
     )
+
     po = {
         "id": str(uuid.uuid4()),
         "po_no": f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-{await db.purchase_orders.count_documents({}) + 1:04d}",
@@ -1692,73 +1693,56 @@ async def create_po(
 
     for i in payload.items:
 
-        purchased_units = (
-    i.quantity +
-    i.free_quantity
-)
+        purchased_units = i.quantity + i.free_quantity
 
         medicine = await db.medicines.find_one({
             "name": i.name,
             "batch_no": i.batch_no
         })
 
-if medicine:
+        if medicine:
 
-    await db.medicines.update_one(
-        {"_id": medicine["_id"]},
-        {
-            "$inc": {
-                "purchased_units": purchased_units
-            },
-            "$set": {
+            await db.medicines.update_one(
+                {"_id": medicine["_id"]},
+                {
+                    "$inc": {
+                        "purchased_units": purchased_units
+                    },
+                    "$set": {
+                        "expiry_date": i.expiry_date,
+                        "mrp": i.mrp,
+                        "purchase_price": i.purchase_price,
+                        "manufacturer": i.manufacturer,
+                        "category": i.category,
+                        "pack_size": i.pack_size,
+                        "sold_units": i.sold_units or 0,
+                        "low_stock_threshold": i.low_stock_threshold or 10,
+                        "distributor_name": payload.distributor_name,
+                    }
+                }
+            )
+
+        else:
+
+            await db.medicines.insert_one({
+                "id": str(uuid.uuid4()),
+                "name": i.name,
+                "batch_no": i.batch_no,
                 "expiry_date": i.expiry_date,
-                "mrp": i.mrp,
-                "purchase_price": i.purchase_price,
                 "manufacturer": i.manufacturer,
                 "category": i.category,
+                "purchase_price": i.purchase_price,
+                "mrp": i.mrp,
                 "pack_size": i.pack_size,
+                "purchased_units": purchased_units,
+                "sold_units": i.sold_units or 0,
+                "low_stock_threshold": i.low_stock_threshold or 10,
+                "distributor_name": payload.distributor_name,
+            })
 
-                "sold_units":
-                    i.sold_units or 0,
-
-                "low_stock_threshold":
-                    i.low_stock_threshold or 10,
-
-                "distributor_name":
-                    payload.distributor_name,
-            }
-        }
-    )
-else:
-
-    await db.medicines.insert_one({
-        "id": str(uuid.uuid4()),
-
-        "name": i.name,
-        "batch_no": i.batch_no,
-
-        "expiry_date": i.expiry_date,
-
-        "manufacturer": i.manufacturer,
-        "category": i.category,
-
-        "purchase_price": i.purchase_price,
-        "mrp": i.mrp,
-
-        "pack_size": i.pack_size,
-
-        "purchased_units": purchased_units,
-
-        "sold_units": i.sold_units or 0,
-
-        "low_stock_threshold": i.low_stock_threshold or 10,
-
-        "distributor_name": payload.distributor_name,
-    })
-
-po.pop("_id", None)
-return po
-
+    po.pop("_id", None)
+    return po
+    
 @api_router.delete("/purchase-orders/{po_id}")
 async def delete_po(
     po_id: str,
