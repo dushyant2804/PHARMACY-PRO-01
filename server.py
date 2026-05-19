@@ -1635,25 +1635,21 @@ async def backup_import(payload: dict, user: dict = Depends(require_role("admin"
 
 # ---------------- Purchase Orders / GRN ----------------
 class POItem(BaseModel):
-
-    medicine_id: Optional[str] = None
-
     name: str
     batch_no: str
-    expiry_date: str
-
-    manufacturer: str = ""
-    category: str = "OTC"
-
     quantity: int
     free_quantity: int = 0
+    pack_size: str | None = None
 
     purchase_price: float
     mrp: float
-    gst_rate: float = 12.0
 
-    pack_size: str = ""
+    manufacturer: str | None = None
+    category: str | None = None
 
+    expiry_date: str | None = None
+
+    sold_units: int = 0
     low_stock_threshold: int = 10
 
 
