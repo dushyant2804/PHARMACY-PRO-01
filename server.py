@@ -1704,9 +1704,9 @@ async def create_po(
 
         if medicine:
 
-await db.medicines.update_one(
-    {"_id": medicine["_id"]},
-    {
+    await db.medicines.update_one(
+      {"_id": medicine["_id"]},
+      {
         "$inc": {
             "purchased_units": purchased_units
         },
