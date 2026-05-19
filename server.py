@@ -1656,9 +1656,13 @@ class POItem(BaseModel):
 class POCreate(BaseModel):
     distributor_id: str
     distributor_name: str
-    invoice_ref: str = ""  # supplier's invoice no
-    items: List[POItem]
-    notes: str = ""
+    invoice_ref: str
+
+    po_date: str | None = None   # 👈 ADD THIS
+
+    items: list[POItem]
+
+    notes: str | None = None
 
 
 @api_router.post("/purchase-orders")
