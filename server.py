@@ -110,7 +110,7 @@ class Medicine(BaseModel):
     pack_size: str = ""
 
     # 🔥 BASE STOCK (ONLY INITIAL PURCHASE)
-    purchased_units: int = 0
+    purchased_units: float= 0
 
     category: str = "OTC"
     gst_rate: float = 12.0
@@ -132,7 +132,7 @@ class MedicineCreate(BaseModel):
     pack_size: str = ""
 
     # 🔥 INITIAL STOCK ENTRY ONLY (purchase time)
-    purchased_units: int = 0
+    purchased_units: float= 0
 
     category: str = "OTC"
     gst_rate: float = 12.0
@@ -1637,8 +1637,8 @@ async def backup_import(payload: dict, user: dict = Depends(require_role("admin"
 class POItem(BaseModel):
     name: str
     batch_no: str
-    quantity: int
-    free_quantity: int = 0
+    quantity: float
+    free_quantity: float = 0
     pack_size: str | None = None
 
     purchase_price: float
@@ -1649,7 +1649,7 @@ class POItem(BaseModel):
 
     expiry_date: str | None = None
 
-    sold_units: int = 0
+    sold_units: float = 0
     low_stock_threshold: int = 10
 
 
@@ -1764,8 +1764,8 @@ async def delete_po(
     for i in po.get("items", []):
 
         qty = (
-            int(i.get("quantity", 0)) +
-            int(i.get("free_quantity", 0))
+            float(i.get("quantity", 0)) +
+            float(i.get("free_quantity", 0))
         )
 
         medicine = await db.medicines.find_one({
@@ -1815,8 +1815,8 @@ async def update_po(
     for i in old_po.get("items", []):
 
         qty = (
-            int(i.get("quantity", 0)) +
-            int(i.get("free_quantity", 0))
+            float(i.get("quantity", 0)) +
+            float(i.get("free_quantity", 0))
         )
 
         medicine = await db.medicines.find_one({
