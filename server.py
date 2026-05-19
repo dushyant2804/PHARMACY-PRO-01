@@ -1704,47 +1704,59 @@ async def create_po(
 
         if medicine:
 
-            await db.medicines.update_one(
-                {"_id": medicine["_id"]},
-                {
-                    "$inc": {
-                        "purchased_units": purchased_units
-                    },
-                    "$set": {
-                        "expiry_date": i.expiry_date,
-                        "mrp": i.mrp,
-                        "purchase_price": i.purchase_price,
-                        "manufacturer": i.manufacturer,
-                        "category": i.category,
-                        "pack_size": i.pack_size,
-                    }
-                }
-            )
+await db.medicines.update_one(
+    {"_id": medicine["_id"]},
+    {
+        "$inc": {
+            "purchased_units": purchased_units
+        },
+        "$set": {
+            "expiry_date": i.expiry_date,
+            "mrp": i.mrp,
+            "purchase_price": i.purchase_price,
+            "manufacturer": i.manufacturer,
+            "category": i.category,
+            "pack_size": i.pack_size,
 
+            "sold_units":
+                i.sold_units or 0,
+
+            "low_stock_threshold":
+                i.low_stock_threshold or 10,
+
+            "distributor_name":
+                payload.distributor_name,
+        }
+    }
+)
         else:
 
-            await db.medicines.insert_one({
-                "id": str(uuid.uuid4()),
+await db.medicines.insert_one({
+    "id": str(uuid.uuid4()),
 
-                "name": i.name,
-                "batch_no": i.batch_no,
+    "name": i.name,
+    "batch_no": i.batch_no,
 
-                "expiry_date": i.expiry_date,
+    "expiry_date": i.expiry_date,
 
-                "manufacturer": i.manufacturer,
-                "category": i.category,
+    "manufacturer": i.manufacturer,
+    "category": i.category,
 
-                "purchase_price": i.purchase_price,
-                "mrp": i.mrp,
+    "purchase_price": i.purchase_price,
+    "mrp": i.mrp,
 
-                "pack_size": i.pack_size,
+    "pack_size": i.pack_size,
 
-                "purchased_units": purchased_units,
+    "purchased_units": purchased_units,
 
-                "sold_units": 0,
+    "sold_units": i.sold_units or 0,
 
-                "low_stock_threshold": 10,
-            })
+    "low_stock_threshold":
+        i.low_stock_threshold or 10,
+
+    "distributor_name":
+        payload.distributor_name,
+})
 
     po.pop("_id", None)
     return po
