@@ -1702,33 +1702,33 @@ async def create_po(
             "batch_no": i.batch_no
         })
 
-        if medicine:
+if medicine:
 
     await db.medicines.update_one(
-      {"_id": medicine["_id"]},
-      {
-        "$inc": {
-            "purchased_units": purchased_units
-        },
-        "$set": {
-            "expiry_date": i.expiry_date,
-            "mrp": i.mrp,
-            "purchase_price": i.purchase_price,
-            "manufacturer": i.manufacturer,
-            "category": i.category,
-            "pack_size": i.pack_size,
+        {"_id": medicine["_id"]},
+        {
+            "$inc": {
+                "purchased_units": purchased_units
+            },
+            "$set": {
+                "expiry_date": i.expiry_date,
+                "mrp": i.mrp,
+                "purchase_price": i.purchase_price,
+                "manufacturer": i.manufacturer,
+                "category": i.category,
+                "pack_size": i.pack_size,
 
-            "sold_units":
-                i.sold_units or 0,
+                "sold_units":
+                    i.sold_units or 0,
 
-            "low_stock_threshold":
-                i.low_stock_threshold or 10,
+                "low_stock_threshold":
+                    i.low_stock_threshold or 10,
 
-            "distributor_name":
-                payload.distributor_name,
+                "distributor_name":
+                    payload.distributor_name,
+            }
         }
-    }
-)
+    )
         else:
 
 await db.medicines.insert_one({
