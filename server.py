@@ -1674,12 +1674,14 @@ async def create_po(
     po = {
         "id": str(uuid.uuid4()),
         "po_no": f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-{await db.purchase_orders.count_documents({}) + 1:04d}",
+
+        "po_date": payload.po_date,
+        
         "distributor_id": payload.distributor_id,
         "distributor_name": payload.distributor_name,
         "invoice_ref": payload.invoice_ref,
         "items": [i.model_dump() for i in payload.items],
         "total": round(total, 2),
-        "status": "pending",
         "notes": payload.notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "received_at": None,
