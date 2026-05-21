@@ -1723,11 +1723,9 @@ async def create_po(
     }
 
     await db.purchase_orders.insert_one(po)
-    print("PAYLOAD ITEMS:", payload.items)
 
     for i in payload.items:
 
-        print("ITEM FOUND:", i)
         purchased_units = float(
             i.quantity +
             i.free_quantity
@@ -1920,6 +1918,7 @@ async def update_po(
     })
 
     if not old_po:
+
         raise HTTPException(
             404,
             "PO not found"
@@ -1935,14 +1934,27 @@ async def update_po(
         )
 
         medicine = await db.medicines.find_one({
-            "name": i.get("name"),
-            "batch_no": i.get("batch_no")
+
+            "name":
+                str(
+                    i.get("name", "")
+                ).strip(),
+
+            "batch_no":
+                str(
+                    i.get("batch_no", "")
+                ).strip(),
         })
 
         if medicine:
 
             await db.medicines.update_one(
-                {"_id": medicine["_id"]},
+
+                {
+                    "_id":
+                        medicine["_id"]
+                },
+
                 {
                     "$inc": {
                         "purchased_units": -qty
@@ -1954,26 +1966,291 @@ async def update_po(
 
     for i in payload.items:
 
-        qty = (
+        qty = float(
             i.quantity +
             i.free_quantity
         )
 
+        name = str(
+            i.name or ""
+        ).strip()
+
+        batch_no = str(
+            i.batch_no or ""
+        ).strip()
+
         medicine = await db.medicines.find_one({
-            "name": i.name,
-            "batch_no": i.batch_no
+
+            "name": name,
+
+            "batch_no": batch_no,
         })
 
         if medicine:
 
             await db.medicines.update_one(
-                {"_id": medicine["_id"]},
+
+                {
+                    "_id":
+                        medicine["_id"]
+                },
+
                 {
                     "$inc": {
                         "purchased_units": qty
+                    },
+
+                    "$set": {
+
+                        "expiry_date":
+                            i.expiry_date,
+
+                        "mrp":
+                            i.mrp,
+
+                        "purchase_price":
+                            i.purchase_price,
+
+                        "manufacturer":
+                            i.manufacturer,
+
+                        "category":
+                            i.category,
+
+                        "pack_size":
+                            i.pack_size,
+
+                        "sold_units":
+                            float(
+                                i.sold_units or 0
+                            ),
+
+                        "gst_rate":
+                            i.gst_rate,
+
+                        "low_stock_threshold":
+                            i.low_stock_threshold or 10,
+
+                        "distributor_name":
+                            payload.distributor_name,
                     }
                 }
             )
+
+        else:
+
+            await db.medicines.insert_one({
+
+                "id":
+                    str(uuid.uuid4()),
+
+                "name":
+                    name,
+
+                "batch_no":
+                    batch_no,
+
+                "expiry_date":
+                    i.expiry_date,
+
+                "manufacturer":
+                    i.manufacturer,
+
+                "category":
+                    i.category,
+
+                "purchase_price":
+                    i.purchase_price,
+
+                "mrp":
+                    i.mrp,
+
+                "pack_size":
+                    i.pack_size,
+
+                "purchased_units":
+                    qty,
+
+                "sold_units":
+@api_router.put("/purchase-orders/{po_id}")
+async def update_po(
+    po_id: str,
+    payload: POCreate,
+    user: dict = Depends(require_role("admin"))
+):
+
+    old_po = await db.purchase_orders.find_one({
+        "id": po_id
+    })
+
+    if not old_po:
+
+        raise HTTPException(
+            404,
+            "PO not found"
+        )
+
+    # REVERSE OLD STOCK
+
+    for i in old_po.get("items", []):
+
+        qty = (
+            float(i.get("quantity", 0)) +
+            float(i.get("free_quantity", 0))
+        )
+
+        medicine = await db.medicines.find_one({
+
+            "name":
+                str(
+                    i.get("name", "")
+                ).strip(),
+
+            "batch_no":
+                str(
+                    i.get("batch_no", "")
+                ).strip(),
+        })
+
+        if medicine:
+
+            await db.medicines.update_one(
+
+                {
+                    "_id":
+                        medicine["_id"]
+                },
+
+                {
+                    "$inc": {
+                        "purchased_units": -qty
+                    }
+                }
+            )
+
+    # APPLY NEW STOCK
+
+    for i in payload.items:
+
+        qty = float(
+            i.quantity +
+            i.free_quantity
+        )
+
+        name = str(
+            i.name or ""
+        ).strip()
+
+        batch_no = str(
+            i.batch_no or ""
+        ).strip()
+
+        medicine = await db.medicines.find_one({
+
+            "name": name,
+
+            "batch_no": batch_no,
+        })
+
+        if medicine:
+
+            await db.medicines.update_one(
+
+                {
+                    "_id":
+                        medicine["_id"]
+                },
+
+                {
+                    "$inc": {
+                        "purchased_units": qty
+                    },
+
+                    "$set": {
+
+                        "expiry_date":
+                            i.expiry_date,
+
+                        "mrp":
+                            i.mrp,
+
+                        "purchase_price":
+                            i.purchase_price,
+
+                        "manufacturer":
+                            i.manufacturer,
+
+                        "category":
+                            i.category,
+
+                        "pack_size":
+                            i.pack_size,
+
+                        "sold_units":
+                            float(
+                                i.sold_units or 0
+                            ),
+
+                        "gst_rate":
+                            i.gst_rate,
+
+                        "low_stock_threshold":
+                            i.low_stock_threshold or 10,
+
+                        "distributor_name":
+                            payload.distributor_name,
+                    }
+                }
+            )
+
+        else:
+
+            await db.medicines.insert_one({
+
+                "id":
+                    str(uuid.uuid4()),
+
+                "name":
+                    name,
+
+                "batch_no":
+                    batch_no,
+
+                "expiry_date":
+                    i.expiry_date,
+
+                "manufacturer":
+                    i.manufacturer,
+
+                "category":
+                    i.category,
+
+                "purchase_price":
+                    i.purchase_price,
+
+                "mrp":
+                    i.mrp,
+
+                "pack_size":
+                    i.pack_size,
+
+                "purchased_units":
+                    qty,
+
+                "sold_units":
+                    float(
+                        i.sold_units or 0
+                    ),
+
+                "gst_rate":
+                    i.gst_rate,
+
+                "low_stock_threshold":
+                    i.low_stock_threshold or 10,
+
+                "distributor_name":
+                    payload.distributor_name,
+            })
 
     total = sum(
         i.purchase_price * i.quantity
@@ -1981,18 +2258,36 @@ async def update_po(
     )
 
     await db.purchase_orders.update_one(
-        {"id": po_id},
+
+        {
+            "id": po_id
+        },
+
         {
             "$set": {
-                "distributor_id": payload.distributor_id,
-                "distributor_name": payload.distributor_name,
-                "invoice_ref": payload.invoice_ref,
-                "notes": payload.notes,
+
+                "po_date":
+                    payload.po_date,
+
+                "distributor_id":
+                    payload.distributor_id,
+
+                "distributor_name":
+                    payload.distributor_name,
+
+                "invoice_ref":
+                    payload.invoice_ref,
+
+                "notes":
+                    payload.notes,
+
                 "items": [
                     i.model_dump()
                     for i in payload.items
                 ],
-                "total": round(total, 2),
+
+                "total":
+                    round(total, 2),
             }
         }
     )
@@ -2000,7 +2295,6 @@ async def update_po(
     return {
         "message": "PO updated"
     }
-
 
 @api_router.get("/purchase-orders")
 async def list_pos(user: dict = Depends(get_current_user)):
