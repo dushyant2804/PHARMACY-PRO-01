@@ -1648,7 +1648,7 @@ class POItem(BaseModel):
     category: str | None = None
 
     expiry_date: str | None = None
-
+    gst_rate: float = 5
     sold_units: float = 0
     low_stock_threshold: int = 10
 
@@ -1718,6 +1718,7 @@ async def create_po(
                         "category": i.category,
                         "pack_size": i.pack_size,
                         "sold_units": i.sold_units or 0,
+                        "gst_rate": i.gst_rate,
                         "low_stock_threshold": i.low_stock_threshold or 10,
                         "distributor_name": payload.distributor_name,
                     }
