@@ -1697,9 +1697,10 @@ async def create_po(
 
         purchased_units = i.quantity + i.free_quantity
 
-        medicine = await db.medicines.find_one({
-            "name": i.name,
-            "batch_no": i.batch_no
+medicine = await db.medicines.find_one({
+    "name": i.name.strip(),
+    "batch_no": i.batch_no.strip()
+})
         })
 
         if medicine:
@@ -1708,9 +1709,11 @@ async def create_po(
                 {"_id": medicine["_id"]},
                 {
                     "$inc": {
-                        "purchased_units": purchased_units
+                       "purchased_units": float(purchased_units),
                     },
                     "$set": {
+                        "name": i.name.strip(),
+                        "batch_no": i.batch_no.strip(),
                         "expiry_date": i.expiry_date,
                         "mrp": i.mrp,
                         "purchase_price": i.purchase_price,
@@ -1729,16 +1732,17 @@ async def create_po(
 
             await db.medicines.insert_one({
                 "id": str(uuid.uuid4()),
-                "name": i.name,
-                "batch_no": i.batch_no,
+                "name": i.name.strip(),
+                "batch_no": i.batch_no.strip(),
                 "expiry_date": i.expiry_date,
                 "manufacturer": i.manufacturer,
                 "category": i.category,
                 "purchase_price": i.purchase_price,
                 "mrp": i.mrp,
                 "pack_size": i.pack_size,
-                "purchased_units": purchased_units,
+                "purchased_units": float(purchased_units),
                 "sold_units": i.sold_units or 0,
+                "gst_rate": i.gst_rate,
                 "low_stock_threshold": i.low_stock_threshold or 10,
                 "distributor_name": payload.distributor_name,
             })
