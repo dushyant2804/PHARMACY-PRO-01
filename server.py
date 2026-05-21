@@ -1703,49 +1703,73 @@ medicine = await db.medicines.find_one({
 })
         })
 
-        if medicine:
+if medicine:
 
-            await db.medicines.update_one(
-                {"_id": medicine["_id"]},
-                {
-                    "$inc": {
-                       "purchased_units": float(purchased_units),
-                    },
-                    "$set": {
-                        "name": i.name.strip(),
-                        "batch_no": i.batch_no.strip(),
-                        "expiry_date": i.expiry_date,
-                        "mrp": i.mrp,
-                        "purchase_price": i.purchase_price,
-                        "manufacturer": i.manufacturer,
-                        "category": i.category,
-                        "pack_size": i.pack_size,
-                        "sold_units": i.sold_units or 0,
-                        "gst_rate": i.gst_rate,
-                        "low_stock_threshold": i.low_stock_threshold or 10,
-                        "distributor_name": payload.distributor_name,
-                    }
-                }
-            )
+    await db.medicines.update_one(
+        {"_id": medicine["_id"]},
+        {
+            "$inc": {
+                "purchased_units": float(purchased_units)
+            },
 
-        else:
-
-            await db.medicines.insert_one({
-                "id": str(uuid.uuid4()),
+            "$set": {
                 "name": i.name.strip(),
                 "batch_no": i.batch_no.strip(),
+
                 "expiry_date": i.expiry_date,
+                "mrp": i.mrp,
+                "purchase_price": i.purchase_price,
+
                 "manufacturer": i.manufacturer,
                 "category": i.category,
-                "purchase_price": i.purchase_price,
-                "mrp": i.mrp,
                 "pack_size": i.pack_size,
-                "purchased_units": float(purchased_units),
-                "sold_units": i.sold_units or 0,
+
+                "sold_units": float(i.sold_units or 0),
+
                 "gst_rate": i.gst_rate,
-                "low_stock_threshold": i.low_stock_threshold or 10,
-                "distributor_name": payload.distributor_name,
-            })
+
+                "low_stock_threshold":
+                    i.low_stock_threshold or 10,
+
+                "distributor_name":
+                    payload.distributor_name,
+            }
+        }
+    )
+
+else:
+
+    await db.medicines.insert_one({
+
+        "id": str(uuid.uuid4()),
+
+        "name": i.name.strip(),
+        "batch_no": i.batch_no.strip(),
+
+        "expiry_date": i.expiry_date,
+
+        "manufacturer": i.manufacturer,
+        "category": i.category,
+
+        "purchase_price": i.purchase_price,
+        "mrp": i.mrp,
+
+        "pack_size": i.pack_size,
+
+        "purchased_units":
+            float(purchased_units),
+
+        "sold_units":
+            float(i.sold_units or 0),
+
+        "gst_rate": i.gst_rate,
+
+        "low_stock_threshold":
+            i.low_stock_threshold or 10,
+
+        "distributor_name":
+            payload.distributor_name,
+    })
 
     po.pop("_id", None)
     return po
