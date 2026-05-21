@@ -1723,9 +1723,11 @@ async def create_po(
     }
 
     await db.purchase_orders.insert_one(po)
+    print("PAYLOAD ITEMS:", payload.items)
 
     for i in payload.items:
 
+    print("ITEM FOUND:", i)
         purchased_units = float(
             i.quantity +
             i.free_quantity
