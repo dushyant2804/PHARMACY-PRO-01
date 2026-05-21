@@ -1668,14 +1668,21 @@ class POCreate(BaseModel):
 @api_router.post("/purchase-orders")
 async def create_po(
     payload: POCreate,
-    user: dict = Depends(require_role("admin", "pharmacist"))
+    user: dict = Depends(
+        require_role(
+            "admin",
+            "pharmacist"
+        )
+    )
 ):
+
     total = sum(
         i.purchase_price * i.quantity
         for i in payload.items
     )
 
     po = {
+
         "id": str(uuid.uuid4()),
 
         "po_no": (
@@ -1686,58 +1693,82 @@ async def create_po(
 
         "po_date": payload.po_date,
 
-        "distributor_id": payload.distributor_id,
-        "distributor_name": payload.distributor_name,
+        "distributor_id":
+            payload.distributor_id,
 
-        "invoice_ref": payload.invoice_ref,
+        "distributor_name":
+            payload.distributor_name,
+
+        "invoice_ref":
+            payload.invoice_ref,
 
         "items": [
             i.model_dump()
             for i in payload.items
         ],
 
-        "total": round(total, 2),
+        "total":
+            round(total, 2),
 
-        "notes": payload.notes,
+        "notes":
+            payload.notes,
 
         "created_at":
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
 
-        "received_at": None,
+        "received_at":
+            None,
     }
 
     await db.purchase_orders.insert_one(po)
 
     for i in payload.items:
 
-        purchased_units = (
+        purchased_units = float(
             i.quantity +
             i.free_quantity
         )
 
+        name = str(
+            i.name or ""
+        ).strip()
+
+        batch_no = str(
+            i.batch_no or ""
+        ).strip()
+
         medicine = await db.medicines.find_one({
-            "name": i.name.strip(),
-            "batch_no": i.batch_no.strip(),
+
+            "name": name,
+
+            "batch_no": batch_no,
         })
 
         if medicine:
 
             await db.medicines.update_one(
-                {"_id": medicine["_id"]},
+
+                {
+                    "_id":
+                        medicine["_id"]
+                },
 
                 {
                     "$inc": {
+
                         "purchased_units":
-                            float(purchased_units)
+                            purchased_units
                     },
 
                     "$set": {
 
                         "name":
-                            i.name.strip(),
+                            name,
 
                         "batch_no":
-                            i.batch_no.strip(),
+                            batch_no,
 
                         "expiry_date":
                             i.expiry_date,
@@ -1778,13 +1809,14 @@ async def create_po(
 
             await db.medicines.insert_one({
 
-                "id": str(uuid.uuid4()),
+                "id":
+                    str(uuid.uuid4()),
 
                 "name":
-                    i.name.strip(),
+                    name,
 
                 "batch_no":
-                    i.batch_no.strip(),
+                    batch_no,
 
                 "expiry_date":
                     i.expiry_date,
@@ -1805,7 +1837,7 @@ async def create_po(
                     i.pack_size,
 
                 "purchased_units":
-                    float(purchased_units),
+                    purchased_units,
 
                 "sold_units":
                     float(
