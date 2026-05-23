@@ -17,6 +17,10 @@ from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
+from fastapi import UploadFile, File
+from PIL import Image
+import pytesseract
+import io
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -2382,6 +2386,15 @@ async def delete_daily_sale(
     })
 
     return {"ok": True}
+
+@app.post("/ocr")
+async def ocr_invoice(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    image = Image.open(io.BytesIO(image_bytes))
+
+    text = pytesseract.image_to_string(image)
+
+    return {"extracted_text": text}
 
 
 # ---------------- Mount ----------------
