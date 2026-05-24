@@ -2454,9 +2454,9 @@ async def ocr_invoice(file: UploadFile = File(...)):
         "drug licence",
         "invoice",
     ]
-     inside_table = False
+    inside_table = False
 
-for line in lines:
+    for line in lines:
 
         lower = line.lower()
 
