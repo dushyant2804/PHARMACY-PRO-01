@@ -2393,8 +2393,14 @@ async def ocr_invoice(file: UploadFile = File(...)):
     image_bytes = await file.read()
 
     image = Image.open(io.BytesIO(image_bytes))
+    image = image.convert("L")
 
-    text = pytesseract.image_to_string(image)
+
+    text = pytesseract.image_to_string(
+        image,
+        config="--psm 6"
+    )
+
     
     import re
 
@@ -2402,45 +2408,50 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
     items = []
 
-    skip_words = [
-        "gst",
-        "invoice",
-        "amount",
-        "total",
-        "cgst",
-        "sgst",
-        "discount",
-        "bill",
-        "phone",
-        "address",
-        "tax",
-        "qty",
-        "batch",
-        "expiry",
-    ]
+    invoice_no = ""
+    invoice_date = ""
+
+    for line in lines:
+
+        lower = line.lower()
+
+        if "invoice" in lower and not invoice_no:
+
+            nums = re.findall(r'\d+', line)
+
+            if nums:
+                invoice_no = nums[-1]
+
+        if not invoice_date:
+
+            date_match = re.search(
+                r'(\d{2}/\d{2}/\d{4})',
+                line
+            )
+
+            if date_match:
+                invoice_date = date_match.group(1)
 
     for line in lines:
 
         line = line.strip()
 
-        if len(line) < 8:
+        if len(line) < 15:
             continue
 
-        lower = line.lower()
-
-        if any(word in lower for word in skip_words):
-            continue
-
-        if not re.search(r'\d', line):
+        if "|" in line:
             continue
 
         parts = line.split()
+
+        if len(parts) < 6:
+            continue
 
         expiry = ""
 
         for p in parts:
 
-            if re.match(r'^\d{1,2}/\d{2}$', p):
+            if re.match(r'^\d{2}/\d{2}$', p):
                 expiry = p
                 break
 
@@ -2456,6 +2467,40 @@ async def ocr_invoice(file: UploadFile = File(...)):
                 batch = p
                 break
 
+        qty = 1
+        free_qty = 0
+
+        for p in parts:
+
+            if "+" in p:
+
+                q = p.split("+")
+
+                if len(q) == 2:
+
+                    try:
+                        qty = int(q[0])
+                        free_qty = int(q[1])
+                    except:
+                        pass
+
+        prices = []
+
+        for p in parts:
+
+            try:
+
+                val = float(p)
+
+                if val > 0:
+                    prices.append(val)
+
+            except:
+                pass
+
+        rate = prices[0] if len(prices) > 0 else 0
+        mrp = prices[-1] if len(prices) > 1 else 0
+
         name_parts = []
 
         for p in parts:
@@ -2463,17 +2508,11 @@ async def ocr_invoice(file: UploadFile = File(...)):
             if p == batch:
                 break
 
-            if re.match(r'^\d+(\.\d+)?$', p):
-                continue
-
             name_parts.append(p)
 
-        name = " ".join(name_parts).strip()
+        name = " ".join(name_parts)
 
-        if (
-            len(name) < 3
-            or len(name) > 50
-        ):
+        if len(name) < 3:
             continue
 
         items.append({
@@ -2482,10 +2521,10 @@ async def ocr_invoice(file: UploadFile = File(...)):
             "expiry_date": expiry,
             "manufacturer": "",
             "category": "OTC",
-            "quantity": 1,
-            "free_quantity": 0,
-            "purchase_price": 0,
-            "mrp": 0,
+            "quantity": qty,
+            "free_quantity": free_qty,
+            "purchase_price": rate,
+            "mrp": mrp,
             "gst_rate": 5,
             "pack_size": "",
             "sold_units": 0,
@@ -2496,8 +2535,11 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
     return {
         "extracted_text": text,
+        "invoice_ref": invoice_no,
+        "po_date": invoice_date,
         "items": items
     }
+
 
 
 
