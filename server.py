@@ -2389,12 +2389,86 @@ async def delete_daily_sale(
 
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
+
     image_bytes = await file.read()
+
     image = Image.open(io.BytesIO(image_bytes))
 
     text = pytesseract.image_to_string(image)
 
-    return {"extracted_text": text}
+    lines = text.split("\n")
+
+    items = []
+
+    for line in lines:
+
+        line = line.strip()
+
+        if len(line) < 10:
+            continue
+
+        parts = line.split()
+
+        if len(parts) < 4:
+            continue
+
+        try:
+
+            expiry = None
+
+            for p in parts:
+
+                if "/" in p and len(p) <= 5:
+                    expiry = p
+
+            batch = ""
+
+            for p in parts:
+
+                if any(char.isdigit() for char in p) and any(char.isalpha() for char in p):
+                    batch = p
+                    break
+
+            name_parts = []
+
+            for p in parts:
+
+                if p == batch:
+                    break
+
+                if p.replace(".", "").isdigit():
+                    continue
+
+                name_parts.append(p)
+
+            name = " ".join(name_parts)
+
+            if name and batch:
+
+                items.append({
+                    "name": name,
+                    "batch_no": batch,
+                    "expiry_date": expiry or "",
+                    "manufacturer": "",
+                    "category": "OTC",
+                    "quantity": 1,
+                    "free_quantity": 0,
+                    "purchase_price": 0,
+                    "mrp": 0,
+                    "gst_rate": 5,
+                    "pack_size": "",
+                    "sold_units": 0,
+                    "low_stock_threshold": 10,
+                })
+
+        except:
+            pass
+
+    return {
+        "extracted_text": text,
+        "items": items
+    }
+
 
 
 # ---------------- Mount ----------------
