@@ -2409,10 +2409,10 @@ async def ocr_invoice(file: UploadFile = File(...)):
         "1"
     )
 
-   data = pytesseract.image_to_data(
-        image,
-        config="--oem 3 --psm 4",
-        output_type=pytesseract.Output.DATAFRAME
+    data = pytesseract.image_to_data(
+           image,
+           config="--oem 3 --psm 4",
+           output_type=pytesseract.Output.DATAFRAME
     )
 
     data = data.dropna()
