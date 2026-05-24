@@ -2455,7 +2455,7 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
         if len(parts) < 6:
             continue
-             skip_line = False
+        skip_line = False
 
         bad_words = [
             "gst",
