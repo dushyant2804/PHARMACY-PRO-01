@@ -2390,7 +2390,10 @@ async def delete_daily_sale(
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
 
+    import re
+
     image_bytes = await file.read()
+
     image = Image.open(io.BytesIO(image_bytes))
 
     image = image.convert("L")
@@ -2404,14 +2407,10 @@ async def ocr_invoice(file: UploadFile = File(...)):
         "1"
     )
 
-
     text = pytesseract.image_to_string(
         image,
         config="--oem 3 --psm 4"
     )
-
-    
-    import re
 
     lines = text.split("\n")
 
@@ -2441,6 +2440,21 @@ async def ocr_invoice(file: UploadFile = File(...)):
             if date_match:
                 invoice_date = date_match.group(1)
 
+    bad_words = [
+        "gst",
+        "discount",
+        "tax",
+        "amount",
+        "total",
+        "cgst",
+        "sgst",
+        "net",
+        "mobile",
+        "phone",
+        "drug licence",
+        "invoice",
+    ]
+
     for line in lines:
 
         line = line.strip()
@@ -2448,39 +2462,23 @@ async def ocr_invoice(file: UploadFile = File(...)):
         if len(line) < 15:
             continue
 
-        if "|" in line:
-            continue
+        lower = line.lower()
 
-        parts = line.split()
-
-        if len(parts) < 6:
-            continue
         skip_line = False
-
-        bad_words = [
-            "gst",
-            "discount",
-            "tax",
-            "amount",
-            "total",
-            "cgst",
-            "sgst",
-            "net",
-            "mobile",
-            "phone",
-            "drug licence",
-            "invoice",
-        ]
 
         for word in bad_words:
 
-            if word in line.lower():
+            if word in lower:
                 skip_line = True
                 break
 
         if skip_line:
             continue
 
+        parts = line.split()
+
+        if len(parts) < 6:
+            continue
 
         expiry = ""
 
@@ -2545,13 +2543,15 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
             name_parts.append(p)
 
-        name = " ".join(name_parts)
-         if (
+        name = " ".join(name_parts).strip()
+
+        if (
             len(name) < 5
             or len(name.split()) < 1
         ):
             continue
-            already_exists = any(
+
+        already_exists = any(
             x["name"] == name and
             x["batch_no"] == batch
             for x in items
@@ -2559,7 +2559,6 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
         if already_exists:
             continue
-
 
         items.append({
             "name": name,
@@ -2576,8 +2575,6 @@ async def ocr_invoice(file: UploadFile = File(...)):
             "sold_units": 0,
             "low_stock_threshold": 10,
         })
-
-
 
     return {
         "extracted_text": text,
