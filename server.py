@@ -2478,7 +2478,7 @@ async def ocr_invoice(file: UploadFile = File(...)):
             continue
 
 
-        if len(line) < 15:
+        if len(line) < 25:
             continue
 
         lower = line.lower()
@@ -2496,7 +2496,7 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
         parts = line.split()
 
-        if len(parts) < 6:
+        if len(parts) < 8:
             continue
 
         expiry = ""
@@ -2578,6 +2578,14 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
         if already_exists:
             continue
+            if (
+            not name
+            or not batch
+            or not expiry
+            or rate <= 0
+        ):
+            continue
+
 
         items.append({
             "name": name,
