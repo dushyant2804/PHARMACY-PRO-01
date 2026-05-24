@@ -2395,8 +2395,8 @@ async def ocr_invoice(file: UploadFile = File(...)):
     image = Image.open(io.BytesIO(image_bytes))
 
     text = pytesseract.image_to_string(image)
-
-import re
+    
+    import re
 
     lines = text.split("\n")
 
@@ -2491,6 +2491,8 @@ import re
             "sold_units": 0,
             "low_stock_threshold": 10,
         })
+
+
 
     return {
         "extracted_text": text,
