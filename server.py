@@ -2578,13 +2578,14 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
         if already_exists:
             continue
+            
             if (
-            not name
-            or not batch
-            or not expiry
-            or rate <= 0
-        ):
-            continue
+                not name
+                or not batch
+                or not expiry
+                or rate <= 0
+           ):
+                continue
 
 
         items.append({
