@@ -21,6 +21,8 @@ from fastapi import UploadFile, File
 from PIL import Image
 import pytesseract
 import io
+import pandas as pd
+
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -2407,209 +2409,20 @@ async def ocr_invoice(file: UploadFile = File(...)):
         "1"
     )
 
-    text = pytesseract.image_to_string(
+   data = pytesseract.image_to_data(
         image,
-        config="--oem 3 --psm 4"
+        config="--oem 3 --psm 4",
+        output_type=pytesseract.Output.DATAFRAME
     )
 
-    lines = text.split("\n")
+    data = data.dropna()
 
-    items = []
-
-    invoice_no = ""
-    invoice_date = ""
-
-    for line in lines:
-
-        lower = line.lower()
-
-        if "invoice" in lower and not invoice_no:
-
-            nums = re.findall(r'\d+', line)
-
-            if nums:
-                invoice_no = nums[-1]
-
-        if not invoice_date:
-
-            date_match = re.search(
-                r'(\d{2}/\d{2}/\d{4})',
-                line
-            )
-
-            if date_match:
-                invoice_date = date_match.group(1)
-
-    bad_words = [
-        "gst",
-        "discount",
-        "tax",
-        "amount",
-        "total",
-        "cgst",
-        "sgst",
-        "net",
-        "mobile",
-        "phone",
-        "drug licence",
-        "invoice",
-    ]
-    inside_table = False
-
-    for line in lines:
-
-        lower = line.lower()
-
-        if (
-            "product" in lower
-            and "batch" in lower
-        ):
-            inside_table = True
-            continue
-
-        if (
-            "total" in lower
-            or "gst" in lower
-            or "net amount" in lower
-        ):
-            inside_table = False
-
-        if not inside_table:
-            continue
-
-
-        if len(line) < 25:
-            continue
-
-        lower = line.lower()
-
-        skip_line = False
-
-        for word in bad_words:
-
-            if word in lower:
-                skip_line = True
-                break
-
-        if skip_line:
-            continue
-
-        parts = line.split()
-
-        if len(parts) < 8:
-            continue
-
-        expiry = ""
-
-        for p in parts:
-
-            if re.match(r'^\d{2}/\d{2}$', p):
-                expiry = p
-                break
-
-        batch = ""
-
-        for p in parts:
-
-            if (
-                any(c.isalpha() for c in p)
-                and any(c.isdigit() for c in p)
-                and len(p) >= 4
-            ):
-                batch = p
-                break
-
-        qty = 1
-        free_qty = 0
-
-        for p in parts:
-
-            if "+" in p:
-
-                q = p.split("+")
-
-                if len(q) == 2:
-
-                    try:
-                        qty = int(q[0])
-                        free_qty = int(q[1])
-                    except:
-                        pass
-
-        prices = []
-
-        for p in parts:
-
-            try:
-
-                val = float(p)
-
-                if val > 0:
-                    prices.append(val)
-
-            except:
-                pass
-
-        rate = prices[0] if len(prices) > 0 else 0
-        mrp = prices[-1] if len(prices) > 1 else 0
-
-        name_parts = []
-
-        for p in parts:
-
-            if p == batch:
-                break
-
-            name_parts.append(p)
-
-        name = " ".join(name_parts).strip()
-
-        if (
-            len(name) < 5
-            or len(name.split()) < 1
-        ):
-            continue
-
-        already_exists = any(
-            x["name"] == name and
-            x["batch_no"] == batch
-            for x in items
-        )
-
-        if already_exists:
-            continue
-            
-            if (
-                not name
-                or not batch
-                or not expiry
-                or rate <= 0
-           ):
-                continue
-
-
-        items.append({
-            "name": name,
-            "batch_no": batch,
-            "expiry_date": expiry,
-            "manufacturer": "",
-            "category": "OTC",
-            "quantity": qty,
-            "free_quantity": free_qty,
-            "purchase_price": rate,
-            "mrp": mrp,
-            "gst_rate": 5,
-            "pack_size": "",
-            "sold_units": 0,
-            "low_stock_threshold": 10,
-        })
+    print(data.head(50))
 
     return {
-        "extracted_text": text,
-        "invoice_ref": invoice_no,
-        "po_date": invoice_date,
-        "items": items
+        "rows": data.head(100).to_dict(orient="records")
     }
+
 
 
 
