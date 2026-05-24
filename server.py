@@ -2454,10 +2454,29 @@ async def ocr_invoice(file: UploadFile = File(...)):
         "drug licence",
         "invoice",
     ]
+     inside_table = False
 
-    for line in lines:
+for line in lines:
 
-        line = line.strip()
+        lower = line.lower()
+
+        if (
+            "product" in lower
+            and "batch" in lower
+        ):
+            inside_table = True
+            continue
+
+        if (
+            "total" in lower
+            or "gst" in lower
+            or "net amount" in lower
+        ):
+            inside_table = False
+
+        if not inside_table:
+            continue
+
 
         if len(line) < 15:
             continue
