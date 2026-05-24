@@ -2396,73 +2396,101 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
     text = pytesseract.image_to_string(image)
 
+import re
+
     lines = text.split("\n")
 
     items = []
+
+    skip_words = [
+        "gst",
+        "invoice",
+        "amount",
+        "total",
+        "cgst",
+        "sgst",
+        "discount",
+        "bill",
+        "phone",
+        "address",
+        "tax",
+        "qty",
+        "batch",
+        "expiry",
+    ]
 
     for line in lines:
 
         line = line.strip()
 
-        if len(line) < 10:
+        if len(line) < 8:
+            continue
+
+        lower = line.lower()
+
+        if any(word in lower for word in skip_words):
+            continue
+
+        if not re.search(r'\d', line):
             continue
 
         parts = line.split()
 
-        if len(parts) < 4:
+        expiry = ""
+
+        for p in parts:
+
+            if re.match(r'^\d{1,2}/\d{2}$', p):
+                expiry = p
+                break
+
+        batch = ""
+
+        for p in parts:
+
+            if (
+                any(c.isalpha() for c in p)
+                and any(c.isdigit() for c in p)
+                and len(p) >= 4
+            ):
+                batch = p
+                break
+
+        name_parts = []
+
+        for p in parts:
+
+            if p == batch:
+                break
+
+            if re.match(r'^\d+(\.\d+)?$', p):
+                continue
+
+            name_parts.append(p)
+
+        name = " ".join(name_parts).strip()
+
+        if (
+            len(name) < 3
+            or len(name) > 50
+        ):
             continue
 
-        try:
-
-            expiry = None
-
-            for p in parts:
-
-                if "/" in p and len(p) <= 5:
-                    expiry = p
-
-            batch = ""
-
-            for p in parts:
-
-                if any(char.isdigit() for char in p) and any(char.isalpha() for char in p):
-                    batch = p
-                    break
-
-            name_parts = []
-
-            for p in parts:
-
-                if p == batch:
-                    break
-
-                if p.replace(".", "").isdigit():
-                    continue
-
-                name_parts.append(p)
-
-            name = " ".join(name_parts)
-
-            if name and batch:
-
-                items.append({
-                    "name": name,
-                    "batch_no": batch,
-                    "expiry_date": expiry or "",
-                    "manufacturer": "",
-                    "category": "OTC",
-                    "quantity": 1,
-                    "free_quantity": 0,
-                    "purchase_price": 0,
-                    "mrp": 0,
-                    "gst_rate": 5,
-                    "pack_size": "",
-                    "sold_units": 0,
-                    "low_stock_threshold": 10,
-                })
-
-        except:
-            pass
+        items.append({
+            "name": name,
+            "batch_no": batch,
+            "expiry_date": expiry,
+            "manufacturer": "",
+            "category": "OTC",
+            "quantity": 1,
+            "free_quantity": 0,
+            "purchase_price": 0,
+            "mrp": 0,
+            "gst_rate": 5,
+            "pack_size": "",
+            "sold_units": 0,
+            "low_stock_threshold": 10,
+        })
 
     return {
         "extracted_text": text,
