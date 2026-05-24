@@ -2391,14 +2391,23 @@ async def delete_daily_sale(
 async def ocr_invoice(file: UploadFile = File(...)):
 
     image_bytes = await file.read()
-
     image = Image.open(io.BytesIO(image_bytes))
+
     image = image.convert("L")
+
+    image = image.resize(
+        (image.width * 2, image.height * 2)
+    )
+
+    image = image.point(
+        lambda x: 0 if x < 140 else 255,
+        "1"
+    )
 
 
     text = pytesseract.image_to_string(
         image,
-        config="--psm 6"
+        config="--oem 3 --psm 4"
     )
 
     
@@ -2446,6 +2455,32 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
         if len(parts) < 6:
             continue
+             skip_line = False
+
+        bad_words = [
+            "gst",
+            "discount",
+            "tax",
+            "amount",
+            "total",
+            "cgst",
+            "sgst",
+            "net",
+            "mobile",
+            "phone",
+            "drug licence",
+            "invoice",
+        ]
+
+        for word in bad_words:
+
+            if word in line.lower():
+                skip_line = True
+                break
+
+        if skip_line:
+            continue
+
 
         expiry = ""
 
@@ -2511,9 +2546,20 @@ async def ocr_invoice(file: UploadFile = File(...)):
             name_parts.append(p)
 
         name = " ".join(name_parts)
-
-        if len(name) < 3:
+         if (
+            len(name) < 5
+            or len(name.split()) < 1
+        ):
             continue
+            already_exists = any(
+            x["name"] == name and
+            x["batch_no"] == batch
+            for x in items
+        )
+
+        if already_exists:
+            continue
+
 
         items.append({
             "name": name,
