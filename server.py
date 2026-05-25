@@ -2410,113 +2410,111 @@ async def ocr_invoice(file: UploadFile = File(...)):
     )
 
     data = pytesseract.image_to_data(
-           image,
-           config="--oem 3 --psm 4",
-           output_type=pytesseract.Output.DATAFRAME
+        image,
+        config="--oem 3 --psm 4",
+        output_type=pytesseract.Output.DATAFRAME
     )
 
     data = data.dropna()
+
     lines = []
 
-current_line = []
+    current_line = []
 
-last_top = None
+    last_top = None
 
-for _, row in data.iterrows():
+    for _, row in data.iterrows():
 
-    text = str(row["text"]).strip()
+        text = str(row["text"]).strip()
 
-    if not text:
-        continue
-
-    top = int(row["top"])
-
-    if last_top is None:
-        last_top = top
-
-    # New line detection
-    if abs(top - last_top) > 10:
-
-        if current_line:
-            lines.append(current_line)
-
-        current_line = []
-
-        last_top = top
-
-    current_line.append(text)
-
-if current_line:
-    lines.append(current_line)
-
-items = []
-
-for line in lines:
-
-    joined = " ".join(line)
-
-    print(joined)
-
-    try:
-
-        # Skip headings
-        if any(x in joined.lower() for x in [
-            "invoice",
-            "gst",
-            "amount",
-            "tax",
-            "total",
-            "cgst",
-            "sgst"
-        ]):
+        if not text:
             continue
 
-        if len(line) < 6:
-            continue
+        top = int(row["top"])
 
-        qty = 1
-        mrp = 0
+        if last_top is None:
+            last_top = top
 
-        # Try finding numeric values
-        numbers = []
+        if abs(top - last_top) > 10:
 
-        for word in line:
+            if current_line:
+                lines.append(current_line)
 
-            try:
-                numbers.append(float(word))
-            except:
-                pass
+            current_line = []
 
-        if len(numbers) >= 2:
-            qty = int(numbers[0])
-            mrp = float(numbers[-1])
+            last_top = top
 
-        item = {
-            "name": joined,
-            "batch_no": "",
-            "expiry_date": "",
-            "manufacturer": "",
-            "category": "OTC",
-            "quantity": qty,
-            "free_quantity": 0,
-            "purchase_price": mrp,
-            "mrp": mrp,
-            "gst_rate": 5,
-            "pack_size": "",
-            "sold_units": 0,
-            "low_stock_threshold": 10,
-        }
+        current_line.append(text)
 
-        items.append(item)
+    if current_line:
+        lines.append(current_line)
 
-    except Exception as e:
-        print(e)
+    items = []
 
-return {
+    for line in lines:
+
+        joined = " ".join(line)
+
+        print(joined)
+
+        try:
+
+            if any(x in joined.lower() for x in [
+                "invoice",
+                "gst",
+                "amount",
+                "tax",
+                "total",
+                "cgst",
+                "sgst"
+            ]):
+                continue
+
+            if len(line) < 6:
+                continue
+
+            qty = 1
+            mrp = 0
+
+            numbers = []
+
+            for word in line:
+
+                try:
+                    numbers.append(float(word))
+                except:
+                    pass
+
+            if len(numbers) >= 2:
+                qty = int(numbers[0])
+                mrp = float(numbers[-1])
+
+            item = {
+                "name": joined,
+                "batch_no": "",
+                "expiry_date": "",
+                "manufacturer": "",
+                "category": "OTC",
+                "quantity": qty,
+                "free_quantity": 0,
+                "purchase_price": mrp,
+                "mrp": mrp,
+                "gst_rate": 5,
+                "pack_size": "",
+                "sold_units": 0,
+                "low_stock_threshold": 10,
+            }
+
+            items.append(item)
+
+        except Exception as e:
+            print(e)
+
+    return {
         "invoice_ref": "",
         "po_date": "",
         "items": items
-}
+    }
 
 
 
