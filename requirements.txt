@@ -10,3 +10,5 @@ pillow
 pytesseract
 python-multipart
 pandas
+opencv-python-headless
+numpy
