@@ -2392,123 +2392,113 @@ async def delete_daily_sale(
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
 
-    import re
+    import cv2
+    import numpy as np
+    import pytesseract
+    import io
+
+    from PIL import Image
 
     image_bytes = await file.read()
 
-    image = Image.open(io.BytesIO(image_bytes))
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    image = image.convert("L")
+    image = np.array(pil_image)
 
-    image = image.resize(
-        (image.width * 2, image.height * 2)
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+    # Threshold
+    thresh = cv2.threshold(
+        gray,
+        180,
+        255,
+        cv2.THRESH_BINARY_INV
+    )[1]
+
+    # Detect horizontal lines
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (40, 1)
     )
 
-    image = image.point(
-        lambda x: 0 if x < 140 else 255,
-        "1"
+    detect_horizontal = cv2.morphologyEx(
+        thresh,
+        cv2.MORPH_OPEN,
+        horizontal_kernel,
+        iterations=2
     )
 
-    data = pytesseract.image_to_data(
-        image,
-        config="--oem 3 --psm 4",
-        output_type=pytesseract.Output.DATAFRAME
+    contours, _ = cv2.findContours(
+        detect_horizontal,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
     )
 
-    data = data.dropna()
+    rows = []
 
-    lines = []
+    for c in contours:
 
-    current_line = []
+        x, y, w, h = cv2.boundingRect(c)
 
-    last_top = None
+        if w < 300:
+            continue
 
-    for _, row in data.iterrows():
+        rows.append((y, x, w, h))
 
-        text = str(row["text"]).strip()
+    rows = sorted(rows, key=lambda r: r[0])
+
+    items = []
+
+    for row in rows:
+
+        y, x, w, h = row
+
+        crop = gray[
+            max(0, y - 10): y + h + 10,
+            0:image.shape[1]
+        ]
+
+        text = pytesseract.image_to_string(
+            crop,
+            config="--psm 7"
+        ).strip()
 
         if not text:
             continue
 
-        top = int(row["top"])
+        print("ROW:", text)
 
-        if last_top is None:
-            last_top = top
+        if len(text) < 5:
+            continue
 
-        if abs(top - last_top) > 10:
+        if any(word in text.lower() for word in [
+            "invoice",
+            "gst",
+            "amount",
+            "total",
+            "tax",
+            "cgst",
+            "sgst"
+        ]):
+            continue
 
-            if current_line:
-                lines.append(current_line)
+        item = {
+            "name": text,
+            "batch_no": "",
+            "expiry_date": "",
+            "manufacturer": "",
+            "category": "OTC",
+            "quantity": 1,
+            "free_quantity": 0,
+            "purchase_price": 0,
+            "mrp": 0,
+            "gst_rate": 5,
+            "pack_size": "",
+            "sold_units": 0,
+            "low_stock_threshold": 10,
+        }
 
-            current_line = []
-
-            last_top = top
-
-        current_line.append(text)
-
-    if current_line:
-        lines.append(current_line)
-
-    items = []
-
-    for line in lines:
-
-        joined = " ".join(line)
-
-        print(joined)
-
-        try:
-
-            if any(x in joined.lower() for x in [
-                "invoice",
-                "gst",
-                "amount",
-                "tax",
-                "total",
-                "cgst",
-                "sgst"
-            ]):
-                continue
-
-            if len(line) < 6:
-                continue
-
-            qty = 1
-            mrp = 0
-
-            numbers = []
-
-            for word in line:
-
-                try:
-                    numbers.append(float(word))
-                except:
-                    pass
-
-            if len(numbers) >= 2:
-                qty = int(numbers[0])
-                mrp = float(numbers[-1])
-
-            item = {
-                "name": joined,
-                "batch_no": "",
-                "expiry_date": "",
-                "manufacturer": "",
-                "category": "OTC",
-                "quantity": qty,
-                "free_quantity": 0,
-                "purchase_price": mrp,
-                "mrp": mrp,
-                "gst_rate": 5,
-                "pack_size": "",
-                "sold_units": 0,
-                "low_stock_threshold": 10,
-            }
-
-            items.append(item)
-
-        except Exception as e:
-            print(e)
+        items.append(item)
 
     return {
         "invoice_ref": "",
