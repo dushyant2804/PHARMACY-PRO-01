@@ -2513,9 +2513,9 @@ for line in lines:
         print(e)
 
 return {
-    "invoice_ref": "",
-    "po_date": "",
-    "items": items
+        "invoice_ref": "",
+        "po_date": "",
+        "items": items
 }
 
 
