@@ -18,10 +18,6 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 from fastapi import UploadFile, File
-from PIL import Image
-import pytesseract
-import io
-import pandas as pd
 
 
 # MongoDB connection
