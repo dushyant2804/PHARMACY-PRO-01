@@ -5,10 +5,3 @@ bcrypt
 PyJWT
 motor
 email-validator
-
-pillow
-pytesseract
-python-multipart
-pandas
-opencv-python-headless
-numpy
