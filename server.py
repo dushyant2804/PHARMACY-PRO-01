@@ -2416,14 +2416,107 @@ async def ocr_invoice(file: UploadFile = File(...)):
     )
 
     data = data.dropna()
+    lines = []
 
-    print(data.head(50))
+current_line = []
 
-    return {
-        "rows": data.head(100).to_dict(orient="records")
-    }
+last_top = None
 
+for _, row in data.iterrows():
 
+    text = str(row["text"]).strip()
+
+    if not text:
+        continue
+
+    top = int(row["top"])
+
+    if last_top is None:
+        last_top = top
+
+    # New line detection
+    if abs(top - last_top) > 10:
+
+        if current_line:
+            lines.append(current_line)
+
+        current_line = []
+
+        last_top = top
+
+    current_line.append(text)
+
+if current_line:
+    lines.append(current_line)
+
+items = []
+
+for line in lines:
+
+    joined = " ".join(line)
+
+    print(joined)
+
+    try:
+
+        # Skip headings
+        if any(x in joined.lower() for x in [
+            "invoice",
+            "gst",
+            "amount",
+            "tax",
+            "total",
+            "cgst",
+            "sgst"
+        ]):
+            continue
+
+        if len(line) < 6:
+            continue
+
+        qty = 1
+        mrp = 0
+
+        # Try finding numeric values
+        numbers = []
+
+        for word in line:
+
+            try:
+                numbers.append(float(word))
+            except:
+                pass
+
+        if len(numbers) >= 2:
+            qty = int(numbers[0])
+            mrp = float(numbers[-1])
+
+        item = {
+            "name": joined,
+            "batch_no": "",
+            "expiry_date": "",
+            "manufacturer": "",
+            "category": "OTC",
+            "quantity": qty,
+            "free_quantity": 0,
+            "purchase_price": mrp,
+            "mrp": mrp,
+            "gst_rate": 5,
+            "pack_size": "",
+            "sold_units": 0,
+            "low_stock_threshold": 10,
+        }
+
+        items.append(item)
+
+    except Exception as e:
+        print(e)
+
+return {
+    "invoice_ref": "",
+    "po_date": "",
+    "items": items
+}
 
 
 
