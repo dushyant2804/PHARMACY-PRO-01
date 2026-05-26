@@ -311,31 +311,128 @@ async def list_medicines(
     sort_by: str = "name",
     user: dict = Depends(get_current_user),
 ):
+
     q = {}
 
     if search:
-        q["name"] = {"$regex": search, "$options": "i"}
+        q["name"] = {
+            "$regex": search,
+            "$options": "i"
+        }
+
     if category:
         q["category"] = category
+
     if distributor:
         q["distributor"] = distributor
+
     if manufacturer:
         q["manufacturer"] = manufacturer
+
     if batch_no:
         q["batch_no"] = batch_no
 
-    sort_field = sort_by if sort_by in ("name", "expiry_date", "mrp") else "name"
+    items = await db.medicines.find(
+        q,
+        {"_id": 0}
+    ).to_list(5000)
 
-    items = await db.medicines.find(q, {"_id": 0}).sort(sort_field, 1).to_list(5000)
+    grouped = {}
 
-    # 🔥 IMPORTANT: compute stock properly here (temporary until invoice system)
     for m in items:
-        purchased = int(m.get("purchased_units", 0))
-        sold = int(m.get("sold_units", 0))
 
-        m["quantity_units"] = max(purchased - sold, 0)
+        purchased = int(
+            m.get("purchased_units", 0)
+        )
 
-    return items
+        sold = int(
+            m.get("sold_units", 0)
+        )
+
+        qty = max(
+            purchased - sold,
+            0
+        )
+
+        m["quantity_units"] = qty
+
+        name = (
+            m.get("name") or ""
+        ).strip().upper()
+
+        if name not in grouped:
+
+            grouped[name] = {
+
+                "id":
+                    m.get("id"),
+
+                "name":
+                    m.get("name"),
+
+                "manufacturer":
+                    m.get("manufacturer"),
+
+                "category":
+                    m.get("category"),
+
+                "mrp":
+                    m.get("mrp"),
+
+                "purchase_price":
+                    m.get("purchase_price"),
+
+                "total_stock":
+                    0,
+
+                "batches":
+                    [],
+            }
+
+        grouped[name]["total_stock"] += qty
+
+        grouped[name]["batches"].append({
+
+            "batch_no":
+                m.get("batch_no"),
+
+            "expiry_date":
+                m.get("expiry_date"),
+
+            "quantity_units":
+                qty,
+
+            "purchased_units":
+                purchased,
+
+            "sold_units":
+                sold,
+
+            "pack_size":
+                m.get("pack_size"),
+
+            "distributor_name":
+                m.get("distributor_name"),
+
+            "low_stock_threshold":
+                m.get(
+                    "low_stock_threshold",
+                    10
+                ),
+        })
+
+    result = list(
+        grouped.values()
+    )
+
+    result.sort(
+        key=lambda x: (
+            x.get(sort_by)
+            or ""
+        )
+    )
+
+    return result
 
 
 @api_router.post("/historical-sales")
