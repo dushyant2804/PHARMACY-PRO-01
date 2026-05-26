@@ -153,7 +153,7 @@ class RegularPatient(BaseModel):
     duration_days: int
     last_refill_date: str
 
-    condition: str = "general" 
+    condition: str = "" 
 
 
 class Distributor(BaseModel):
@@ -470,6 +470,35 @@ async def add_patient(payload: RegularPatient):
     await db.regular_patients.insert_one(data)
     return {"success": True}
 
+@api_router.put("/patients/{phone}")
+def update_patient(
+    phone: str,
+    payload: RegularPatient
+):
+
+    global patients_db
+
+    for patient in patients_db:
+
+        if patient["phone"] == phone:
+
+            patient["name"] = payload.name
+            patient["age"] = payload.age
+            patient["phone"] = payload.phone
+            patient["address"] = payload.address
+            patient["medicine_name"] = payload.medicine_name
+            patient["duration_days"] = payload.duration_days
+            patient["last_refill_date"] = payload.last_refill_date
+            patient["condition"] = payload.condition
+
+            return {
+                "message": "Updated"
+            }
+
+    raise HTTPException(
+        status_code=404,
+        detail="Patient not found"
+    )
 
 @api_router.get("/patients")
 async def list_patients():
@@ -500,9 +529,18 @@ async def patient_alerts():
 
 
 @api_router.delete("/patients/{phone}")
-async def delete_patient(phone: str):
-    await db.regular_patients.delete_one({"phone": phone})
-    return {"success": True}
+def delete_patient(phone: int):
+
+    global patients_db
+
+    patients_db = [
+        p for p in patients_db
+        if p["phone"] != phone
+    ]
+
+    return {
+        "message": "Deleted"
+    }
 
 
 from datetime import datetime, timezone
