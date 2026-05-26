@@ -471,29 +471,21 @@ async def add_patient(payload: RegularPatient):
     return {"success": True}
 
 @api_router.put("/patients/{phone}")
-def update_patient(
+async def update_patient(
     phone: str,
     payload: RegularPatient
 ):
 
-    global patients_db
+    await db.regular_patients.update_one(
+        {"phone": phone},
+        {
+            "$set": payload.model_dump()
+        }
+    )
 
-    for patient in patients_db:
-
-        if patient["phone"] == phone:
-
-            patient["name"] = payload.name
-            patient["age"] = payload.age
-            patient["phone"] = payload.phone
-            patient["address"] = payload.address
-            patient["medicine_name"] = payload.medicine_name
-            patient["duration_days"] = payload.duration_days
-            patient["last_refill_date"] = payload.last_refill_date
-            patient["condition"] = payload.condition
-
-            return {
-                "message": "Updated"
-            }
+    return {
+        "success": True
+    }
 
     raise HTTPException(
         status_code=404,
@@ -529,19 +521,15 @@ async def patient_alerts():
 
 
 @api_router.delete("/patients/{phone}")
-def delete_patient(phone: int):
+async def delete_patient(phone: str):
 
-    global patients_db
-
-    patients_db = [
-        p for p in patients_db
-        if p["phone"] != phone
-    ]
+    await db.regular_patients.delete_one(
+        {"phone": phone}
+    )
 
     return {
-        "message": "Deleted"
+        "success": True
     }
-
 
 from datetime import datetime, timezone
 
