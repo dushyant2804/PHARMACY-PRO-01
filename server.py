@@ -312,6 +312,12 @@ async def list_medicines(
     user: dict = Depends(get_current_user),
 ):
 
+    from datetime import datetime, timezone
+
+    today = datetime.now(
+        timezone.utc
+    ).date()
+
     q = {}
 
     if search:
@@ -356,6 +362,45 @@ async def list_medicines(
 
         m["quantity_units"] = qty
 
+        # EXPIRY WARNING SYSTEM
+
+        expiry_status = "safe"
+
+        days_to_expiry = None
+
+        expiry = m.get(
+            "expiry_date"
+        )
+
+        if expiry:
+
+            try:
+
+                exp_date = datetime.fromisoformat(
+                    expiry
+                ).date()
+
+                days_left = (
+                    exp_date - today
+                ).days
+
+                days_to_expiry = days_left
+
+                if days_left < 0:
+
+                    expiry_status = "expired"
+
+                elif days_left <= 30:
+
+                    expiry_status = "critical"
+
+                elif days_left <= 90:
+
+                    expiry_status = "warning"
+
+            except:
+                pass
+
         name = (
             m.get("name") or ""
         ).strip().upper()
@@ -385,11 +430,37 @@ async def list_medicines(
                 "total_stock":
                     0,
 
+                "expiry_status":
+                    "safe",
+
                 "batches":
                     [],
             }
 
         grouped[name]["total_stock"] += qty
+
+        # UPGRADE GROUP WARNING LEVEL
+
+        current = grouped[name][
+            "expiry_status"
+        ]
+
+        priority = {
+            "safe": 0,
+            "warning": 1,
+            "critical": 2,
+            "expired": 3,
+        }
+
+        if (
+            priority[expiry_status]
+            >
+            priority[current]
+        ):
+
+            grouped[name][
+                "expiry_status"
+            ] = expiry_status
 
         grouped[name]["batches"].append({
 
@@ -398,6 +469,12 @@ async def list_medicines(
 
             "expiry_date":
                 m.get("expiry_date"),
+
+            "expiry_status":
+                expiry_status,
+
+            "days_to_expiry":
+                days_to_expiry,
 
             "quantity_units":
                 qty,
