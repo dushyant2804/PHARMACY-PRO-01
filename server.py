@@ -727,6 +727,87 @@ async def _next_invoice_no() -> str:
     count = await db.invoices.count_documents({"invoice_no": {"$regex": f"^INV-{today}-"}})
     return f"INV-{today}-{count + 1:04d}"
 
+async def reduce_fifo_stock(
+    medicine_name: str,
+    qty: int
+):
+
+    batches = await db.medicines.find(
+        {
+            "name": medicine_name
+        },
+        {
+            "_id": 0
+        }
+    ).sort(
+        "expiry_date",
+        1
+    ).to_list(100)
+
+    remaining = qty
+
+    for batch in batches:
+
+        purchased = int(
+            batch.get(
+                "purchased_units",
+                0
+            )
+        )
+
+        sold = int(
+            batch.get(
+                "sold_units",
+                0
+            )
+        )
+
+        available = purchased - sold
+
+        if available <= 0:
+            continue
+
+        # enough stock
+        if available >= remaining:
+
+            await db.medicines.update_one(
+                {
+                    "id": batch["id"]
+                },
+                {
+                    "$inc": {
+                        "sold_units": remaining
+                    }
+                }
+            )
+
+            remaining = 0
+
+            break
+
+        # consume full batch
+        else:
+
+            await db.medicines.update_one(
+                {
+                    "id": batch["id"]
+                },
+                {
+                    "$inc": {
+                        "sold_units": available
+                    }
+                }
+            )
+
+            remaining -= available
+
+    if remaining > 0:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient stock for {medicine_name}"
+        )
+
 
 @api_router.post("/invoices")
 async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_current_user)):
@@ -736,66 +817,57 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
     line_total_raw = 0.0
 
     for item in payload.items:
-        med = await db.medicines.find_one({"id": item.medicine_id})
 
-        if not med:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Medicine not found: {item.name}"
-            )
+    med = await db.medicines.find_one({
+        "name": item.name
+    })
 
-        upb = max(
-            int(med.get("units_per_box") or item.units_per_box or 1),
-            1
+    if not med:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Medicine not found: {item.name}"
         )
 
-        units_needed = item.quantity * (
-            upb if item.unit_type == "box" else 1
-        )
+    upb = max(
+        int(
+            med.get("units_per_box")
+            or item.units_per_box
+            or 1
+        ),
+        1
+    )
 
-        # FIXED STOCK SYSTEM
-        available = (
-            int(med.get("purchased_units", 0))
-            - int(med.get("sold_units", 0))
-        )
+    units_needed = item.quantity * (
+        upb if item.unit_type == "box" else 1
+    )
 
-        if available < units_needed:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Insufficient stock for {item.name}"
-            )
+    # FIFO STOCK REDUCTION
+    await reduce_fifo_stock(
+        item.name,
+        units_needed
+    )
 
-        # INCREASE SOLD UNITS
-        await db.medicines.update_one(
-            {"id": item.medicine_id},
-            {
-                "$inc": {
-                    "sold_units": units_needed
-                }
-            }
-        )
+    unit_price = item.mrp * (
+        upb if item.unit_type == "box" else 1
+    )
 
-        unit_price = item.mrp * (
-            upb if item.unit_type == "box" else 1
-        )
+    line_base = unit_price * item.quantity
 
-        line_base = unit_price * item.quantity
+    line_discount = (
+        line_base *
+        (item.discount_pct / 100.0)
+    )
 
-        line_discount = (
-            line_base *
-            (item.discount_pct / 100.0)
-        )
+    taxable = line_base - line_discount
 
-        taxable = line_base - line_discount
+    line_total_raw += taxable
 
-        line_total_raw += taxable
-
-        items_out.append({
-            **item.model_dump(),
-            "units_per_box": upb,
-            "units_dispensed": units_needed,
-            "line_total": round(taxable, 2),
-        })
+    items_out.append({
+        **item.model_dump(),
+        "units_per_box": upb,
+        "units_dispensed": units_needed,
+        "line_total": round(taxable, 2),
+    })
 
     bill_disc = float(
         payload.bill_discount_amount or 0.0
@@ -2309,12 +2381,12 @@ class DailySaleCreate(BaseModel):
     notes: str = ""
     sale_date: Optional[str] = None  # YYYY-MM-DD; defaults to today
 
-
 @api_router.post("/daily-sales")
 async def create_daily_sale(
     payload: DailySaleCreate,
     user: dict = Depends(get_current_user)
 ):
+
     med = await db.medicines.find_one({
         "id": payload.medicine_id
     })
@@ -2334,13 +2406,44 @@ async def create_daily_sale(
         upb if payload.unit_type == "box" else 1
     )
 
-    # FIXED STOCK SYSTEM
-    available = (
-        int(med.get("purchased_units", 0))
-        - int(med.get("sold_units", 0))
-    )
+    # FIFO BATCH SYSTEM
 
-    if available < units_needed:
+    batches = await db.medicines.find(
+        {
+            "name": med["name"]
+        },
+        {"_id": 0}
+    ).sort("expiry_date", 1).to_list(100)
+
+    remaining = units_needed
+
+    for batch in batches:
+
+        available = (
+            int(batch.get("purchased_units", 0))
+            - int(batch.get("sold_units", 0))
+        )
+
+        if available <= 0:
+            continue
+
+        deduct = min(available, remaining)
+
+        await db.medicines.update_one(
+            {"id": batch["id"]},
+            {
+                "$inc": {
+                    "sold_units": deduct
+                }
+            }
+        )
+
+        remaining -= deduct
+
+        if remaining <= 0:
+            break
+
+    if remaining > 0:
         raise HTTPException(
             status_code=400,
             detail=f"Insufficient stock for {med['name']}"
@@ -2383,16 +2486,6 @@ async def create_daily_sale(
     }
 
     await db.daily_sales.insert_one(entry)
-
-    # INCREASE SOLD UNITS
-    await db.medicines.update_one(
-        {"id": payload.medicine_id},
-        {
-            "$inc": {
-                "sold_units": units_needed
-            }
-        }
-    )
 
     entry.pop("_id", None)
 
