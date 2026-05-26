@@ -816,7 +816,7 @@ async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_curren
     items_out = []
     line_total_raw = 0.0
 
-    for item in payload.items:
+for item in payload.items:
 
     med = await db.medicines.find_one({
         "name": item.name
