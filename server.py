@@ -767,7 +767,7 @@ async def reduce_fifo_stock(
         if available <= 0:
             continue
 
-        # enough stock
+        # enough stock in this batch
         if available >= remaining:
 
             await db.medicines.update_one(
@@ -810,73 +810,82 @@ async def reduce_fifo_stock(
 
 
 @api_router.post("/invoices")
-async def create_invoice(payload: InvoiceCreate, user: dict = Depends(get_current_user)):
+async def create_invoice(
+    payload: InvoiceCreate,
+    user: dict = Depends(get_current_user)
+):
+
     subtotal = 0.0
     gst_total = 0.0
     items_out = []
     line_total_raw = 0.0
 
-for item in payload.items:
+    for item in payload.items:
 
-    med = await db.medicines.find_one({
-        "name": item.name
-    })
+        med = await db.medicines.find_one({
+            "name": item.name
+        })
 
-    if not med:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Medicine not found: {item.name}"
+        if not med:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Medicine not found: {item.name}"
+            )
+
+        upb = max(
+            int(
+                med.get("units_per_box")
+                or item.units_per_box
+                or 1
+            ),
+            1
         )
 
-    upb = max(
-        int(
-            med.get("units_per_box")
-            or item.units_per_box
-            or 1
-        ),
-        1
-    )
+        units_needed = item.quantity * (
+            upb if item.unit_type == "box" else 1
+        )
 
-    units_needed = item.quantity * (
-        upb if item.unit_type == "box" else 1
-    )
+        # FIFO STOCK REDUCTION
+        await reduce_fifo_stock(
+            item.name,
+            units_needed
+        )
 
-    # FIFO STOCK REDUCTION
-    await reduce_fifo_stock(
-        item.name,
-        units_needed
-    )
+        unit_price = item.mrp * (
+            upb if item.unit_type == "box" else 1
+        )
 
-    unit_price = item.mrp * (
-        upb if item.unit_type == "box" else 1
-    )
+        line_base = unit_price * item.quantity
 
-    line_base = unit_price * item.quantity
+        line_discount = (
+            line_base *
+            (item.discount_pct / 100.0)
+        )
 
-    line_discount = (
-        line_base *
-        (item.discount_pct / 100.0)
-    )
+        taxable = line_base - line_discount
 
-    taxable = line_base - line_discount
+        line_total_raw += taxable
 
-    line_total_raw += taxable
-
-    items_out.append({
-        **item.model_dump(),
-        "units_per_box": upb,
-        "units_dispensed": units_needed,
-        "line_total": round(taxable, 2),
-    })
+        items_out.append({
+            **item.model_dump(),
+            "units_per_box": upb,
+            "units_dispensed": units_needed,
+            "line_total": round(taxable, 2),
+        })
 
     bill_disc = float(
         payload.bill_discount_amount or 0.0
     )
 
     if not bill_disc and payload.bill_discount_pct:
+
         bill_disc = (
             line_total_raw *
-            (float(payload.bill_discount_pct) / 100.0)
+            (
+                float(
+                    payload.bill_discount_pct
+                ) / 100.0
+            )
         )
 
     bill_disc = min(
@@ -907,7 +916,10 @@ for item in payload.items:
             item_after -
             (
                 item_after /
-                (1 + it["gst_rate"] / 100.0)
+                (
+                    1 +
+                    it["gst_rate"] / 100.0
+                )
             )
         )
 
@@ -930,26 +942,35 @@ for item in payload.items:
     paid = float(
         payload.paid_amount
         if payload.payment_mode != "cash"
-        else (payload.paid_amount or total)
+        else (
+            payload.paid_amount or total
+        )
     )
 
     invoice = {
+
         "id": str(uuid.uuid4()),
+
         "invoice_no": await _next_invoice_no(),
 
         "customer_id": payload.customer_id,
+
         "customer_name": payload.customer_name,
+
         "customer_phone": payload.customer_phone,
+
         "customer_gstin": payload.customer_gstin,
 
         "referring_doctor": (
             payload.referring_doctor.strip()
-            if payload.referring_doctor else ""
+            if payload.referring_doctor
+            else ""
         ),
 
         "items": final_items,
 
         "subtotal": round(subtotal, 2),
+
         "gst_total": round(gst_total, 2),
 
         "bill_discount": round(bill_disc, 2),
@@ -971,31 +992,56 @@ for item in payload.items:
             timezone.utc
         ).isoformat(),
 
-        "created_by": user.get("name", ""),
+        "created_by": user.get(
+            "name",
+            ""
+        ),
     }
 
-    await db.invoices.insert_one(invoice)
+    await db.invoices.insert_one(
+        invoice
+    )
 
     if invoice["referring_doctor"]:
+
         await db.doctor_history.update_one(
-            {"name": invoice["referring_doctor"]},
+
             {
-                "$inc": {"count": 1},
+                "name": invoice["referring_doctor"]
+            },
+
+            {
+                "$inc": {
+                    "count": 1
+                },
+
                 "$set": {
                     "last_used": invoice["created_at"]
                 }
             },
+
             upsert=True,
         )
 
-    if payload.customer_id and invoice["due_amount"] > 0:
+    if (
+        payload.customer_id
+        and invoice["due_amount"] > 0
+    ):
+
         await db.customer_transactions.insert_one({
+
             "id": str(uuid.uuid4()),
+
             "customer_id": payload.customer_id,
+
             "type": "sale",
+
             "amount": invoice["due_amount"],
+
             "reference": invoice["invoice_no"],
+
             "notes": "Credit sale",
+
             "created_at": invoice["created_at"],
         })
 
