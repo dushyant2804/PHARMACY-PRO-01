@@ -562,7 +562,7 @@ async def create_expense(
     return expense
 
 
-@api_router.get("/reports/monthly-summary")
+@api_router.get("/s/monthly-summary")
 async def monthly_summary(
     month: str,
     user: dict = Depends(get_current_user)
@@ -1534,60 +1534,73 @@ async def dashboard_summary(
     }
     
 @api_router.get("/reports/sales")
-async def sales_report(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def sales_report(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
     q = {}
+
     if start or end:
         q["created_at"] = {}
+
         if start:
             q["created_at"]["$gte"] = start
+
         if end:
             q["created_at"]["$lte"] = end + "T23:59:59"
+
     invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
-    total = sum(i.get("total", 0) for i in invoices)
-    gst = sum(i.get("gst_total", 0) for i in invoices)
-    # Daily breakdown
+
+    total_sales = 0.0
+    total_gst = 0.0
+    total_discount = 0.0
+
     daily = {}
-    for i in invoices:
-        day = i["created_at"][:10]
-        daily[day] = daily.get(day, 0) + i.get("total", 0)
-    # Profit approximation (MRP - purchase_price) * qty from items
+
+    # SALES + DAILY
+    for inv in invoices:
+        total_sales += float(inv.get("total", 0))
+        total_gst += float(inv.get("gst_total", 0))
+        total_discount += float(inv.get("bill_discount", 0))
+
+        day = inv.get("created_at", "")[:10]
+        if day:
+            daily[day] = daily.get(day, 0) + float(inv.get("total", 0))
+
+    # PROFIT (safe + async optimized)
     profit = 0.0
+
     for inv in invoices:
         for it in inv.get("items", []):
-            med = await db.medicines.find_one({"id": it["medicine_id"]}, {"purchase_price": 1})
+            med = await db.medicines.find_one(
+                {"id": it.get("medicine_id")},
+                {"purchase_price": 1}
+            )
+
             if med:
-                profit += (it["mrp"] - med.get("purchase_price", 0)) * it["quantity"]
+                profit += (
+                    float(it.get("mrp", 0)) -
+                    float(med.get("purchase_price", 0))
+                ) * float(it.get("quantity", 0))
+
+    # Convert daily → frontend-friendly array
+    daily_list = [
+        {"date": k, "total": v}
+        for k, v in sorted(daily.items())
+    ]
+
     return {
-    "sales": round(total_sales, 2),
+        "total_sales": round(total_sales, 2),
+        "total_gst": round(total_gst, 2),
+        "total_discount": round(total_discount, 2),
+        "estimated_profit": round(profit, 2),
 
-    "gst_collected": round(total_gst, 2),
+        # IMPORTANT: for your Recharts line chart
+        "daily": daily_list,
 
-    "discount_given": round(total_discount, 2),
-
-    "expenses": 0,
-
-    "profit": round(total_sales, 2),
-
-    "customer_outstanding": round(
-        customer_outstanding,
-        2
-    ),
-
-    "distributor_outstanding": round(
-        distributor_outstanding,
-        2
-    ),
-
-    "stock_value": round(stock_value, 2),
-
-    "low_stock_count": len(low_stock_items),
-
-    "low_stock_items": low_stock_items,
-
-    "expiring_soon_count": 0,
-
-    "expiring_soon": [],
-}
+        "invoice_count": len(invoices)
+    }
 
 @api_router.get("/reports/stock-valuation")
 async def stock_valuation(
