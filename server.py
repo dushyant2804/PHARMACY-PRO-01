@@ -1306,19 +1306,13 @@ async def dashboard_summary(
     q = {}
 
     if start or end:
-
         q["created_at"] = {}
-
         if start:
             q["created_at"]["$gte"] = start
-
         if end:
             q["created_at"]["$lte"] = end
 
-    today = datetime.now(
-        timezone.utc
-    ).date()
-
+    today = datetime.now(timezone.utc).date()
     current_month = today.month
     current_year = today.year
 
@@ -1339,80 +1333,45 @@ async def dashboard_summary(
     customer_outstanding_month = 0
 
     # SALES
-
-    invoices = await db.invoices.find(
-        q,
-        {"_id": 0}
-    ).to_list(5000)
+    invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
 
     total_sales = 0
 
     for i in invoices:
-
-        amt = float(
-            i.get("total", 0)
-        )
-
+        amt = float(i.get("total", 0))
         total_sales += amt
 
         try:
-
-            dt = datetime.fromisoformat(
-                i["created_at"]
-            ).date()
+            dt = datetime.fromisoformat(i["created_at"]).date()
 
             if dt == today:
                 sales_today += amt
 
-            if (
-                dt.month == current_month and
-                dt.year == current_year
-            ):
+            if dt.month == current_month and dt.year == current_year:
                 sales_month += amt
 
         except Exception:
             pass
 
-    total_gst = sum(
-        i.get("gst_total", 0)
-        for i in invoices
-    )
-
-    total_discount = sum(
-        i.get("bill_discount", 0)
-        for i in invoices
-    )
+    total_gst = sum(i.get("gst_total", 0) for i in invoices)
+    total_discount = sum(i.get("bill_discount", 0) for i in invoices)
 
     # EXPENSES
-
-    expenses = await db.expenses.find(
-        q,
-        {"_id": 0}
-    ).to_list(5000)
+    expenses = await db.expenses.find(q, {"_id": 0}).to_list(5000)
 
     total_expenses = 0
 
     for e in expenses:
-
-        amt = float(
-            e.get("amount", 0)
-        )
-
+        amt = float(e.get("amount", 0))
         total_expenses += amt
 
         try:
-
-            dt = datetime.fromisoformat(
-                e["created_at"]
-            ).date()
+            dt = datetime.fromisoformat(e["created_at"]).date()
 
             if dt == today:
                 expenses_today += amt
 
-            if (
-                dt.month == current_month and
-                dt.year == current_year
-            ):
+            if dt.month == current_month and dt.year == current_year:
                 expenses_month += amt
 
         except Exception:
@@ -1422,12 +1381,22 @@ async def dashboard_summary(
     profit_today = sales_today - expenses_today
     profit_month = sales_month - expenses_month
 
-    # STOCK
+    # SAFE EXPIRY PARSER (MM/YY ONLY)
+    def parse_expiry(expiry):
+        try:
+            if not expiry or "/" not in expiry:
+                return None
 
-    medicines = await db.medicines.find(
-        {},
-        {"_id": 0}
-    ).to_list(5000)
+            mm, yy = expiry.split("/")
+            mm = int(mm)
+            yy = int("20" + yy)
+
+            return datetime(yy, mm, 1).date()
+        except:
+            return None
+
+    # STOCK
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
 
     stock_value = 0
     low_stock_items = []
@@ -1435,139 +1404,83 @@ async def dashboard_summary(
 
     for m in medicines:
 
-        purchased = int(
-            m.get("purchased_units", 0)
-        )
+        purchased = int(m.get("purchased_units", 0))
+        sold = int(m.get("sold_units", 0))
 
-        sold = int(
-            m.get("sold_units", 0)
-        )
+        available = max(0, purchased - sold)
 
-        available = purchased - sold
+        stock_value += available * float(m.get("purchase_price", 0))
 
-        stock_value += (
-            available *
-            float(m.get("purchase_price", 0))
-        )
+        threshold = int(m.get("low_stock_threshold") or 10)
 
-        if available <= int(
-            m.get("low_stock_threshold", 10)
-        ):
-
+        if available <= threshold:
             low_stock_items.append({
-                "id": m["id"],
-                "name": m["name"],
+                "id": m.get("id"),
+                "name": m.get("name"),
                 "qty": available,
-                "threshold": m.get(
-                    "low_stock_threshold",
-                    10
-                ),
+                "threshold": threshold,
             })
 
-        try:
+        exp = parse_expiry(m.get("expiry_date"))
 
-            exp = datetime.strptime(
-                m["expiry_date"],
-                "%Y-%m-%d"
-            ).date()
-
-            days_left = (
-                exp - today
-            ).days
+        if exp:
+            days_left = (exp - today).days
 
             if days_left <= 60:
-
                 expiring.append({
-                    "name": m["name"],
-                    "batch_no": m.get(
-                        "batch_no",
-                        ""
-                    ),
+                    "name": m.get("name"),
+                    "batch_no": m.get("batch_no", ""),
                     "days_left": days_left,
                 })
 
-        except Exception:
-            pass
-
     # CUSTOMER OUTSTANDING
-
-    customer_txns = await db.customer_transactions.find(
-        {},
-        {"_id": 0}
-    ).to_list(5000)
+    customer_txns = await db.customer_transactions.find({}, {"_id": 0}).to_list(5000)
 
     customer_outstanding = 0
 
     for t in customer_txns:
 
         if t.get("type") == "sale":
-
-            amt = float(
-                t.get("amount", 0)
-            )
-
+            amt = float(t.get("amount", 0))
             customer_outstanding += amt
 
             try:
-
-                dt = datetime.fromisoformat(
-                    t["created_at"]
-                ).date()
+                dt = datetime.fromisoformat(t["created_at"]).date()
 
                 if dt == today:
                     customer_outstanding_today += amt
 
-                if (
-                    dt.month == current_month and
-                    dt.year == current_year
-                ):
+                if dt.month == current_month and dt.year == current_year:
                     customer_outstanding_month += amt
 
             except Exception:
                 pass
 
         elif t.get("type") == "payment":
-
-            amt = float(
-                t.get("amount", 0)
-            )
-
+            amt = float(t.get("amount", 0))
             customer_outstanding -= amt
-
             received_total += amt
 
             try:
-
-                dt = datetime.fromisoformat(
-                    t["created_at"]
-                ).date()
+                dt = datetime.fromisoformat(t["created_at"]).date()
 
                 if dt == today:
                     received_today += amt
 
-                if (
-                    dt.month == current_month and
-                    dt.year == current_year
-                ):
+                if dt.month == current_month and dt.year == current_year:
                     received_month += amt
 
             except Exception:
                 pass
-                
-    # DISTRIBUTOR OUTSTANDING
 
-    distributors = await db.distributors.find(
-        {},
-        {"_id": 0}
-    ).to_list(1000)
+    # DISTRIBUTOR OUTSTANDING
+    distributors = await db.distributors.find({}, {"_id": 0}).to_list(1000)
 
     distributor_outstanding = 0
 
     for d in distributors:
 
-        bal = float(
-            d.get("opening_balance", 0)
-        )
+        bal = float(d.get("opening_balance", 0))
 
         txns = await db.distributor_transactions.find(
             {"distributor_id": d["id"]},
@@ -1577,95 +1490,46 @@ async def dashboard_summary(
         for t in txns:
 
             if t.get("type") == "purchase":
-
-                bal += float(
-                    t.get("amount", 0)
-                )
+                bal += float(t.get("amount", 0))
 
             elif t.get("type") == "payment":
-
-                bal -= float(
-                    t.get("amount", 0)
-                )
+                bal -= float(t.get("amount", 0))
 
         if bal > 0:
             distributor_outstanding += bal
 
     return {
-
         "sales": round(total_sales, 2),
         "sales_month": round(sales_month, 2),
         "sales_today": round(sales_today, 2),
 
-        "gst_collected": round(
-            total_gst,
-            2
-        ),
+        "gst_collected": round(total_gst, 2),
+        "discount_given": round(total_discount, 2),
 
-        "discount_given": round(
-            total_discount,
-            2
-        ),
-
-        "expenses": round(
-            total_expenses,
-            2
-        ),
+        "expenses": round(total_expenses, 2),
         "expenses_month": round(expenses_month, 2),
         "expenses_today": round(expenses_today, 2),
 
-        "profit": round(
-            profit,
-            2
-        ),
-        "expenses_month": round(expenses_month, 2),
-        "expenses_today": round(expenses_today, 2),
+        "profit": round(profit, 2),
+        "profit_month": round(profit_month, 2),
+        "profit_today": round(profit_today, 2),
 
-        "stock_value": round(
-            stock_value,
-            2
-        ),
+        "stock_value": round(stock_value, 2),
 
-        "customer_outstanding": round(
-            customer_outstanding,
-            2
-        ),
-        "customer_outstanding_month": round(
-    customer_outstanding_month,
-    2
-),
+        "customer_outstanding": round(customer_outstanding, 2),
+        "customer_outstanding_month": round(customer_outstanding_month, 2),
+        "customer_outstanding_today": round(customer_outstanding_today, 2),
 
-"customer_outstanding_today": round(
-    customer_outstanding_today,
-    2
-),
+        "distributor_outstanding": round(distributor_outstanding, 2),
 
-        "distributor_outstanding": round(
-            distributor_outstanding,
-            2
-        ),
         "amount_received": round(received_total, 2),
+        "amount_received_month": round(received_month, 2),
+        "amount_received_today": round(received_today, 2),
 
-"amount_received_month": round(
-    received_month,
-    2
-),
-
-"amount_received_today": round(
-    received_today,
-    2
-),
-
-        "low_stock_count": len(
-            low_stock_items
-        ),
-
+        "low_stock_count": len(low_stock_items),
         "low_stock_items": low_stock_items,
 
-        "expiring_soon_count": len(
-            expiring
-        ),
-
+        "expiring_soon_count": len(expiring),
         "expiring_soon": expiring,
     }
     
@@ -1988,13 +1852,22 @@ class POCreate(BaseModel):
 @api_router.post("/purchase-orders")
 async def create_po(
     payload: POCreate,
-    user: dict = Depends(
-        require_role(
-            "admin",
-            "pharmacist"
-        )
-    )
+    user: dict = Depends(require_role("admin", "pharmacist"))
 ):
+
+    def normalize_expiry(expiry):
+        if not expiry:
+            return ""
+
+        # force MM/YY only
+        if "/" in expiry:
+            parts = expiry.split("/")
+            if len(parts) == 2:
+                mm = parts[0].zfill(2)
+                yy = parts[1][-2:]
+                return f"{mm}/{yy}"
+
+        return expiry[:5]
 
     total = sum(
         i.purchase_price * i.quantity
@@ -2002,125 +1875,63 @@ async def create_po(
     )
 
     po = {
-
         "id": str(uuid.uuid4()),
-
         "po_no": (
-            f"PO-"
-            f"{datetime.now(timezone.utc).strftime('%y%m%d')}-"
+            f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-"
             f"{await db.purchase_orders.count_documents({}) + 1:04d}"
         ),
-
         "po_date": payload.po_date,
-
-        "distributor_id":
-            payload.distributor_id,
-
-        "distributor_name":
-            payload.distributor_name,
-
-        "invoice_ref":
-            payload.invoice_ref,
-
+        "distributor_id": payload.distributor_id,
+        "distributor_name": payload.distributor_name,
+        "invoice_ref": payload.invoice_ref,
         "items": [
-            i.model_dump()
+            {
+                **i.model_dump(),
+                "expiry_date": normalize_expiry(i.expiry_date)
+            }
             for i in payload.items
         ],
-
-        "total":
-            round(total, 2),
-
-        "notes":
-            payload.notes,
-
-        "created_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-
-        "received_at":
-            None,
+        "total": round(total, 2),
+        "notes": payload.notes,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "received_at": None,
     }
 
     await db.purchase_orders.insert_one(po)
 
     for i in payload.items:
 
-        purchased_units = float(
-            i.quantity +
-            i.free_quantity
-        )
+        purchased_units = float(i.quantity + i.free_quantity)
 
-        name = str(
-            i.name or ""
-        ).strip()
-
-        batch_no = str(
-            i.batch_no or ""
-        ).strip()
+        name = str(i.name or "").strip().lower()
+        batch_no = str(i.batch_no or "").strip().upper()
 
         medicine = await db.medicines.find_one({
-
             "name": name,
-
             "batch_no": batch_no,
         })
 
         if medicine:
 
             await db.medicines.update_one(
-
-                {
-                    "_id":
-                        medicine["_id"]
-                },
-
+                {"_id": medicine["_id"]},
                 {
                     "$inc": {
-
-                        "purchased_units":
-                            purchased_units
+                        "purchased_units": purchased_units
                     },
-
                     "$set": {
-
-                        "name":
-                            name,
-
-                        "batch_no":
-                            batch_no,
-
-                        "expiry_date":
-                            i.expiry_date,
-
-                        "mrp":
-                            i.mrp,
-
-                        "purchase_price":
-                            i.purchase_price,
-
-                        "manufacturer":
-                            i.manufacturer,
-
-                        "category":
-                            i.category,
-
-                        "pack_size":
-                            i.pack_size,
-
-                        "sold_units":
-                            float(
-                                i.sold_units or 0
-                            ),
-
-                        "gst_rate":
-                            i.gst_rate,
-
-                        "low_stock_threshold":
-                            i.low_stock_threshold or 10,
-
-                        "distributor_name":
-                            payload.distributor_name,
+                        "name": name,
+                        "batch_no": batch_no,
+                        "expiry_date": normalize_expiry(i.expiry_date),
+                        "mrp": i.mrp,
+                        "purchase_price": i.purchase_price,
+                        "manufacturer": i.manufacturer,
+                        "category": i.category,
+                        "pack_size": i.pack_size,
+                        "sold_units": float(i.sold_units or 0),
+                        "gst_rate": i.gst_rate,
+                        "low_stock_threshold": i.low_stock_threshold or 10,
+                        "distributor_name": payload.distributor_name,
                     }
                 }
             )
@@ -2128,54 +1939,23 @@ async def create_po(
         else:
 
             await db.medicines.insert_one({
-
-                "id":
-                    str(uuid.uuid4()),
-
-                "name":
-                    name,
-
-                "batch_no":
-                    batch_no,
-
-                "expiry_date":
-                    i.expiry_date,
-
-                "manufacturer":
-                    i.manufacturer,
-
-                "category":
-                    i.category,
-
-                "purchase_price":
-                    i.purchase_price,
-
-                "mrp":
-                    i.mrp,
-
-                "pack_size":
-                    i.pack_size,
-
-                "purchased_units":
-                    purchased_units,
-
-                "sold_units":
-                    float(
-                        i.sold_units or 0
-                    ),
-
-                "gst_rate":
-                    i.gst_rate,
-
-                "low_stock_threshold":
-                    i.low_stock_threshold or 10,
-
-                "distributor_name":
-                    payload.distributor_name,
+                "id": str(uuid.uuid4()),
+                "name": name,
+                "batch_no": batch_no,
+                "expiry_date": normalize_expiry(i.expiry_date),
+                "manufacturer": i.manufacturer,
+                "category": i.category,
+                "purchase_price": i.purchase_price,
+                "mrp": i.mrp,
+                "pack_size": i.pack_size,
+                "purchased_units": purchased_units,
+                "sold_units": float(i.sold_units or 0),
+                "gst_rate": i.gst_rate,
+                "low_stock_threshold": i.low_stock_threshold or 10,
+                "distributor_name": payload.distributor_name,
             })
 
     po.pop("_id", None)
-
     return po
     
 @api_router.delete("/purchase-orders/{po_id}")
@@ -2232,126 +2012,70 @@ async def update_po(
     user: dict = Depends(require_role("admin"))
 ):
 
-    old_po = await db.purchase_orders.find_one({
-        "id": po_id
-    })
+    def normalize_expiry(expiry):
+        if not expiry:
+            return ""
+
+        if "/" in expiry:
+            parts = expiry.split("/")
+            if len(parts) == 2:
+                mm = parts[0].zfill(2)
+                yy = parts[1][-2:]
+                return f"{mm}/{yy}"
+
+        return expiry[:5]
+
+    old_po = await db.purchase_orders.find_one({"id": po_id})
 
     if not old_po:
-
-        raise HTTPException(
-            404,
-            "PO not found"
-        )
+        raise HTTPException(404, "PO not found")
 
     # REVERSE OLD STOCK
-
     for i in old_po.get("items", []):
 
-        qty = (
-            float(i.get("quantity", 0)) +
-            float(i.get("free_quantity", 0))
-        )
+        qty = float(i.get("quantity", 0)) + float(i.get("free_quantity", 0))
 
         medicine = await db.medicines.find_one({
-
-            "name":
-                str(
-                    i.get("name", "")
-                ).strip(),
-
-            "batch_no":
-                str(
-                    i.get("batch_no", "")
-                ).strip(),
+            "name": str(i.get("name", "")).strip().lower(),
+            "batch_no": str(i.get("batch_no", "")).strip().upper(),
         })
 
         if medicine:
-
             await db.medicines.update_one(
-
-                {
-                    "_id":
-                        medicine["_id"]
-                },
-
-                {
-                    "$inc": {
-                        "purchased_units": -qty
-                    }
-                }
+                {"_id": medicine["_id"]},
+                {"$inc": {"purchased_units": -qty}}
             )
 
     # APPLY NEW STOCK
-
     for i in payload.items:
 
-        qty = float(
-            i.quantity +
-            i.free_quantity
-        )
+        qty = float(i.quantity + i.free_quantity)
 
-        name = str(
-            i.name or ""
-        ).strip()
-
-        batch_no = str(
-            i.batch_no or ""
-        ).strip()
+        name = str(i.name or "").strip().lower()
+        batch_no = str(i.batch_no or "").strip().upper()
 
         medicine = await db.medicines.find_one({
-
             "name": name,
-
             "batch_no": batch_no,
         })
 
         if medicine:
 
             await db.medicines.update_one(
-
+                {"_id": medicine["_id"]},
                 {
-                    "_id":
-                        medicine["_id"]
-                },
-
-                {
-                    "$inc": {
-                        "purchased_units": qty
-                    },
-
+                    "$inc": {"purchased_units": qty},
                     "$set": {
-
-                        "expiry_date":
-                            i.expiry_date,
-
-                        "mrp":
-                            i.mrp,
-
-                        "purchase_price":
-                            i.purchase_price,
-
-                        "manufacturer":
-                            i.manufacturer,
-
-                        "category":
-                            i.category,
-
-                        "pack_size":
-                            i.pack_size,
-
-                        "sold_units":
-                            float(
-                                i.sold_units or 0
-                            ),
-
-                        "gst_rate":
-                            i.gst_rate,
-
-                        "low_stock_threshold":
-                            i.low_stock_threshold or 10,
-
-                        "distributor_name":
-                            payload.distributor_name,
+                        "expiry_date": normalize_expiry(i.expiry_date),
+                        "mrp": i.mrp,
+                        "purchase_price": i.purchase_price,
+                        "manufacturer": i.manufacturer,
+                        "category": i.category,
+                        "pack_size": i.pack_size,
+                        "sold_units": float(i.sold_units or 0),
+                        "gst_rate": i.gst_rate,
+                        "low_stock_threshold": i.low_stock_threshold or 10,
+                        "distributor_name": payload.distributor_name,
                     }
                 }
             )
@@ -2359,50 +2083,20 @@ async def update_po(
         else:
 
             await db.medicines.insert_one({
-
-                "id":
-                    str(uuid.uuid4()),
-
-                "name":
-                    name,
-
-                "batch_no":
-                    batch_no,
-
-                "expiry_date":
-                    i.expiry_date,
-
-                "manufacturer":
-                    i.manufacturer,
-
-                "category":
-                    i.category,
-
-                "purchase_price":
-                    i.purchase_price,
-
-                "mrp":
-                    i.mrp,
-
-                "pack_size":
-                    i.pack_size,
-
-                "purchased_units":
-                    qty,
-
-                "sold_units":
-                    float(
-                        i.sold_units or 0
-                    ),
-
-                "gst_rate":
-                    i.gst_rate,
-
-                "low_stock_threshold":
-                    i.low_stock_threshold or 10,
-
-                "distributor_name":
-                    payload.distributor_name,
+                "id": str(uuid.uuid4()),
+                "name": name,
+                "batch_no": batch_no,
+                "expiry_date": normalize_expiry(i.expiry_date),
+                "manufacturer": i.manufacturer,
+                "category": i.category,
+                "purchase_price": i.purchase_price,
+                "mrp": i.mrp,
+                "pack_size": i.pack_size,
+                "purchased_units": qty,
+                "sold_units": float(i.sold_units or 0),
+                "gst_rate": i.gst_rate,
+                "low_stock_threshold": i.low_stock_threshold or 10,
+                "distributor_name": payload.distributor_name,
             })
 
     total = sum(
@@ -2411,43 +2105,27 @@ async def update_po(
     )
 
     await db.purchase_orders.update_one(
-
-        {
-            "id": po_id
-        },
-
+        {"id": po_id},
         {
             "$set": {
-
-                "po_date":
-                    payload.po_date,
-
-                "distributor_id":
-                    payload.distributor_id,
-
-                "distributor_name":
-                    payload.distributor_name,
-
-                "invoice_ref":
-                    payload.invoice_ref,
-
-                "notes":
-                    payload.notes,
-
+                "po_date": payload.po_date,
+                "distributor_id": payload.distributor_id,
+                "distributor_name": payload.distributor_name,
+                "invoice_ref": payload.invoice_ref,
+                "notes": payload.notes,
                 "items": [
-                    i.model_dump()
+                    {
+                        **i.model_dump(),
+                        "expiry_date": normalize_expiry(i.expiry_date)
+                    }
                     for i in payload.items
                 ],
-
-                "total":
-                    round(total, 2),
+                "total": round(total, 2),
             }
         }
     )
 
-    return {
-        "message": "PO updated"
-    }
+    return {"message": "PO updated"}
 
 @api_router.get("/purchase-orders")
 async def list_pos(user: dict = Depends(get_current_user)):
