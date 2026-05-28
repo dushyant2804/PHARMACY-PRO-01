@@ -2060,11 +2060,6 @@ async def update_po(
 
        "batch_no":
          str(i.get("batch_no", "")).strip().upper(),
-
-       "expiry_date":
-         normalize_expiry(
-           i.get("expiry_date", "")
-         ),
       })
 
     # APPLY NEW STOCK
