@@ -496,12 +496,6 @@ async def list_medicines(
 
             "distributor_name":
                 m.get("distributor_name"),
-
-            "low_stock_threshold":
-                m.get(
-                    "low_stock_threshold",
-                    10
-                ),
         })
 
     result = list(
@@ -2078,52 +2072,58 @@ async def update_po(
     if not old_po:
         raise HTTPException(404, "PO not found")
 
-    # REMOVE OLD MEDICINES OF THIS PO
+    # REVERSE OLD PO STOCK
+for i in old_po.get("items", []):
 
-    for i in old_po.get("items", []):
+    qty = float(i.get("quantity", 0)) + float(i.get("free_quantity", 0))
 
-      await db.medicines.delete_many({
+    name = str(i.get("name", "")).strip().lower()
+    batch_no = str(i.get("batch_no", "")).strip().upper()
 
-       "name":
-         str(i.get("name", "")).strip(),
-
-       "batch_no":
-         str(i.get("batch_no", "")).strip().upper(),
-      })
-
-    # APPLY NEW STOCK
-    for i in payload.items:
-
-        qty = float(i.quantity + i.free_quantity)
-
-        name = str(i.name or "").strip()
-        batch_no = str(i.batch_no or "").strip().upper()
-
-        medicine = await db.medicines.find_one({
+    await db.medicines.update_one(
+        {
             "name": name,
-            "batch_no": batch_no,
-        })
+            "batch_no": batch_no
+        },
+        {
+            "$inc": {
+                "purchased_units": -qty
+            }
+        }
+    )
 
-        if medicine:
+    # APPLY NEW PO STOCK
+for i in payload.items:
 
-            await db.medicines.update_one(
-                {"_id": medicine["_id"]},
-                {
-                    "$inc": {"purchased_units": qty},
-                    "$set": {
-                        "expiry_date": normalize_expiry(i.expiry_date),
-                        "mrp": i.mrp,
-                        "purchase_price": i.purchase_price,
-                        "manufacturer": i.manufacturer,
-                        "category": i.category,
-                        "pack_size": i.pack_size,
-                        "sold_units": float(i.sold_units or 0),
-                        "gst_rate": i.gst_rate,
-                        "low_stock_threshold": i.low_stock_threshold or 10,
-                        "distributor_name": payload.distributor_name,
-                    }
-                }
-            )
+    qty = float(i.quantity or 0) + float(i.free_quantity or 0)
+
+    name = str(i.name or "").strip().lower()
+    batch_no = str(i.batch_no or "").strip().upper()
+
+    await db.medicines.update_one(
+        {
+            "name": name,
+            "batch_no": batch_no
+        },
+        {
+            "$inc": {
+                "purchased_units": qty
+            },
+            "$set": {
+                "expiry_date": normalize_expiry(i.expiry_date),
+                "mrp": i.mrp,
+                "purchase_price": i.purchase_price,
+                "manufacturer": i.manufacturer,
+                "category": i.category,
+                "pack_size": i.pack_size,
+                "sold_units": float(i.sold_units or 0),
+                "gst_rate": i.gst_rate,
+                "low_stock_threshold": i.low_stock_threshold or 10,
+                "distributor_name": payload.distributor_name,
+            }
+        },
+        upsert=True
+    )
 
         else:
 
