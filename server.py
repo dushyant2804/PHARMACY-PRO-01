@@ -1919,50 +1919,38 @@ async def create_po(
     )
 
     po = {
-        "id": str(uuid.uuid4()),
-        "po_no": (
-            f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-"
-            f"{await db.purchase_orders.count_documents({}) + 1:04d}"
-        ),
-        "po_date": payload.po_date,
-        "distributor_id": payload.distributor_id,
-        "distributor_name": payload.distributor_name,
-        "invoice_ref": payload.invoice_ref,
-        "items": [
-           {
-             **i.model_dump(),
-             "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
-             "expiry_date": normalize_expiry(i.expiry_date),
-           }
-           for i in payload.items
-        ]
-        "total": round(payload.grand_total, 2),
+    "id": str(uuid.uuid4()),
+    "po_no": (
+        f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-"
+        f"{await db.purchase_orders.count_documents({}) + 1:04d}"
+    ),
+    "po_date": payload.po_date,
+    "distributor_id": payload.distributor_id,
+    "distributor_name": payload.distributor_name,
+    "invoice_ref": payload.invoice_ref,
 
-        "sub_total":
-          payload.sub_total,
+    "items": [
+        {
+            **i.model_dump(),
+            "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
+            "expiry_date": normalize_expiry(i.expiry_date),
+        }
+        for i in payload.items
+    ],
+    "total": round(payload.grand_total, 2),
 
-        "scheme_discount":
-          payload.scheme_discount,
+    "sub_total": payload.sub_total,
+    "scheme_discount": payload.scheme_discount,
+    "cash_discount": payload.cash_discount,
+    "total_cgst": payload.total_cgst,
+    "total_sgst": payload.total_sgst,
+    "round_off": payload.round_off,
+    "grand_total": payload.grand_total,
 
-        "cash_discount":
-          payload.cash_discount,
-
-        "total_cgst":
-          payload.total_cgst,
-
-        "total_sgst":
-          payload.total_sgst,
-
-        "round_off":
-          payload.round_off,
-
-        "grand_total":
-          payload.grand_total,
-        
-        "notes": payload.notes,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "received_at": None,
-    }
+    "notes": payload.notes,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "received_at": None,
+}
 
     await db.purchase_orders.insert_one(po)
 
