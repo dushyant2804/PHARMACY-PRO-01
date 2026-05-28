@@ -1910,7 +1910,29 @@ async def create_po(
             }
             for i in payload.items
         ],
-        "total": round(total, 2),
+        "total": round(payload.grand_total, 2),
+
+        "sub_total":
+          payload.sub_total,
+
+        "scheme_discount":
+          payload.scheme_discount,
+
+        "cash_discount":
+          payload.cash_discount,
+
+        "total_cgst":
+          payload.total_cgst,
+
+        "total_sgst":
+          payload.total_sgst,
+
+        "round_off":
+          payload.round_off,
+
+        "grand_total":
+          payload.grand_total,
+        
         "notes": payload.notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "received_at": None,
@@ -2136,7 +2158,28 @@ async def update_po(
                     }
                     for i in payload.items
                 ],
-                "total": round(total, 2),
+                "total": round(payload.grand_total, 2),
+
+                "sub_total":
+                  payload.sub_total,
+
+                "scheme_discount":
+                  payload.scheme_discount,
+
+                "cash_discount":
+                  payload.cash_discount,
+
+                "total_cgst":
+                  payload.total_cgst,
+
+                "total_sgst":
+                  payload.total_sgst,
+
+                "round_off":
+                  payload.round_off,
+
+                "grand_total":
+                  payload.grand_total,,
             }
         }
     )
