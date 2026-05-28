@@ -1866,6 +1866,13 @@ class POCreate(BaseModel):
     items: list[POItem]
 
     notes: str | None = None
+    sub_total: float = 0
+    scheme_discount: float = 0
+    cash_discount: float = 0
+    total_cgst: float = 0
+    total_sgst: float = 0
+    round_off: float = 0
+    grand_total: float = 0
 
 
 @api_router.post("/purchase-orders")
