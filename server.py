@@ -513,7 +513,8 @@ async def list_medicines(
     
 @api_router.put("/medicines/{medicine_id}/threshold")
 async def update_threshold(medicine_id: str, payload: dict):
-    await db.medicines.update_one(
+
+    result = await db.medicines.update_one(
         {"id": medicine_id},
         {
             "$set": {
@@ -521,8 +522,18 @@ async def update_threshold(medicine_id: str, payload: dict):
             }
         }
     )
-    return {"message": "threshold updated"}
 
+    # IMPORTANT: verify update happened
+    if result.matched_count == 0:
+        raise HTTPException(404, "Medicine not found")
+
+    # return fresh value
+    updated = await db.medicines.find_one({"id": medicine_id})
+
+    return {
+        "message": "threshold updated",
+        "low_stock_threshold": updated.get("low_stock_threshold")
+    }
 
 
 @api_router.post("/historical-sales")
