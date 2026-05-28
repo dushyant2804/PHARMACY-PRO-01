@@ -2055,7 +2055,7 @@ async def update_po(
                      "expiry_date": normalize_expiry(i.expiry_date),
                    }
                    for i in payload.items
-                ]
+                ],
                 "total": round(payload.grand_total, 2),
 
                 "sub_total":
