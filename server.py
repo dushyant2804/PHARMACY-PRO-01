@@ -2044,25 +2044,7 @@ async def update_po(
     if not old_po:
         raise HTTPException(404, "PO not found")
 
-    # REVERSE OLD PO STOCK
-    for i in old_po.get("items", []):
-
-        qty = float(i.get("quantity", 0)) + float(i.get("free_quantity", 0))
-
-        name = str(i.get("name", "")).strip().lower()
-        batch_no = str(i.get("batch_no", "")).strip().upper()
-
-        await db.medicines.update_one(
-            {
-                "name": name,
-                "batch_no": batch_no
-            },
-            {
-                "$inc": {
-                    "purchased_units": -qty
-                }
-            }
-        )
+# ONLY UPDATE PO — DO NOT TOUCH INVENTORY
 
     total = sum(
         i.purchase_price * i.quantity
