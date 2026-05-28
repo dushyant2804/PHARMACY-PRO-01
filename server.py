@@ -2420,7 +2420,7 @@ async def rebuild_inventory():
                     "gst_rate": i.get("gst_rate"),
                     "purchased_units": 0,
                     "sold_units": float(i.get("sold_units", 0)),
-                    "low_stock_threshold": i.get("low_stock_threshold", 10),
+                    "low_stock_threshold": i.get("low_stock_threshold"),
                 }
 
             medicines[key]["purchased_units"] += qty
