@@ -1972,7 +1972,6 @@ async def create_po(
                         "pack_size": i.pack_size,
                         "sold_units": float(i.sold_units or 0),
                         "gst_rate": i.gst_rate,
-                        "low_stock_threshold": i.low_stock_threshold or 10,
                         "distributor_name": payload.distributor_name,
                     }
                 }
@@ -2118,7 +2117,6 @@ for i in payload.items:
                 "pack_size": i.pack_size,
                 "sold_units": float(i.sold_units or 0),
                 "gst_rate": i.gst_rate,
-                "low_stock_threshold": i.low_stock_threshold or 10,
                 "distributor_name": payload.distributor_name,
             }
         },
@@ -2140,7 +2138,6 @@ for i in payload.items:
                 "purchased_units": qty,
                 "sold_units": float(i.sold_units or 0),
                 "gst_rate": i.gst_rate,
-                "low_stock_threshold": i.low_stock_threshold or 10,
                 "distributor_name": payload.distributor_name,
             })
 
