@@ -1932,7 +1932,7 @@ async def create_po(
            {
              **i.model_dump(),
              "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
-             "expiry_date": normalize_expiry(i.expiry_date)
+             "expiry_date": normalize_expiry(i.expiry_date),
            }
            for i in payload.items
         ]
@@ -2064,7 +2064,7 @@ async def update_po(
                    {
                      **i.model_dump(),
                      "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
-                     "expiry_date": normalize_expiry(i.expiry_date)
+                     "expiry_date": normalize_expiry(i.expiry_date),
                    }
                    for i in payload.items
                 ]
