@@ -751,6 +751,16 @@ async def delete_medicine(med_id: str, user: dict = Depends(require_role("admin"
     await db.medicines.delete_one({"id": med_id})
     return {"ok": True}
 
+@api_router.delete("/medicines/clear-all")
+async def clear_all_medicines(
+    user: dict = Depends(require_role("admin"))
+):
+    await db.medicines.delete_many({})
+
+    return {
+        "message": "All medicines deleted"
+    }
+
 
 # ---------------- Distributors ----------------
 @api_router.get("/distributors")
