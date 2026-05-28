@@ -510,6 +510,19 @@ async def list_medicines(
     )
 
     return result
+    
+@api_router.put("/medicines/{medicine_id}/threshold")
+async def update_threshold(medicine_id: str, payload: dict):
+    await db.medicines.update_one(
+        {"id": medicine_id},
+        {
+            "$set": {
+                "low_stock_threshold": int(payload["low_stock_threshold"])
+            }
+        }
+    )
+    return {"message": "threshold updated"}
+
 
 
 @api_router.post("/historical-sales")
@@ -2122,24 +2135,6 @@ for i in payload.items:
         },
         upsert=True
     )
-
-        else:
-
-            await db.medicines.insert_one({
-                "id": str(uuid.uuid4()),
-                "name": name,
-                "batch_no": batch_no,
-                "expiry_date": normalize_expiry(i.expiry_date),
-                "manufacturer": i.manufacturer,
-                "category": i.category,
-                "purchase_price": i.purchase_price,
-                "mrp": i.mrp,
-                "pack_size": i.pack_size,
-                "purchased_units": qty,
-                "sold_units": float(i.sold_units or 0),
-                "gst_rate": i.gst_rate,
-                "distributor_name": payload.distributor_name,
-            })
 
     total = sum(
         i.purchase_price * i.quantity
