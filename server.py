@@ -2043,21 +2043,23 @@ async def update_po(
     if not old_po:
         raise HTTPException(404, "PO not found")
 
-    # REVERSE OLD STOCK
-    for i in old_po.get("items", []):
+    # REMOVE OLD MEDICINES OF THIS PO
 
-        qty = float(i.get("quantity", 0)) + float(i.get("free_quantity", 0))
+for i in old_po.get("items", []):
 
-        medicine = await db.medicines.find_one({
-            "name": str(i.get("name", "")).strip().lower(),
-            "batch_no": str(i.get("batch_no", "")).strip().upper(),
-        })
+    await db.medicines.delete_many({
 
-        if medicine:
-            await db.medicines.update_one(
-                {"_id": medicine["_id"]},
-                {"$inc": {"purchased_units": -qty}}
-            )
+        "name":
+            str(i.get("name", "")).strip().lower(),
+
+        "batch_no":
+            str(i.get("batch_no", "")).strip().upper(),
+
+        "expiry_date":
+            normalize_expiry(
+                i.get("expiry_date", "")
+            ),
+    })
 
     # APPLY NEW STOCK
     for i in payload.items:
