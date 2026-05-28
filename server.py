@@ -1951,7 +1951,7 @@ async def create_po(
 
         purchased_units = float(i.quantity + i.free_quantity)
 
-        name = str(i.name or "").strip().lower()
+        name = str(i.name or "").strip()
         batch_no = str(i.batch_no or "").strip().upper()
 
         medicine = await db.medicines.find_one({
@@ -2085,7 +2085,7 @@ async def update_po(
       await db.medicines.delete_many({
 
        "name":
-         str(i.get("name", "")).strip().lower(),
+         str(i.get("name", "")).strip(),
 
        "batch_no":
          str(i.get("batch_no", "")).strip().upper(),
@@ -2096,7 +2096,7 @@ async def update_po(
 
         qty = float(i.quantity + i.free_quantity)
 
-        name = str(i.name or "").strip().lower()
+        name = str(i.name or "").strip()
         batch_no = str(i.batch_no or "").strip().upper()
 
         medicine = await db.medicines.find_one({
