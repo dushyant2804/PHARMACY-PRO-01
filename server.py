@@ -2051,21 +2051,21 @@ async def update_po(
 
     # REMOVE OLD MEDICINES OF THIS PO
 
-for i in old_po.get("items", []):
+    for i in old_po.get("items", []):
 
-    await db.medicines.delete_many({
+      await db.medicines.delete_many({
 
-        "name":
-            str(i.get("name", "")).strip().lower(),
+       "name":
+         str(i.get("name", "")).strip().lower(),
 
-        "batch_no":
-            str(i.get("batch_no", "")).strip().upper(),
+       "batch_no":
+         str(i.get("batch_no", "")).strip().upper(),
 
-        "expiry_date":
-            normalize_expiry(
-                i.get("expiry_date", "")
-            ),
-    })
+       "expiry_date":
+         normalize_expiry(
+           i.get("expiry_date", "")
+         ),
+      })
 
     # APPLY NEW STOCK
     for i in payload.items:
