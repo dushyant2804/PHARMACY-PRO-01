@@ -1929,12 +1929,13 @@ async def create_po(
         "distributor_name": payload.distributor_name,
         "invoice_ref": payload.invoice_ref,
         "items": [
-            {
-                **i.model_dump(),
-                "expiry_date": normalize_expiry(i.expiry_date)
-            }
-            for i in payload.items
-        ],
+           {
+             **i.model_dump(),
+             "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
+             "expiry_date": normalize_expiry(i.expiry_date)
+           }
+           for i in payload.items
+        ]
         "total": round(payload.grand_total, 2),
 
         "sub_total":
@@ -1965,62 +1966,9 @@ async def create_po(
 
     await db.purchase_orders.insert_one(po)
 
-    for i in payload.items:
-
-        purchased_units = float(i.quantity + i.free_quantity)
-
-        name = str(i.name or "").strip()
-        batch_no = str(i.batch_no or "").strip().upper()
-
-        medicine = await db.medicines.find_one({
-            "name": name,
-            "batch_no": batch_no,
-        })
-
-        if medicine:
-
-            await db.medicines.update_one(
-                {"_id": medicine["_id"]},
-                {
-                    "$inc": {
-                        "purchased_units": purchased_units
-                    },
-                    "$set": {
-                        "name": name,
-                        "batch_no": batch_no,
-                        "expiry_date": normalize_expiry(i.expiry_date),
-                        "mrp": i.mrp,
-                        "purchase_price": i.purchase_price,
-                        "manufacturer": i.manufacturer,
-                        "category": i.category,
-                        "pack_size": i.pack_size,
-                        "sold_units": float(i.sold_units or 0),
-                        "gst_rate": i.gst_rate,
-                        "distributor_name": payload.distributor_name,
-                    }
-                }
-            )
-
-        else:
-
-            await db.medicines.insert_one({
-                "id": str(uuid.uuid4()),
-                "name": name,
-                "batch_no": batch_no,
-                "expiry_date": normalize_expiry(i.expiry_date),
-                "manufacturer": i.manufacturer,
-                "category": i.category,
-                "purchase_price": i.purchase_price,
-                "mrp": i.mrp,
-                "pack_size": i.pack_size,
-                "purchased_units": purchased_units,
-                "sold_units": float(i.sold_units or 0),
-                "gst_rate": i.gst_rate,
-                "low_stock_threshold": i.low_stock_threshold or 10,
-                "distributor_name": payload.distributor_name,
-            })
-
+    
     po.pop("_id", None)
+    await rebuild_inventory()
     return po
     
 @api_router.delete("/purchase-orders/{po_id}")
@@ -2065,6 +2013,7 @@ async def delete_po(
     await db.purchase_orders.delete_one({
         "id": po_id
     })
+    await rebuild_inventory()
 
     return {
         "message": "PO deleted"
@@ -2115,38 +2064,6 @@ async def update_po(
             }
         )
 
-    # APPLY NEW PO STOCK
-    for i in payload.items:
-
-        qty = float(i.quantity or 0) + float(i.free_quantity or 0)
-
-        name = str(i.name or "").strip().lower()
-        batch_no = str(i.batch_no or "").strip().upper()
-
-        await db.medicines.update_one(
-            {
-                "name": name,
-                "batch_no": batch_no
-            },
-            {
-                "$inc": {
-                    "purchased_units": qty
-                },
-                "$set": {
-                    "expiry_date": normalize_expiry(i.expiry_date),
-                    "mrp": i.mrp,
-                    "purchase_price": i.purchase_price,
-                    "manufacturer": i.manufacturer,
-                    "category": i.category,
-                    "pack_size": i.pack_size,
-                    "sold_units": float(i.sold_units or 0),
-                    "gst_rate": i.gst_rate,
-                    "distributor_name": payload.distributor_name,
-                }
-            },
-            upsert=True
-        )
-
     total = sum(
         i.purchase_price * i.quantity
         for i in payload.items
@@ -2162,12 +2079,13 @@ async def update_po(
                 "invoice_ref": payload.invoice_ref,
                 "notes": payload.notes,
                 "items": [
-                    {
-                        **i.model_dump(),
-                        "expiry_date": normalize_expiry(i.expiry_date)
-                    }
-                    for i in payload.items
-                ],
+                   {
+                     **i.model_dump(),
+                     "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
+                     "expiry_date": normalize_expiry(i.expiry_date)
+                   }
+                   for i in payload.items
+                ]
                 "total": round(payload.grand_total, 2),
 
                 "sub_total":
@@ -2193,6 +2111,7 @@ async def update_po(
             }
         }
     )
+    await rebuild_inventory()
 
     return {"message": "PO updated"}
 
@@ -2470,6 +2389,46 @@ async def delete_daily_sale(
     })
 
     return {"ok": True}
+
+
+# =========================
+# INVENTORY REBUILDER (CORE LOGIC)
+# =========================
+
+async def rebuild_inventory():
+    medicines = {}
+
+    cursor = db.purchase_orders.find({})
+
+    async for po in cursor:
+        for i in po.get("items", []):
+
+            key = i.get("medicine_key")
+
+            qty = float(i.get("quantity", 0)) + float(i.get("free_quantity", 0))
+
+            if key not in medicines:
+                medicines[key] = {
+                    "name": i.get("name"),
+                    "batch_no": i.get("batch_no"),
+                    "expiry_date": i.get("expiry_date"),
+                    "manufacturer": i.get("manufacturer"),
+                    "category": i.get("category"),
+                    "mrp": i.get("mrp"),
+                    "purchase_price": i.get("purchase_price"),
+                    "pack_size": i.get("pack_size"),
+                    "gst_rate": i.get("gst_rate"),
+                    "purchased_units": 0,
+                    "sold_units": float(i.get("sold_units", 0)),
+                    "low_stock_threshold": i.get("low_stock_threshold", 10),
+                }
+
+            medicines[key]["purchased_units"] += qty
+
+    await db.medicines.delete_many({})
+
+    for m in medicines.values():
+        await db.medicines.insert_one(m)
 
 
 # ---------------- Mount ----------------
