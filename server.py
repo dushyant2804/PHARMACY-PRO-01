@@ -488,6 +488,12 @@ async def list_medicines(
             "pack_size":
                 m.get("pack_size"),
 
+            "purchase_price":
+              m.get("purchase_price"),
+
+            "mrp":
+              m.get("mrp"),
+
             "distributor_name":
                 m.get("distributor_name"),
 
