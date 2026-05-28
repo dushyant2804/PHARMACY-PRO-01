@@ -2179,7 +2179,7 @@ async def update_po(
                   payload.round_off,
 
                 "grand_total":
-                  payload.grand_total,,
+                  payload.grand_total,
             }
         }
     )
