@@ -2085,56 +2085,56 @@ async def update_po(
         raise HTTPException(404, "PO not found")
 
     # REVERSE OLD PO STOCK
-for i in old_po.get("items", []):
+    for i in old_po.get("items", []):
 
-    qty = float(i.get("quantity", 0)) + float(i.get("free_quantity", 0))
+        qty = float(i.get("quantity", 0)) + float(i.get("free_quantity", 0))
 
-    name = str(i.get("name", "")).strip().lower()
-    batch_no = str(i.get("batch_no", "")).strip().upper()
+        name = str(i.get("name", "")).strip().lower()
+        batch_no = str(i.get("batch_no", "")).strip().upper()
 
-    await db.medicines.update_one(
-        {
-            "name": name,
-            "batch_no": batch_no
-        },
-        {
-            "$inc": {
-                "purchased_units": -qty
+        await db.medicines.update_one(
+            {
+                "name": name,
+                "batch_no": batch_no
+            },
+            {
+                "$inc": {
+                    "purchased_units": -qty
+                }
             }
-        }
-    )
+        )
 
     # APPLY NEW PO STOCK
-for i in payload.items:
+    for i in payload.items:
 
-    qty = float(i.quantity or 0) + float(i.free_quantity or 0)
+        qty = float(i.quantity or 0) + float(i.free_quantity or 0)
 
-    name = str(i.name or "").strip().lower()
-    batch_no = str(i.batch_no or "").strip().upper()
+        name = str(i.name or "").strip().lower()
+        batch_no = str(i.batch_no or "").strip().upper()
 
-    await db.medicines.update_one(
-        {
-            "name": name,
-            "batch_no": batch_no
-        },
-        {
-            "$inc": {
-                "purchased_units": qty
+        await db.medicines.update_one(
+            {
+                "name": name,
+                "batch_no": batch_no
             },
-            "$set": {
-                "expiry_date": normalize_expiry(i.expiry_date),
-                "mrp": i.mrp,
-                "purchase_price": i.purchase_price,
-                "manufacturer": i.manufacturer,
-                "category": i.category,
-                "pack_size": i.pack_size,
-                "sold_units": float(i.sold_units or 0),
-                "gst_rate": i.gst_rate,
-                "distributor_name": payload.distributor_name,
-            }
-        },
-        upsert=True
-    )
+            {
+                "$inc": {
+                    "purchased_units": qty
+                },
+                "$set": {
+                    "expiry_date": normalize_expiry(i.expiry_date),
+                    "mrp": i.mrp,
+                    "purchase_price": i.purchase_price,
+                    "manufacturer": i.manufacturer,
+                    "category": i.category,
+                    "pack_size": i.pack_size,
+                    "sold_units": float(i.sold_units or 0),
+                    "gst_rate": i.gst_rate,
+                    "distributor_name": payload.distributor_name,
+                }
+            },
+            upsert=True
+        )
 
     total = sum(
         i.purchase_price * i.quantity
