@@ -1455,9 +1455,13 @@ async def dashboard_summary(
 
         stock_value += available * float(m.get("purchase_price", 0))
 
-        threshold = int(m.get("low_stock_threshold") or 10)
+        threshold = m.get("low_stock_threshold")
 
-        if available <= threshold:
+        if (
+           threshold is not None
+           and
+           available <= threshold
+        ):
             low_stock_items.append({
                 "id": m.get("id"),
                 "name": m.get("name"),
@@ -1542,6 +1546,16 @@ async def dashboard_summary(
         if bal > 0:
             distributor_outstanding += bal
 
+    purchase_orders = await db.purchase_orders.find(
+      {},
+      {"_id": 0}
+   ).to_list(5000)
+
+   total_purchase_amount = sum(
+     float(po.get("grand_total", 0))
+     for po in purchase_orders
+   )
+
     return {
         "sales": round(total_sales, 2),
         "sales_month": round(sales_month, 2),
@@ -1559,6 +1573,8 @@ async def dashboard_summary(
         "profit_today": round(profit_today, 2),
 
         "stock_value": round(stock_value, 2),
+
+        "total_purchase_amount": round(total_purchase_amount, 2),
 
         "customer_outstanding": round(customer_outstanding, 2),
         "customer_outstanding_month": round(customer_outstanding_month, 2),
