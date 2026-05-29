@@ -1870,9 +1870,6 @@ class POItem(BaseModel):
 
     expiry_date: str | None = None
     gst_rate: float = 5
-    sold_units: float = 0
-    low_stock_threshold: int = 10
-
 
 class POCreate(BaseModel):
     distributor_id: str
