@@ -1202,6 +1202,8 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
     txns = await db.distributor_transactions.find({"distributor_id": did}, {"_id": 0}).sort("created_at", 1).to_list(1000)
     balance = dist.get("opening_balance", 0.0)
     running = []
+    total_purchases = 0
+    total_paid = 0
     for t in txns:
 
           amt = float(t.get("amount", 0))
@@ -1209,18 +1211,24 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
           if t["type"] in ["purchase", "sale"]:
 
              balance += amt
+             total_purchases += amt
 
           else:  # payment
 
              balance -= amt
+             total_paid += amt
 
           running.append({
             **t,
             "running_balance": round(balance, 2)
           })
-    return {"distributor": dist, "transactions": running, "balance": round(balance, 2)}
-
-
+    return {
+      "distributor": dist,
+      "transactions": running,
+      "balance": round(balance, 2),
+      "total_purchases": round(total_purchases, 2),
+      "total_paid": round(total_paid, 2),
+    }
 @api_router.delete("/ledger/distributor/{did}/transaction/{txn_id}")
 async def delete_distributor_txn(
     did: str,
