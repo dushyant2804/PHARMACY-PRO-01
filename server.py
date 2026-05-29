@@ -1202,7 +1202,7 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
     txns = await db.distributor_transactions.find({"distributor_id": did}, {"_id": 0}).sort("created_at", 1).to_list(1000)
     balance = dist.get("opening_balance", 0.0)
     running = []
-    total_purchases = 0
+    total_purchases = float(dist.get("opening_balance", 0))
     total_paid = 0
     for t in txns:
 
