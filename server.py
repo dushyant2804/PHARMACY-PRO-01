@@ -2361,45 +2361,88 @@ async def delete_daily_sale(
     return {"ok": True}
 
 
-# =========================
-# INVENTORY REBUILDER (CORE LOGIC)
-# =========================
-
 async def rebuild_inventory():
+
     medicines = {}
 
+    # PRESERVE EXISTING MANUAL VALUES
+    existing_medicines = {}
+
+    existing_cursor = db.medicines.find({})
+
+    async for old in existing_cursor:
+
+        key = old.get("medicine_key")
+
+        if key:
+            existing_medicines[key] = old
+
+    # REBUILD FROM PO
     cursor = db.purchase_orders.find({})
 
     async for po in cursor:
+
         for i in po.get("items", []):
 
             key = i.get("medicine_key")
 
-            qty = float(i.get("quantity", 0)) + float(i.get("free_quantity", 0))
+            if not key:
+                continue
+
+            qty = (
+                float(i.get("quantity", 0))
+                +
+                float(i.get("free_quantity", 0))
+            )
+
+            existing = existing_medicines.get(key)
 
             if key not in medicines:
+
                 medicines[key] = {
+
+                    "medicine_key": key,
+
                     "name": i.get("name"),
+
                     "batch_no": i.get("batch_no"),
+
                     "expiry_date": i.get("expiry_date"),
+
                     "manufacturer": i.get("manufacturer"),
+
                     "category": i.get("category"),
+
                     "mrp": i.get("mrp"),
+
                     "purchase_price": i.get("purchase_price"),
+
                     "pack_size": i.get("pack_size"),
+
                     "gst_rate": i.get("gst_rate"),
+
+                    # PURCHASE STOCK FROM PO
                     "purchased_units": 0,
-                    "sold_units": float(i.get("sold_units", 0)),
-                    "low_stock_threshold": i.get("low_stock_threshold"),
+
+                    # MANUAL SOLD QTY PRESERVED
+                    "sold_units":
+                        existing.get("sold_units", 0)
+                        if existing else 0,
+
+                    # MANUAL THRESHOLD PRESERVED
+                    "low_stock_threshold":
+                        existing.get("low_stock_threshold")
+                        if existing else None,
                 }
 
             medicines[key]["purchased_units"] += qty
 
+    # FULL REBUILD
     await db.medicines.delete_many({})
 
     for m in medicines.values():
-        await db.medicines.insert_one(m)
 
+        await db.medicines.insert_one(m)
 
 # ---------------- Mount ----------------
 
