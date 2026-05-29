@@ -1546,7 +1546,7 @@ async def dashboard_summary(
         if bal > 0:
             distributor_outstanding += bal
 
-    purchase_orders = await db.purchase_orders.find(
+   purchase_orders = await db.purchase_orders.find(
       {},
       {"_id": 0}
    ).to_list(5000)
