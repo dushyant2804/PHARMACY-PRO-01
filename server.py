@@ -535,6 +535,26 @@ async def update_threshold(medicine_id: str, payload: dict):
         "low_stock_threshold": updated.get("low_stock_threshold")
     }
 
+@api_router.put("/medicines/{medicine_id}/sold")
+async def update_sold_units(
+    medicine_id: str,
+    payload: dict
+):
+
+    await db.medicines.update_one(
+        {"id": medicine_id},
+        {
+            "$set": {
+                "sold_units":
+                    float(payload["sold_units"])
+            }
+        }
+    )
+
+    return {
+        "message": "sold qty updated"
+    }
+
 
 @api_router.post("/historical-sales")
 async def create_historical_sale(
