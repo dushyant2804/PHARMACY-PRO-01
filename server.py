@@ -1546,15 +1546,15 @@ async def dashboard_summary(
         if bal > 0:
             distributor_outstanding += bal
 
-   purchase_orders = await db.purchase_orders.find(
-      {},
-      {"_id": 0}
-   ).to_list(5000)
+    purchase_orders = await db.purchase_orders.find(
+        {},
+        {"_id": 0}
+    ).to_list(5000)
 
-   total_purchase_amount = sum(
-     float(po.get("grand_total", 0))
-     for po in purchase_orders
-   )
+    total_purchase_amount = sum(
+        float(po.get("grand_total", 0))
+        for po in purchase_orders
+    )
 
     return {
         "sales": round(total_sales, 2),
