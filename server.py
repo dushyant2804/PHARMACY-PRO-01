@@ -1203,7 +1203,6 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
     balance = dist.get("opening_balance", 0.0)
     running = []
     for t in txns:
-        for t in txns:
 
           amt = float(t.get("amount", 0))
 
