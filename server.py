@@ -2466,6 +2466,11 @@ async def rebuild_inventory():
                     "low_stock_threshold":
                         existing.get("low_stock_threshold")
                         if existing else None,
+
+                    "id":
+                       existing.get("id")
+                       if existing
+                       else str(uuid.uuid4()),
                 }
 
             medicines[key]["purchased_units"] += qty
