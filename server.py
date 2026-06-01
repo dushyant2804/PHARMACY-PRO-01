@@ -19,7 +19,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from fastapi import UploadFile, File
 
 
@@ -224,7 +224,35 @@ class RegularPatient(BaseModel):
     duration_days: int
     last_refill_date: str
 
-    condition: str = "" 
+    condition: str = ""
+
+    @field_validator(
+        "name", "phone", "medicine_name", "last_refill_date", "condition", mode="before"
+    )
+    @classmethod
+    def trim_string_fields(cls, value):
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def trim_optional_string_fields(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip()
+            return trimmed or None
+        return value
+
+    @field_validator("name", "phone")
+    @classmethod
+    def require_name_and_phone(cls, value, info):
+        if not value:
+            raise ValueError(f"Patient {info.field_name} is required")
+        return value
 
 
 class Distributor(BaseModel):
@@ -963,6 +991,9 @@ async def update_patient(
     payload: RegularPatient,
     user: dict = Depends(get_current_user)
 ):
+    phone = phone.strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="Patient phone is required")
 
     result = await db.regular_patients.update_one(
         {"phone": phone},
@@ -981,10 +1012,16 @@ async def update_patient(
         "success": True
     }
 
+def _has_patient_identity(patient: dict) -> bool:
+    has_name = bool(str(patient.get("name") or "").strip())
+    has_phone = bool(str(patient.get("phone") or "").strip())
+    return has_name and has_phone
+
+
 @api_router.get("/patients")
 async def list_patients(user: dict = Depends(get_current_user)):
     items = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
-    return items
+    return [patient for patient in items if _has_patient_identity(patient)]
 
 
 @api_router.get("/patients/alerts")
@@ -1009,11 +1046,45 @@ async def patient_alerts(user: dict = Depends(get_current_user)):
     return alerts
 
 
+@api_router.delete("/patients")
+async def delete_invalid_patient(
+    user: dict = Depends(get_current_user)
+):
+    result = await db.regular_patients.delete_many(
+        {
+            "$or": [
+                {"phone": {"$exists": False}},
+                {"phone": None},
+                {"phone": ""},
+                {"phone": {"$regex": r"^\s+$"}},
+                {"name": {"$exists": False}},
+                {"name": None},
+                {"name": ""},
+                {"name": {"$regex": r"^\s+$"}},
+            ]
+        }
+    )
+
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Invalid patient not found"
+        )
+
+    return {
+        "success": True,
+        "deleted_count": result.deleted_count,
+    }
+
+
 @api_router.delete("/patients/{phone}")
 async def delete_patient(
     phone: str,
     user: dict = Depends(get_current_user)
 ):
+    phone = phone.strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="Patient phone is required")
 
     result = await db.regular_patients.delete_one(
         {"phone": phone}
