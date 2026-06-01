@@ -343,6 +343,35 @@ async def list_medicines(
         {"_id": 0}
     ).to_list(5000)
 
+    medicine_keys = list({
+        m.get("medicine_key")
+        for m in items
+        if m.get("medicine_key")
+    })
+    po_distributor_lookup = {}
+    if medicine_keys:
+        purchase_orders = await db.purchase_orders.find(
+            {
+                "items.medicine_key": {
+                    "$in": medicine_keys
+                }
+            },
+            {
+                "_id": 0,
+                "distributor_id": 1,
+                "distributor_name": 1,
+                "items.medicine_key": 1
+            }
+        ).to_list(5000)
+        for po in purchase_orders:
+            for item in po.get("items", []):
+                key = item.get("medicine_key")
+                if key and key not in po_distributor_lookup:
+                    po_distributor_lookup[key] = {
+                        "distributor_id": po.get("distributor_id"),
+                        "distributor_name": po.get("distributor_name") or "",
+                    }
+
     grouped = {}
 
     for m in items:
@@ -361,6 +390,15 @@ async def list_medicines(
         )
 
         m["quantity_units"] = qty
+
+        po_distributor = po_distributor_lookup.get(m.get("medicine_key"), {})
+        distributor_id = m.get("distributor_id") or po_distributor.get("distributor_id")
+        distributor_name = (
+            m.get("distributor_name")
+            or m.get("distributor")
+            or po_distributor.get("distributor_name")
+            or ""
+        )
 
         # EXPIRY WARNING SYSTEM
 
@@ -494,8 +532,14 @@ async def list_medicines(
             "mrp":
               m.get("mrp"),
 
+            "distributor_id":
+                distributor_id,
+
             "distributor_name":
-                m.get("distributor_name"),
+                distributor_name,
+
+            "distributor":
+                distributor_name,
         })
 
     result = list(
@@ -2448,6 +2492,20 @@ async def rebuild_inventory():
 
             existing = existing_medicines.get(key)
 
+            distributor_id = (
+                po.get("distributor_id")
+                or i.get("distributor_id")
+                or (existing.get("distributor_id") if existing else None)
+            )
+            distributor_name = (
+                po.get("distributor_name")
+                or i.get("distributor_name")
+                or i.get("distributor")
+                or (existing.get("distributor_name") if existing else None)
+                or (existing.get("distributor") if existing else None)
+                or ""
+            )
+
             if key not in medicines:
 
                 medicines[key] = {
@@ -2472,6 +2530,15 @@ async def rebuild_inventory():
 
                     "gst_rate": i.get("gst_rate"),
 
+                    "distributor_id":
+                        distributor_id,
+
+                    "distributor_name":
+                        distributor_name,
+
+                    "distributor":
+                        distributor_name,
+
                     # PURCHASE STOCK FROM PO
                     "purchased_units": 0,
 
@@ -2490,6 +2557,15 @@ async def rebuild_inventory():
                        if existing
                        else str(uuid.uuid4()),
                 }
+
+            if not medicines[key].get("distributor_id") and distributor_id:
+                medicines[key]["distributor_id"] = distributor_id
+
+            if distributor_name:
+                if not medicines[key].get("distributor_name"):
+                    medicines[key]["distributor_name"] = distributor_name
+                if not medicines[key].get("distributor"):
+                    medicines[key]["distributor"] = distributor_name
 
             medicines[key]["purchased_units"] += qty
 
