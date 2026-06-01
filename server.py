@@ -1012,29 +1012,31 @@ async def update_patient(
         "success": True
     }
 
+@api_router.get("/patients")
+async def list_patients(user: dict = Depends(get_current_user)):
+    items = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
+    return items
+
+
 def _has_patient_identity(patient: dict) -> bool:
     has_name = bool(str(patient.get("name") or "").strip())
     has_phone = bool(str(patient.get("phone") or "").strip())
     return has_name and has_phone
 
 
-@api_router.get("/patients")
-async def list_patients(user: dict = Depends(get_current_user)):
-    items = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
-    return [patient for patient in items if _has_patient_identity(patient)]
-
-
 async def get_patient_due_alerts(today):
     patients = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
     alerts = []
 
-    for p in patients:
-        if not _has_patient_identity(p):
+    for patient in patients:
+        if not _has_patient_identity(patient):
             continue
 
         try:
-            last_refill_date = datetime.fromisoformat(p["last_refill_date"]).date()
-            duration_days = int(p.get("duration_days") or 0)
+            last_refill_date = datetime.fromisoformat(
+                patient["last_refill_date"]
+            ).date()
+            duration_days = int(patient.get("duration_days") or 0)
             days_since_refill = (today - last_refill_date).days
 
             if days_since_refill >= duration_days:
@@ -1042,10 +1044,10 @@ async def get_patient_due_alerts(today):
                 overdue_days = max(0, (today - due_date).days)
 
                 alerts.append({
-                    "name": p.get("name", ""),
-                    "phone": p.get("phone", ""),
-                    "medicine_name": p.get("medicine_name", ""),
-                    "last_refill_date": p.get("last_refill_date", ""),
+                    "name": patient.get("name", ""),
+                    "phone": patient.get("phone", ""),
+                    "medicine_name": patient.get("medicine_name", ""),
+                    "last_refill_date": patient.get("last_refill_date", ""),
                     "duration_days": duration_days,
                     "due_date": due_date.isoformat(),
                     "days_since_refill": days_since_refill,
@@ -2073,6 +2075,8 @@ async def distributor_ledger_monthly_summary(
         "transactions": txns,
         "daily_summary": daily_summary,
     }
+
+
 @api_router.delete("/ledger/distributor/{did}/transaction/{txn_id}")
 async def delete_distributor_txn(
     did: str,
