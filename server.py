@@ -9,6 +9,7 @@ import logging
 import bcrypt
 import jwt
 from datetime import datetime, timezone, timedelta
+from calendar import monthrange
 from typing import List, Optional, Literal
 from collections import defaultdict
 
@@ -44,6 +45,66 @@ if not JWT_SECRET:
 
 logger = logging.getLogger("pharmacy")
 logging.basicConfig(level=logging.INFO)
+
+EXPIRY_WARNING_DAYS = 90
+
+
+def parse_expiry_date(expiry):
+    if not expiry:
+        return None
+
+    value = str(expiry).strip()
+
+    try:
+        if "/" in value:
+            parts = value.split("/")
+
+            if len(parts) != 2:
+                return None
+
+            month = int(parts[0])
+            year_text = parts[1].strip()
+            year = int(year_text)
+
+            if len(year_text) <= 2:
+                year += 2000
+
+            last_day = monthrange(year, month)[1]
+
+            return datetime(year, month, last_day).date()
+
+        return datetime.fromisoformat(value).date()
+    except Exception:
+        return None
+
+
+def expiry_details(expiry, today):
+    expiry_date = parse_expiry_date(expiry)
+
+    details = {
+        "expiry_status": "safe",
+        "days_to_expiry": None,
+        "days_expired": None,
+        "expired_days_ago": None,
+    }
+
+    if not expiry_date:
+        return details
+
+    days_left = (expiry_date - today).days
+
+    if days_left < 0:
+        days_expired = abs(days_left)
+        details["expiry_status"] = "expired"
+        details["days_expired"] = days_expired
+        details["expired_days_ago"] = days_expired
+    else:
+        details["days_to_expiry"] = days_left
+
+        if days_left <= EXPIRY_WARNING_DAYS:
+            details["expiry_status"] = "warning"
+
+    return details
 
 
 # ---------------- Auth helpers ----------------
@@ -504,42 +565,15 @@ async def list_medicines(
 
         # EXPIRY WARNING SYSTEM
 
-        expiry_status = "safe"
-
-        days_to_expiry = None
-
-        expiry = m.get(
-            "expiry_date"
+        expiry_info = expiry_details(
+            m.get("expiry_date"),
+            today
         )
 
-        if expiry:
-
-            try:
-
-                exp_date = datetime.fromisoformat(
-                    expiry
-                ).date()
-
-                days_left = (
-                    exp_date - today
-                ).days
-
-                days_to_expiry = days_left
-
-                if days_left < 0:
-
-                    expiry_status = "expired"
-
-                elif days_left <= 30:
-
-                    expiry_status = "critical"
-
-                elif days_left <= 90:
-
-                    expiry_status = "warning"
-
-            except:
-                pass
+        expiry_status = expiry_info["expiry_status"]
+        days_to_expiry = expiry_info["days_to_expiry"]
+        days_expired = expiry_info["days_expired"]
+        expired_days_ago = expiry_info["expired_days_ago"]
 
         name = (
             m.get("name") or ""
@@ -600,8 +634,7 @@ async def list_medicines(
         priority = {
             "safe": 0,
             "warning": 1,
-            "critical": 2,
-            "expired": 3,
+            "expired": 2,
         }
 
         if (
@@ -681,6 +714,12 @@ async def list_medicines(
 
             "days_to_expiry":
                 days_to_expiry,
+
+            "days_expired":
+                days_expired,
+
+            "expired_days_ago":
+                expired_days_ago,
 
             "quantity_units":
                 qty,
@@ -2078,26 +2117,13 @@ async def dashboard_summary(
     profit_today = sales_today - expenses_today
     profit_month = sales_month - expenses_month
 
-    # SAFE EXPIRY PARSER (MM/YY ONLY)
-    def parse_expiry(expiry):
-        try:
-            if not expiry or "/" not in expiry:
-                return None
-
-            mm, yy = expiry.split("/")
-            mm = int(mm)
-            yy = int("20" + yy)
-
-            return datetime(yy, mm, 1).date()
-        except:
-            return None
-
     # STOCK
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
 
     stock_value = 0
     low_stock_items = []
-    expiring = []
+    expiring_soon_items = []
+    expired_items = []
 
     for m in medicines:
 
@@ -2122,17 +2148,27 @@ async def dashboard_summary(
                 "threshold": threshold,
             })
 
-        exp = parse_expiry(m.get("expiry_date"))
+        expiry_info = expiry_details(
+            m.get("expiry_date"),
+            today
+        )
 
-        if exp:
-            days_left = (exp - today).days
+        expiry_item = {
+            "id": m.get("id"),
+            "medicine_key": m.get("medicine_key"),
+            "name": m.get("name"),
+            "batch_no": m.get("batch_no", ""),
+            "expiry_date": m.get("expiry_date"),
+            "expiry_status": expiry_info["expiry_status"],
+            "days_to_expiry": expiry_info["days_to_expiry"],
+            "days_expired": expiry_info["days_expired"],
+            "expired_days_ago": expiry_info["expired_days_ago"],
+        }
 
-            if days_left <= 60:
-                expiring.append({
-                    "name": m.get("name"),
-                    "batch_no": m.get("batch_no", ""),
-                    "days_left": days_left,
-                })
+        if expiry_info["expiry_status"] == "expired":
+            expired_items.append(expiry_item)
+        elif expiry_info["expiry_status"] == "warning":
+            expiring_soon_items.append(expiry_item)
 
     # CUSTOMER OUTSTANDING
     customer_txns = await db.customer_transactions.find({}, {"_id": 0}).to_list(5000)
@@ -2211,18 +2247,24 @@ async def dashboard_summary(
 
     return {
         "sales": round(total_sales, 2),
+        "sales_total": round(total_sales, 2),
         "sales_month": round(sales_month, 2),
+        "sales_this_month": round(sales_month, 2),
         "sales_today": round(sales_today, 2),
 
         "gst_collected": round(total_gst, 2),
         "discount_given": round(total_discount, 2),
 
         "expenses": round(total_expenses, 2),
+        "expenses_total": round(total_expenses, 2),
         "expenses_month": round(expenses_month, 2),
+        "expenses_this_month": round(expenses_month, 2),
         "expenses_today": round(expenses_today, 2),
 
         "profit": round(profit, 2),
+        "profit_total": round(profit, 2),
         "profit_month": round(profit_month, 2),
+        "profit_this_month": round(profit_month, 2),
         "profit_today": round(profit_today, 2),
 
         "stock_value": round(stock_value, 2),
@@ -2242,8 +2284,12 @@ async def dashboard_summary(
         "low_stock_count": len(low_stock_items),
         "low_stock_items": low_stock_items,
 
-        "expiring_soon_count": len(expiring),
-        "expiring_soon": expiring,
+        "expiring_soon_count": len(expiring_soon_items),
+        "expiring_soon_items": expiring_soon_items,
+        "expiring_soon": expiring_soon_items,
+
+        "expired_count": len(expired_items),
+        "expired_items": expired_items,
     }
     
 @api_router.get("/reports/sales")
@@ -2470,17 +2516,37 @@ async def expiry_report(user: dict = Depends(get_current_user)):
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
     today = datetime.now(timezone.utc).date()
     expired, near = [], []
+
     for m in medicines:
-        try:
-            exp = datetime.strptime(m["expiry_date"], "%Y-%m-%d").date()
-            days = (exp - today).days
-            if days < 0:
-                expired.append({**m, "days_to_expiry": days})
-            elif days <= 90:
-                near.append({**m, "days_to_expiry": days})
-        except Exception:
-            pass
-    return {"expired": expired, "near_expiry": sorted(near, key=lambda x: x["days_to_expiry"])}
+        details = expiry_details(
+            m.get("expiry_date"),
+            today
+        )
+
+        item = {
+            **m,
+            "expiry_status": details["expiry_status"],
+            "days_to_expiry": details["days_to_expiry"],
+            "days_expired": details["days_expired"],
+            "expired_days_ago": details["expired_days_ago"],
+        }
+
+        if details["expiry_status"] == "expired":
+            expired.append(item)
+        elif details["expiry_status"] == "warning":
+            near.append(item)
+
+    return {
+        "expired": sorted(
+            expired,
+            key=lambda x: x.get("days_expired") or 0,
+            reverse=True
+        ),
+        "near_expiry": sorted(
+            near,
+            key=lambda x: x.get("days_to_expiry") or 0
+        ),
+    }
 
 
 @api_router.get("/reports/top-medicines")
