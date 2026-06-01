@@ -374,6 +374,94 @@ async def list_medicines(
         {"_id": 0}
     ).to_list(5000)
 
+    def normalized_medicine_key(name, batch_no):
+
+        if not name or not batch_no:
+
+            return None
+
+        return f"{str(name).strip().lower()}::{str(batch_no).strip().upper()}"
+
+    medicine_lookup_keys = set()
+
+    for m in items:
+
+        medicine_key = m.get("medicine_key")
+
+        if medicine_key:
+
+            medicine_lookup_keys.add(medicine_key)
+
+        normalized_key = normalized_medicine_key(
+            m.get("name"),
+            m.get("batch_no")
+        )
+
+        if normalized_key:
+
+            medicine_lookup_keys.add(normalized_key)
+
+    purchase_order_distributors = {}
+
+    if medicine_lookup_keys:
+
+        purchase_orders = await db.purchase_orders.find(
+            {},
+            {
+                "_id": 0,
+                "distributor_id": 1,
+                "distributor_name": 1,
+                "items.name": 1,
+                "items.batch_no": 1,
+                "items.medicine_key": 1,
+            }
+        ).to_list(10000)
+
+        for po in purchase_orders:
+
+            po_distributor_name = po.get("distributor_name")
+
+            if not po.get("distributor_id") and not po_distributor_name:
+
+                continue
+
+            distributor_details = {
+                "distributor_id": po.get("distributor_id"),
+                "distributor_name": po_distributor_name,
+                "distributor": po_distributor_name,
+            }
+
+            for item in po.get("items", []):
+
+                item_keys = []
+
+                item_medicine_key = item.get("medicine_key")
+
+                if item_medicine_key:
+
+                    item_keys.append(item_medicine_key)
+
+                normalized_item_key = normalized_medicine_key(
+                    item.get("name"),
+                    item.get("batch_no")
+                )
+
+                if normalized_item_key:
+
+                    item_keys.append(normalized_item_key)
+
+                for item_key in item_keys:
+
+                    if item_key not in medicine_lookup_keys:
+
+                        continue
+
+                    if item_key in purchase_order_distributors:
+
+                        continue
+
+                    purchase_order_distributors[item_key] = distributor_details
+
     distributor_ids = {
         m.get("distributor_id")
         for m in items
@@ -539,6 +627,34 @@ async def list_medicines(
             or m.get("distributor_name")
             or distributor_names.get(distributor_id)
         )
+
+        normalized_key = normalized_medicine_key(
+            m.get("name"),
+            m.get("batch_no")
+        )
+
+        po_distributor = (
+            purchase_order_distributors.get(m.get("medicine_key"))
+            or purchase_order_distributors.get(normalized_key)
+            or {}
+        )
+
+        if po_distributor:
+
+            distributor_id = (
+                distributor_id
+                or po_distributor.get("distributor_id")
+            )
+
+            distributor_name = (
+                distributor_name
+                or po_distributor.get("distributor_name")
+            )
+
+            distributor_value = (
+                distributor_value
+                or po_distributor.get("distributor")
+            )
 
         grouped[name]["batches"].append({
 
