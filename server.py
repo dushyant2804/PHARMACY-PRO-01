@@ -107,6 +107,89 @@ def expiry_details(expiry, today):
     return details
 
 
+def parse_iso_date(value):
+    if not value:
+        return None
+
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text).date()
+    except Exception:
+        return None
+
+
+def _patient_invalid_filter() -> dict:
+    return {
+        "$or": [
+            {"phone": {"$exists": False}},
+            {"phone": None},
+            {"phone": ""},
+            {"phone": {"$regex": r"^\s+$"}},
+            {"name": {"$exists": False}},
+            {"name": None},
+            {"name": ""},
+            {"name": {"$regex": r"^\s+$"}},
+        ]
+    }
+
+
+def _patient_alert_item(patient: dict, today):
+    if not _has_patient_identity(patient):
+        return None
+
+    last_refill = parse_iso_date(patient.get("last_refill_date"))
+    if not last_refill:
+        return None
+
+    try:
+        duration_days = int(patient.get("duration_days") or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if duration_days <= 0:
+        return None
+
+    days_since_refill = (today - last_refill).days
+    days_until_due = duration_days - days_since_refill
+
+    if days_until_due > 0:
+        return None
+
+    next_refill_date = last_refill + timedelta(days=duration_days)
+
+    return {
+        **patient,
+        "duration_days": duration_days,
+        "last_refill_date": patient.get("last_refill_date"),
+        "next_refill_date": next_refill_date.isoformat(),
+        "days_since_refill": days_since_refill,
+        "days_overdue": abs(days_until_due),
+    }
+
+
+async def _get_patient_alerts(today=None) -> list:
+    today = today or datetime.now(timezone.utc).date()
+    patients = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
+
+    alerts = []
+    for patient in patients:
+        alert = _patient_alert_item(patient, today)
+        if alert:
+            alerts.append(alert)
+
+    alerts.sort(
+        key=lambda item: (
+            -int(item.get("days_overdue") or 0),
+            str(item.get("name") or "").lower(),
+        )
+    )
+    return alerts
+
+
 # ---------------- Auth helpers ----------------
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -252,6 +335,27 @@ class RegularPatient(BaseModel):
     def require_name_and_phone(cls, value, info):
         if not value:
             raise ValueError(f"Patient {info.field_name} is required")
+        return value
+
+    @field_validator("age")
+    @classmethod
+    def require_valid_age(cls, value):
+        if value < 0 or value > 130:
+            raise ValueError("Patient age must be between 0 and 130")
+        return value
+
+    @field_validator("duration_days")
+    @classmethod
+    def require_positive_duration(cls, value):
+        if value <= 0:
+            raise ValueError("Patient duration_days must be greater than 0")
+        return value
+
+    @field_validator("last_refill_date")
+    @classmethod
+    def require_valid_refill_date(cls, value):
+        if not parse_iso_date(value):
+            raise ValueError("Patient last_refill_date must be a valid ISO date")
         return value
 
 
@@ -1026,50 +1130,14 @@ async def list_patients(user: dict = Depends(get_current_user)):
 
 @api_router.get("/patients/alerts")
 async def patient_alerts(user: dict = Depends(get_current_user)):
-    from datetime import datetime
-
-    today = datetime.now().date()
-    patients = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
-
-    alerts = []
-
-    for p in patients:
-        try:
-            last = datetime.fromisoformat(p["last_refill_date"]).date()
-            days = int(p.get("duration_days") or 0)
-
-            if (today - last).days >= days:
-                alerts.append(p)
-        except:
-            continue
-
-    return alerts
+    return await _get_patient_alerts()
 
 
 @api_router.delete("/patients")
 async def delete_invalid_patient(
     user: dict = Depends(get_current_user)
 ):
-    result = await db.regular_patients.delete_many(
-        {
-            "$or": [
-                {"phone": {"$exists": False}},
-                {"phone": None},
-                {"phone": ""},
-                {"phone": {"$regex": r"^\s+$"}},
-                {"name": {"$exists": False}},
-                {"name": None},
-                {"name": ""},
-                {"name": {"$regex": r"^\s+$"}},
-            ]
-        }
-    )
-
-    if result.deleted_count == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Invalid patient not found"
-        )
+    result = await db.regular_patients.delete_many(_patient_invalid_filter())
 
     return {
         "success": True,
@@ -2023,6 +2091,110 @@ async def add_dist_payment(did: str, p: PaymentCreate, user: dict = Depends(requ
     return txn
 
 
+async def _distributor_monthly_summary_data(month: str, distributor_id: Optional[str] = None):
+    try:
+        datetime.strptime(month, "%Y-%m")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="month must be in YYYY-MM format")
+
+    distributor_query = {}
+    if distributor_id:
+        distributor_query["id"] = distributor_id
+
+    distributors = await db.distributors.find(distributor_query, {"_id": 0}).to_list(1000)
+    distributor_lookup = {d.get("id"): d for d in distributors}
+
+    txn_query = {"created_at": {"$regex": f"^{month}"}}
+    if distributor_id:
+        txn_query["distributor_id"] = distributor_id
+
+    transactions = await db.distributor_transactions.find(txn_query, {"_id": 0}).to_list(5000)
+
+    summaries = {}
+    for distributor in distributors:
+        did = distributor.get("id")
+        summaries[did] = {
+            "distributor_id": did,
+            "distributor_name": distributor.get("name", ""),
+            "month": month,
+            "purchase_total": 0.0,
+            "payment_total": 0.0,
+            "net_change": 0.0,
+            "transaction_count": 0,
+            "transactions": [],
+        }
+
+    for txn in transactions:
+        did = txn.get("distributor_id")
+        if did not in summaries:
+            distributor = distributor_lookup.get(did, {})
+            summaries[did] = {
+                "distributor_id": did,
+                "distributor_name": distributor.get("name", ""),
+                "month": month,
+                "purchase_total": 0.0,
+                "payment_total": 0.0,
+                "net_change": 0.0,
+                "transaction_count": 0,
+                "transactions": [],
+            }
+
+        amount = float(txn.get("amount", 0) or 0)
+        summary = summaries[did]
+
+        if txn.get("type") in ["purchase", "sale"]:
+            summary["purchase_total"] += amount
+            summary["net_change"] += amount
+        elif txn.get("type") == "payment":
+            summary["payment_total"] += amount
+            summary["net_change"] -= amount
+
+        summary["transaction_count"] += 1
+        summary["transactions"].append(txn)
+
+    items = []
+    total_purchases = 0.0
+    total_payments = 0.0
+
+    for summary in summaries.values():
+        summary["purchase_total"] = round(summary["purchase_total"], 2)
+        summary["payment_total"] = round(summary["payment_total"], 2)
+        summary["net_change"] = round(summary["net_change"], 2)
+        total_purchases += summary["purchase_total"]
+        total_payments += summary["payment_total"]
+        items.append(summary)
+
+    items.sort(key=lambda item: str(item.get("distributor_name") or "").lower())
+
+    return {
+        "month": month,
+        "distributor_id": distributor_id,
+        "purchase_total": round(total_purchases, 2),
+        "payment_total": round(total_payments, 2),
+        "net_change": round(total_purchases - total_payments, 2),
+        "distributor_count": len(items),
+        "items": items,
+    }
+
+
+@api_router.get("/distributors/monthly-summary")
+async def distributor_monthly_summary(
+    month: str,
+    distributor_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    return await _distributor_monthly_summary_data(month, distributor_id)
+
+
+@api_router.get("/ledger/distributor/{did}/monthly-summary")
+async def distributor_ledger_monthly_summary(
+    did: str,
+    month: str,
+    user: dict = Depends(get_current_user),
+):
+    return await _distributor_monthly_summary_data(month, did)
+
+
 @api_router.get("/ledger/customer/{cid}")
 async def customer_ledger(cid: str, user: dict = Depends(get_current_user)):
     cust = await db.customers.find_one({"id": cid}, {"_id": 0})
@@ -2316,6 +2488,8 @@ async def dashboard_summary(
         for po in purchase_orders
     )
 
+    patient_alerts = await _get_patient_alerts(today)
+
     return {
         "sales": round(total_sales, 2),
         "sales_total": round(total_sales, 2),
@@ -2361,6 +2535,11 @@ async def dashboard_summary(
 
         "expired_count": len(expired_items),
         "expired_items": expired_items,
+
+        "patient_alert_count": len(patient_alerts),
+        "patient_alerts": patient_alerts,
+        "patient_due_alerts_count": len(patient_alerts),
+        "patient_due_alerts": patient_alerts,
     }
     
 @api_router.get("/reports/sales")
