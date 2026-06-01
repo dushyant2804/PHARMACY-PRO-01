@@ -16,6 +16,8 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Respons
 from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
+from pymongo.errors import PyMongoError
 from pydantic import BaseModel, Field, EmailStr
 from fastapi import UploadFile, File
 
@@ -33,7 +35,12 @@ def home():
 api_router = APIRouter(prefix="/api")
 
 JWT_ALGORITHM = "HS256"
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-me")
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development").lower()
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    if ENVIRONMENT in {"production", "prod"}:
+        raise RuntimeError("JWT_SECRET environment variable must be set in production")
+    JWT_SECRET = "dev-only-change-me"
 
 logger = logging.getLogger("pharmacy")
 logging.basicConfig(level=logging.INFO)
@@ -90,6 +97,9 @@ class UserRegister(BaseModel):
     email: EmailStr
     password: str
     name: str
+
+
+class UserCreateByAdmin(UserRegister):
     role: Literal["admin", "cashier", "pharmacist"] = "cashier"
 
 
@@ -254,8 +264,7 @@ async def shutdown():
 
 
 # ---------------- Auth routes ----------------
-@api_router.post("/auth/register")
-async def register(payload: UserRegister):
+async def _create_user(payload: UserRegister, role: str) -> dict:
     email = payload.email.lower()
     existing = await db.users.find_one({"email": email})
     if existing:
@@ -265,11 +274,16 @@ async def register(payload: UserRegister):
         "email": email,
         "password_hash": hash_password(payload.password),
         "name": payload.name,
-        "role": payload.role,
+        "role": role,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.users.insert_one(user)
     return {"id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"]}
+
+
+@api_router.post("/auth/register")
+async def register(payload: UserRegister):
+    return await _create_user(payload, "cashier")
 
 
 @api_router.post("/auth/login")
@@ -300,7 +314,24 @@ async def list_users(user: dict = Depends(require_role("admin"))):
     return users
 
 
+@api_router.post("/auth/users")
+async def create_user_by_admin(
+    payload: UserCreateByAdmin,
+    user: dict = Depends(require_role("admin"))
+):
+    return await _create_user(payload, payload.role)
+
+
 # ---------------- Medicines ----------------
+def _medicine_identity_filter(medicine_id: str) -> dict:
+    return {
+        "$or": [
+            {"id": medicine_id},
+            {"medicine_key": medicine_id},
+        ]
+    }
+
+
 @api_router.get("/medicines")
 async def list_medicines(
     search: Optional[str] = None,
@@ -410,7 +441,19 @@ async def list_medicines(
             grouped[name] = {
 
                 "id":
+                    m.get("id") or m.get("medicine_key"),
+
+                "medicine_id":
                     m.get("id"),
+
+                "medicine_key":
+                    m.get("medicine_key"),
+
+                "low_stock_threshold":
+                    m.get("low_stock_threshold"),
+
+                "sold_units":
+                    sold,
 
                 "name":
                     m.get("name"),
@@ -464,6 +507,18 @@ async def list_medicines(
 
         grouped[name]["batches"].append({
 
+            "id":
+                m.get("id") or m.get("medicine_key"),
+
+            "medicine_id":
+                m.get("id"),
+
+            "medicine_key":
+                m.get("medicine_key"),
+
+            "low_stock_threshold":
+                m.get("low_stock_threshold"),
+
             "batch_no":
                 m.get("batch_no"),
 
@@ -494,8 +549,14 @@ async def list_medicines(
             "mrp":
               m.get("mrp"),
 
+            "distributor_id":
+                m.get("distributor_id"),
+
             "distributor_name":
-                m.get("distributor_name"),
+                m.get("distributor_name") or m.get("distributor"),
+
+            "distributor":
+                m.get("distributor") or m.get("distributor_name"),
         })
 
     result = list(
@@ -512,10 +573,16 @@ async def list_medicines(
     return result
     
 @api_router.put("/medicines/{medicine_id}/threshold")
-async def update_threshold(medicine_id: str, payload: dict):
+async def update_threshold(
+    medicine_id: str,
+    payload: dict,
+    user: dict = Depends(require_role("admin", "pharmacist"))
+):
+
+    medicine_filter = _medicine_identity_filter(medicine_id)
 
     result = await db.medicines.update_one(
-        {"id": medicine_id},
+        medicine_filter,
         {
             "$set": {
                 "low_stock_threshold": int(payload["low_stock_threshold"])
@@ -528,7 +595,7 @@ async def update_threshold(medicine_id: str, payload: dict):
         raise HTTPException(404, "Medicine not found")
 
     # return fresh value
-    updated = await db.medicines.find_one({"id": medicine_id})
+    updated = await db.medicines.find_one(medicine_filter)
 
     return {
         "message": "threshold updated",
@@ -538,11 +605,14 @@ async def update_threshold(medicine_id: str, payload: dict):
 @api_router.put("/medicines/{medicine_id}/sold")
 async def update_sold_units(
     medicine_id: str,
-    payload: dict
+    payload: dict,
+    user: dict = Depends(require_role("admin", "pharmacist"))
 ):
 
-    await db.medicines.update_one(
-        {"id": medicine_id},
+    medicine_filter = _medicine_identity_filter(medicine_id)
+
+    result = await db.medicines.update_one(
+        medicine_filter,
         {
             "$set": {
                 "sold_units":
@@ -551,8 +621,14 @@ async def update_sold_units(
         }
     )
 
+    if result.matched_count == 0:
+        raise HTTPException(404, "Medicine not found")
+
+    updated = await db.medicines.find_one(medicine_filter)
+
     return {
-        "message": "sold qty updated"
+        "message": "sold qty updated",
+        "sold_units": updated.get("sold_units")
     }
 
 
@@ -683,7 +759,10 @@ async def lookup_barcode(barcode: str, user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/patients")
-async def add_patient(payload: RegularPatient):
+async def add_patient(
+    payload: RegularPatient,
+    user: dict = Depends(get_current_user)
+):
     data = payload.model_dump()
     await db.regular_patients.insert_one(data)
     return {"success": True}
@@ -691,33 +770,35 @@ async def add_patient(payload: RegularPatient):
 @api_router.put("/patients/{phone}")
 async def update_patient(
     phone: str,
-    payload: RegularPatient
+    payload: RegularPatient,
+    user: dict = Depends(get_current_user)
 ):
 
-    await db.regular_patients.update_one(
+    result = await db.regular_patients.update_one(
         {"phone": phone},
         {
             "$set": payload.model_dump()
         }
     )
 
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Patient not found"
+        )
+
     return {
         "success": True
     }
 
-    raise HTTPException(
-        status_code=404,
-        detail="Patient not found"
-    )
-
 @api_router.get("/patients")
-async def list_patients():
+async def list_patients(user: dict = Depends(get_current_user)):
     items = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
     return items
 
 
 @api_router.get("/patients/alerts")
-async def patient_alerts():
+async def patient_alerts(user: dict = Depends(get_current_user)):
     from datetime import datetime
 
     today = datetime.now().date()
@@ -739,11 +820,20 @@ async def patient_alerts():
 
 
 @api_router.delete("/patients/{phone}")
-async def delete_patient(phone: str):
+async def delete_patient(
+    phone: str,
+    user: dict = Depends(get_current_user)
+):
 
-    await db.regular_patients.delete_one(
+    result = await db.regular_patients.delete_one(
         {"phone": phone}
     )
+
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Patient not found"
+        )
 
     return {
         "success": True
@@ -752,7 +842,10 @@ async def delete_patient(phone: str):
 from datetime import datetime, timezone
 
 @api_router.post("/patients/contacted/{phone}")
-async def mark_contacted(phone: str):
+async def mark_contacted(
+    phone: str,
+    user: dict = Depends(get_current_user)
+):
     await db.regular_patients.update_one(
         {"phone": phone},
         {
@@ -786,7 +879,11 @@ async def update_medicine(
 
 @api_router.delete("/medicines/{med_id}")
 async def delete_medicine(med_id: str, user: dict = Depends(require_role("admin"))):
-    await db.medicines.delete_one({"id": med_id})
+    result = await db.medicines.delete_one(_medicine_identity_filter(med_id))
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Medicine not found")
+
     return {"ok": True}
 
 
@@ -843,14 +940,121 @@ async def delete_customer(cid: str, user: dict = Depends(require_role("admin")))
 
 
 # ---------------- Invoices ----------------
-async def _next_invoice_no() -> str:
-    today = datetime.now(timezone.utc).strftime("%y%m%d")
-    count = await db.invoices.count_documents({"invoice_no": {"$regex": f"^INV-{today}-"}})
-    return f"INV-{today}-{count + 1:04d}"
+async def _existing_document_max_sequence(prefix: str, today: str) -> int:
+    collection, field = {
+        "INV": (db.invoices, "invoice_no"),
+        "PO": (db.purchase_orders, "po_no"),
+    }[prefix]
 
-async def reduce_fifo_stock(
+    docs = await collection.find(
+        {
+            field: {
+                "$regex": f"^{prefix}-{today}-\\d+$"
+            }
+        },
+        {
+            "_id": 0,
+            field: 1
+        }
+    ).to_list(None)
+
+    max_sequence = 0
+    for doc in docs:
+        try:
+            max_sequence = max(
+                max_sequence,
+                int(str(doc.get(field, "")).rsplit("-", 1)[-1])
+            )
+        except ValueError:
+            continue
+
+    return max_sequence
+
+
+async def _next_document_no(prefix: str) -> str:
+    today = datetime.now(timezone.utc).strftime("%y%m%d")
+    existing_max = await _existing_document_max_sequence(prefix, today)
+    counter = await db.counters.find_one_and_update(
+        {
+            "_id": f"{prefix}-{today}"
+        },
+        [
+            {
+                "$set": {
+                    "seq": {
+                        "$add": [
+                            {
+                                "$max": [
+                                    {"$ifNull": ["$seq", 0]},
+                                    existing_max,
+                                ]
+                            },
+                            1,
+                        ]
+                    },
+                    "prefix": prefix,
+                    "date": today,
+                }
+            }
+        ],
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return f"{prefix}-{today}-{int(counter['seq']):04d}"
+
+
+async def _next_invoice_no() -> str:
+    return await _next_document_no("INV")
+
+
+async def _next_po_no() -> str:
+    return await _next_document_no("PO")
+
+def _is_transaction_unsupported(exc: Exception) -> bool:
+    message = str(exc).lower()
+    details = getattr(exc, "details", None) or {}
+    code_name = str(details.get("codeName", "")).lower()
+
+    unsupported_markers = (
+        "transaction numbers are only allowed",
+        "transactions are not supported",
+        "transaction is not supported",
+        "multi-document transactions are not supported",
+        "sessions are not supported",
+        "session is not supported",
+        "cannot use sessions",
+        "replica set member or mongos",
+        "not a replica set member",
+    )
+
+    if any(marker in message for marker in unsupported_markers):
+        return True
+
+    return (
+        "transaction" in message
+        and "not supported" in message
+        and code_name in {"illegaloperation", "operationnotsupportedintransaction"}
+    )
+
+
+async def _run_with_transaction(operation, fallback):
+    try:
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                return await operation(session)
+    except PyMongoError as exc:
+        if _is_transaction_unsupported(exc):
+            logger.warning(
+                "MongoDB transactions are not available; using validation-first stock fallback"
+            )
+            return await fallback()
+        raise
+
+
+async def _build_fifo_stock_plan(
     medicine_name: str,
-    qty: int
+    qty: int,
+    session=None
 ):
 
     batches = await db.medicines.find(
@@ -859,13 +1063,15 @@ async def reduce_fifo_stock(
         },
         {
             "_id": 0
-        }
+        },
+        session=session
     ).sort(
         "expiry_date",
         1
     ).to_list(100)
 
     remaining = qty
+    plan = []
 
     for batch in batches:
 
@@ -888,39 +1094,21 @@ async def reduce_fifo_stock(
         if available <= 0:
             continue
 
-        # enough stock in this batch
-        if available >= remaining:
+        deduct = min(
+            available,
+            remaining
+        )
 
-            await db.medicines.update_one(
-                {
-                    "id": batch["id"]
-                },
-                {
-                    "$inc": {
-                        "sold_units": remaining
-                    }
-                }
-            )
+        plan.append({
+            "medicine_id": batch["id"],
+            "medicine_name": medicine_name,
+            "deduct": deduct,
+        })
 
-            remaining = 0
+        remaining -= deduct
 
+        if remaining <= 0:
             break
-
-        # consume full batch
-        else:
-
-            await db.medicines.update_one(
-                {
-                    "id": batch["id"]
-                },
-                {
-                    "$inc": {
-                        "sold_units": available
-                    }
-                }
-            )
-
-            remaining -= available
 
     if remaining > 0:
 
@@ -928,6 +1116,213 @@ async def reduce_fifo_stock(
             status_code=400,
             detail=f"Insufficient stock for {medicine_name}"
         )
+
+    return plan
+
+
+async def _apply_fifo_stock_plan(
+    plan: list[dict],
+    session=None,
+    applied=None
+):
+    applied_steps = []
+
+    for step in plan:
+
+        result = await db.medicines.update_one(
+            {
+                "id": step["medicine_id"],
+                "$expr": {
+                    "$gte": [
+                        {
+                            "$subtract": [
+                                {"$ifNull": ["$purchased_units", 0]},
+                                {"$ifNull": ["$sold_units", 0]},
+                            ]
+                        },
+                        step["deduct"],
+                    ]
+                }
+            },
+            {
+                "$inc": {
+                    "sold_units": step["deduct"]
+                }
+            },
+            session=session
+        )
+
+        if result.modified_count != 1:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Stock changed while processing {step['medicine_name']}. Please retry."
+            )
+
+        applied_steps.append(step)
+        if applied is not None:
+            applied.append(step)
+
+    return applied_steps
+
+
+async def _apply_fifo_stock_requests(
+    stock_requests: dict[str, int],
+    session=None,
+    applied=None
+):
+    applied_steps = []
+
+    for medicine_name, qty in stock_requests.items():
+        plan = await _build_fifo_stock_plan(
+            medicine_name,
+            qty,
+            session=session
+        )
+        applied_steps.extend(
+            await _apply_fifo_stock_plan(
+                plan,
+                session=session,
+                applied=applied
+            )
+        )
+
+    return applied_steps
+
+
+async def _restore_fifo_stock(applied: list[dict]):
+    for step in reversed(applied):
+        result = await db.medicines.update_one(
+            {
+                "id": step["medicine_id"],
+                "$expr": {
+                    "$gte": [
+                        {"$ifNull": ["$sold_units", 0]},
+                        step["deduct"],
+                    ]
+                }
+            },
+            {
+                "$inc": {
+                    "sold_units": -step["deduct"]
+                }
+            }
+        )
+
+        if result.modified_count != 1:
+            logger.error(
+                "Could not automatically restore %s units for medicine %s without "
+                "making sold_units negative; manual stock reconciliation may be needed",
+                step["deduct"],
+                step["medicine_id"],
+            )
+
+
+def _stock_deductions_from_steps(steps: list[dict]) -> list[dict]:
+    return [
+        {
+            "medicine_id": step["medicine_id"],
+            "medicine_name": step.get("medicine_name", ""),
+            "deduct": int(step.get("deduct", 0)),
+        }
+        for step in steps
+        if int(step.get("deduct", 0)) > 0
+    ]
+
+
+def _stock_deductions_from_daily_sale(sale: dict) -> list[dict]:
+    deductions = sale.get("stock_deductions") or []
+    if deductions:
+        return _stock_deductions_from_steps(deductions)
+
+    return [
+        {
+            "medicine_id": sale["medicine_id"],
+            "medicine_name": sale.get("medicine_name", ""),
+            "deduct": int(
+                sale.get(
+                    "units_dispensed",
+                    sale.get("quantity", 0)
+                )
+            ),
+            "legacy_fallback": True,
+        }
+    ]
+
+
+async def _restore_daily_sale_stock(
+    deductions: list[dict],
+    session=None,
+    restored=None
+):
+    for step in reversed(deductions):
+        deduct = int(step.get("deduct", 0))
+        if deduct <= 0:
+            continue
+
+        result = await db.medicines.update_one(
+            {
+                "id": step["medicine_id"],
+                "$expr": {
+                    "$gte": [
+                        {"$ifNull": ["$sold_units", 0]},
+                        deduct,
+                    ]
+                }
+            },
+            {
+                "$inc": {
+                    "sold_units": -deduct
+                }
+            },
+            session=session,
+        )
+
+        if result.modified_count != 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Could not restore daily-sale stock for "
+                    f"{step.get('medicine_name') or step['medicine_id']}. "
+                    "Manual reconciliation may be needed."
+                )
+            )
+
+        if restored is not None:
+            restored.append(step)
+
+
+async def _reapply_daily_sale_stock(restored: list[dict]):
+    for step in reversed(restored):
+        deduct = int(step.get("deduct", 0))
+        if deduct <= 0:
+            continue
+
+        await db.medicines.update_one(
+            {
+                "id": step["medicine_id"]
+            },
+            {
+                "$inc": {
+                    "sold_units": deduct
+                }
+            }
+        )
+
+
+async def reduce_fifo_stock(
+    medicine_name: str,
+    qty: int,
+    session=None
+):
+    plan = await _build_fifo_stock_plan(
+        medicine_name,
+        qty,
+        session=session
+    )
+    return await _apply_fifo_stock_plan(
+        plan,
+        session=session
+    )
 
 
 @api_router.post("/invoices")
@@ -940,6 +1335,7 @@ async def create_invoice(
     gst_total = 0.0
     items_out = []
     line_total_raw = 0.0
+    stock_requests = defaultdict(int)
 
     for item in payload.items:
 
@@ -966,11 +1362,7 @@ async def create_invoice(
             upb if item.unit_type == "box" else 1
         )
 
-        # FIFO STOCK REDUCTION
-        await reduce_fifo_stock(
-            item.name,
-            units_needed
-        )
+        stock_requests[item.name] += units_needed
 
         unit_price = item.mrp * (
             upb if item.unit_type == "box" else 1
@@ -1119,54 +1511,146 @@ async def create_invoice(
         ),
     }
 
-    await db.invoices.insert_one(
-        invoice
-    )
+    async def write_invoice_records(session=None, rollback_log=None):
+        doctor_name = invoice["referring_doctor"]
 
-    if invoice["referring_doctor"]:
+        if doctor_name:
 
-        await db.doctor_history.update_one(
+            if rollback_log is not None:
+                previous_doctor = await db.doctor_history.find_one(
+                    {
+                        "name": doctor_name
+                    }
+                )
+                rollback_log.append((
+                    "doctor_history",
+                    doctor_name,
+                    previous_doctor,
+                ))
 
-            {
-                "name": invoice["referring_doctor"]
-            },
+            await db.doctor_history.update_one(
 
-            {
-                "$inc": {
-                    "count": 1
+                {
+                    "name": doctor_name
                 },
 
-                "$set": {
-                    "last_used": invoice["created_at"]
-                }
-            },
+                {
+                    "$inc": {
+                        "count": 1
+                    },
 
-            upsert=True,
+                    "$set": {
+                        "last_used": invoice["created_at"]
+                    }
+                },
+
+                upsert=True,
+                session=session,
+            )
+
+        if (
+            payload.customer_id
+            and invoice["due_amount"] > 0
+        ):
+
+            customer_txn = {
+
+                "id": str(uuid.uuid4()),
+
+                "customer_id": payload.customer_id,
+
+                "type": "sale",
+
+                "amount": invoice["due_amount"],
+
+                "reference": invoice["invoice_no"],
+
+                "notes": "Credit sale",
+
+                "created_at": invoice["created_at"],
+            }
+
+            await db.customer_transactions.insert_one(
+                customer_txn,
+                session=session
+            )
+
+            if rollback_log is not None:
+                rollback_log.append((
+                    "customer_transaction",
+                    customer_txn["id"],
+                ))
+
+        await db.invoices.insert_one(
+            invoice,
+            session=session
         )
 
-    if (
-        payload.customer_id
-        and invoice["due_amount"] > 0
-    ):
+        if rollback_log is not None:
+            rollback_log.append((
+                "invoice",
+                invoice["id"],
+            ))
 
-        await db.customer_transactions.insert_one({
 
-            "id": str(uuid.uuid4()),
+    async def rollback_invoice_records(rollback_log):
+        for action in reversed(rollback_log):
+            if action[0] == "invoice":
+                await db.invoices.delete_one({
+                    "id": action[1]
+                })
+            elif action[0] == "customer_transaction":
+                await db.customer_transactions.delete_one({
+                    "id": action[1]
+                })
+            elif action[0] == "doctor_history":
+                _, doctor_name, previous_doctor = action
+                if previous_doctor:
+                    await db.doctor_history.replace_one(
+                        {
+                            "_id": previous_doctor["_id"]
+                        },
+                        previous_doctor,
+                        upsert=True
+                    )
+                else:
+                    await db.doctor_history.delete_one({
+                        "name": doctor_name
+                    })
 
-            "customer_id": payload.customer_id,
+    async def transaction_operation(session):
+        await _apply_fifo_stock_requests(
+            stock_requests,
+            session=session
+        )
+        await write_invoice_records(session=session)
+        return invoice
 
-            "type": "sale",
+    async def fallback_operation():
+        applied = []
 
-            "amount": invoice["due_amount"],
+        try:
+            await _apply_fifo_stock_requests(
+                stock_requests,
+                applied=applied
+            )
+            rollback_log = []
+            await write_invoice_records(rollback_log=rollback_log)
+        except Exception:
+            try:
+                if "rollback_log" in locals() and rollback_log:
+                    await rollback_invoice_records(rollback_log)
+            finally:
+                if applied:
+                    await _restore_fifo_stock(applied)
+            raise
 
-            "reference": invoice["invoice_no"],
+        return invoice
 
-            "notes": "Credit sale",
-
-            "created_at": invoice["created_at"],
-        })
-
-    return invoice
+    return await _run_with_transaction(
+        transaction_operation,
+        fallback_operation
+    )
     
 @api_router.get("/invoices")
 async def list_invoices(
@@ -1971,10 +2455,7 @@ async def create_po(
 
     po = {
     "id": str(uuid.uuid4()),
-    "po_no": (
-        f"PO-{datetime.now(timezone.utc).strftime('%y%m%d')}-"
-        f"{await db.purchase_orders.count_documents({}) + 1:04d}"
-    ),
+    "po_no": await _next_po_no(),
     "po_date": payload.po_date,
     "distributor_id": payload.distributor_id,
     "distributor_name": payload.distributor_name,
@@ -2216,48 +2697,9 @@ async def create_daily_sale(
         upb if payload.unit_type == "box" else 1
     )
 
-    # FIFO BATCH SYSTEM
-
-    batches = await db.medicines.find(
-        {
-            "name": med["name"]
-        },
-        {"_id": 0}
-    ).sort("expiry_date", 1).to_list(100)
-
-    remaining = units_needed
-
-    for batch in batches:
-
-        available = (
-            int(batch.get("purchased_units", 0))
-            - int(batch.get("sold_units", 0))
-        )
-
-        if available <= 0:
-            continue
-
-        deduct = min(available, remaining)
-
-        await db.medicines.update_one(
-            {"id": batch["id"]},
-            {
-                "$inc": {
-                    "sold_units": deduct
-                }
-            }
-        )
-
-        remaining -= deduct
-
-        if remaining <= 0:
-            break
-
-    if remaining > 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient stock for {med['name']}"
-        )
+    stock_requests = {
+        med["name"]: units_needed
+    }
 
     sale_date = (
         payload.sale_date
@@ -2295,11 +2737,52 @@ async def create_daily_sale(
         "created_by": user.get("name", ""),
     }
 
-    await db.daily_sales.insert_one(entry)
+    async def write_daily_sale(session=None):
+        await db.daily_sales.insert_one(
+            entry,
+            session=session
+        )
 
-    entry.pop("_id", None)
+    async def transaction_operation(session):
+        applied_steps = await _apply_fifo_stock_requests(
+            stock_requests,
+            session=session
+        )
+        entry["stock_deductions"] = _stock_deductions_from_steps(
+            applied_steps
+        )
+        await write_daily_sale(session=session)
+        return entry
 
-    return entry
+    async def fallback_operation():
+        applied = []
+
+        try:
+            await _apply_fifo_stock_requests(
+                stock_requests,
+                applied=applied
+            )
+            entry["stock_deductions"] = _stock_deductions_from_steps(
+                applied
+            )
+            await write_daily_sale()
+        except Exception:
+            if applied:
+                await _restore_fifo_stock(applied)
+            raise
+
+        return entry
+
+    await _run_with_transaction(
+        transaction_operation,
+        fallback_operation
+    )
+
+    return {
+        key: value
+        for key, value in entry.items()
+        if key not in {"_id", "stock_deductions"}
+    }
 
 @api_router.get("/daily-sales")
 async def list_daily_sales(
@@ -2309,7 +2792,13 @@ async def list_daily_sales(
     q = {}
     if date:
         q["sale_date"] = date
-    items = await db.daily_sales.find(q, {"_id": 0}).sort("created_at", -1).to_list(2000)
+    items = await db.daily_sales.find(
+        q,
+        {
+            "_id": 0,
+            "stock_deductions": 0
+        }
+    ).sort("created_at", -1).to_list(2000)
     return items
 
 
@@ -2390,26 +2879,56 @@ async def delete_daily_sale(
             detail="Entry not found"
         )
 
-    # RESTORE STOCK
-    await db.medicines.update_one(
-        {"id": sale["medicine_id"]},
-        {
-            "$inc": {
-                "sold_units": -int(
-                    sale.get(
-                        "units_dispensed",
-                        sale.get("quantity", 0)
-                    )
+    stock_deductions = _stock_deductions_from_daily_sale(sale)
+
+    async def transaction_operation(session):
+        await _restore_daily_sale_stock(
+            stock_deductions,
+            session=session
+        )
+        result = await db.daily_sales.delete_one(
+            {
+                "id": sale_id
+            },
+            session=session
+        )
+
+        if result.deleted_count != 1:
+            raise HTTPException(
+                status_code=404,
+                detail="Entry not found"
+            )
+
+        return {"ok": True}
+
+    async def fallback_operation():
+        restored = []
+
+        try:
+            await _restore_daily_sale_stock(
+                stock_deductions,
+                restored=restored
+            )
+            result = await db.daily_sales.delete_one({
+                "id": sale_id
+            })
+
+            if result.deleted_count != 1:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Entry not found"
                 )
-            }
-        },
+        except Exception:
+            if restored:
+                await _reapply_daily_sale_stock(restored)
+            raise
+
+        return {"ok": True}
+
+    return await _run_with_transaction(
+        transaction_operation,
+        fallback_operation
     )
-
-    await db.daily_sales.delete_one({
-        "id": sale_id
-    })
-
-    return {"ok": True}
 
 
 async def rebuild_inventory():
@@ -2471,6 +2990,25 @@ async def rebuild_inventory():
                     "pack_size": i.get("pack_size"),
 
                     "gst_rate": i.get("gst_rate"),
+
+                    "distributor_id":
+                        po.get("distributor_id")
+                        or i.get("distributor_id")
+                        or (existing.get("distributor_id") if existing else None),
+
+                    "distributor_name":
+                        po.get("distributor_name")
+                        or i.get("distributor_name")
+                        or i.get("distributor")
+                        or (existing.get("distributor_name") if existing else None)
+                        or (existing.get("distributor") if existing else None),
+
+                    "distributor":
+                        po.get("distributor_name")
+                        or i.get("distributor")
+                        or i.get("distributor_name")
+                        or (existing.get("distributor") if existing else None)
+                        or (existing.get("distributor_name") if existing else None),
 
                     # PURCHASE STOCK FROM PO
                     "purchased_units": 0,
