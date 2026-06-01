@@ -374,6 +374,27 @@ async def list_medicines(
         {"_id": 0}
     ).to_list(5000)
 
+    distributor_ids = {
+        m.get("distributor_id")
+        for m in items
+        if m.get("distributor_id")
+    }
+
+    distributor_names = {}
+
+    if distributor_ids:
+
+        distributor_rows = await db.distributors.find(
+            {"id": {"$in": list(distributor_ids)}},
+            {"_id": 0, "id": 1, "name": 1}
+        ).to_list(5000)
+
+        distributor_names = {
+            d.get("id"): d.get("name")
+            for d in distributor_rows
+            if d.get("id")
+        }
+
     grouped = {}
 
     for m in items:
@@ -505,6 +526,20 @@ async def list_medicines(
                 "expiry_status"
             ] = expiry_status
 
+        distributor_id = m.get("distributor_id")
+
+        distributor_name = (
+            m.get("distributor_name")
+            or m.get("distributor")
+            or distributor_names.get(distributor_id)
+        )
+
+        distributor_value = (
+            m.get("distributor")
+            or m.get("distributor_name")
+            or distributor_names.get(distributor_id)
+        )
+
         grouped[name]["batches"].append({
 
             "id":
@@ -550,13 +585,13 @@ async def list_medicines(
               m.get("mrp"),
 
             "distributor_id":
-                m.get("distributor_id"),
+                distributor_id,
 
             "distributor_name":
-                m.get("distributor_name") or m.get("distributor"),
+                distributor_name,
 
             "distributor":
-                m.get("distributor") or m.get("distributor_name"),
+                distributor_value,
         })
 
     result = list(
@@ -2952,6 +2987,18 @@ async def rebuild_inventory():
 
     async for po in cursor:
 
+        po_distributor_id = po.get("distributor_id")
+
+        po_distributor_name = (
+            po.get("distributor_name")
+            or po.get("distributor")
+        )
+
+        po_distributor = (
+            po.get("distributor")
+            or po.get("distributor_name")
+        )
+
         for i in po.get("items", []):
 
             key = i.get("medicine_key")
@@ -2992,19 +3039,19 @@ async def rebuild_inventory():
                     "gst_rate": i.get("gst_rate"),
 
                     "distributor_id":
-                        po.get("distributor_id")
+                        po_distributor_id
                         or i.get("distributor_id")
                         or (existing.get("distributor_id") if existing else None),
 
                     "distributor_name":
-                        po.get("distributor_name")
+                        po_distributor_name
                         or i.get("distributor_name")
                         or i.get("distributor")
                         or (existing.get("distributor_name") if existing else None)
                         or (existing.get("distributor") if existing else None),
 
                     "distributor":
-                        po.get("distributor_name")
+                        po_distributor
                         or i.get("distributor")
                         or i.get("distributor_name")
                         or (existing.get("distributor") if existing else None)
