@@ -19,7 +19,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
-from pydantic import BaseModel, Field, EmailStr, field_validator
+from pydantic import BaseModel, Field, EmailStr, field_validator, model_validator
 from fastapi import UploadFile, File
 
 
@@ -427,6 +427,138 @@ class ExpenseCreate(BaseModel):
     category: str
     amount: float
     notes: Optional[str] = None
+
+
+class PurchaseReturnCreate(BaseModel):
+    return_date: Optional[str] = None
+    distributor: Optional[str] = None
+    distributor_id: Optional[str] = None
+    medicine_name: Optional[str] = None
+    medicine_id: Optional[str] = None
+    medicine_key: Optional[str] = None
+    batch_number: Optional[str] = None
+    expiry_date: Optional[str] = None
+    return_quantity: Optional[float] = None
+    purchase_rate: Optional[float] = None
+    reason: Optional[Literal["Expired", "Damaged", "Wrong Item", "Other"]] = None
+    notes: str = ""
+    adjust_distributor_ledger: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_frontend_payload(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        selected = (
+            normalized.get("selectedMedicine")
+            or normalized.get("selected_medicine")
+            or normalized.get("selectedBatch")
+            or normalized.get("selected_batch")
+            or {}
+        )
+
+        if isinstance(selected, dict):
+            fallback_keys = {
+                "medicine_name": ["medicine_name", "name"],
+                "medicine_id": ["medicine_id", "id"],
+                "medicine_key": ["medicine_key"],
+                "batch_number": ["batch_number", "batch_no"],
+                "expiry_date": ["expiry_date"],
+                "distributor": ["distributor", "distributor_name"],
+                "distributor_id": ["distributor_id"],
+                "purchase_rate": ["purchase_rate", "purchase_price"],
+            }
+
+            for field_name, selected_keys in fallback_keys.items():
+                if normalized.get(field_name) not in [None, ""]:
+                    continue
+                for selected_key in selected_keys:
+                    selected_value = selected.get(selected_key)
+                    if selected_value not in [None, ""]:
+                        normalized[field_name] = selected_value
+                        break
+
+        alias_map = {
+            "batch_no": "batch_number",
+            "batch": "batch_number",
+            "medicine": "medicine_name",
+            "name": "medicine_name",
+            "distributor_name": "distributor",
+            "purchase_price": "purchase_rate",
+            "return_qty": "return_quantity",
+            "quantity": "return_quantity",
+            "adjustDistributorLedger": "adjust_distributor_ledger",
+        }
+
+        for source, target in alias_map.items():
+            if normalized.get(target) in [None, ""] and normalized.get(source) not in [None, ""]:
+                normalized[target] = normalized[source]
+
+        return normalized
+
+    @field_validator(
+        "return_date",
+        "distributor",
+        "distributor_id",
+        "medicine_name",
+        "medicine_id",
+        "medicine_key",
+        "batch_number",
+        "expiry_date",
+        "reason",
+        mode="before",
+    )
+    @classmethod
+    def trim_string_fields(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip()
+            return trimmed or None
+        return value
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def trim_notes(cls, value):
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("return_date")
+    @classmethod
+    def require_valid_return_date(cls, value):
+        if value is not None and not parse_iso_date(value):
+            raise ValueError("return_date must be a valid ISO date")
+        return value
+
+    @field_validator("expiry_date")
+    @classmethod
+    def require_valid_expiry_date(cls, value):
+        if value is not None and not parse_expiry_date(value):
+            raise ValueError("expiry_date must be a valid ISO date or MM/YY value")
+        return value
+
+    @field_validator("return_quantity")
+    @classmethod
+    def require_positive_return_quantity(cls, value):
+        if value is None:
+            return value
+        if value <= 0:
+            raise ValueError("return_quantity must be greater than zero")
+        return value
+
+    @field_validator("purchase_rate")
+    @classmethod
+    def require_positive_purchase_rate(cls, value):
+        if value is None:
+            return value
+        if value <= 0:
+            raise ValueError("purchase_rate must be greater than zero")
+        return value
     
 # ---------------- Startup ----------------
 @app.on_event("startup")
@@ -435,6 +567,11 @@ async def startup():
     await db.medicines.create_index("name")
     await db.medicines.create_index("barcode")
     await db.invoices.create_index("created_at")
+    await db.purchase_returns.create_index("return_date")
+    await db.purchase_returns.create_index("distributor")
+    await db.purchase_returns.create_index("medicine_name")
+    await db.purchase_returns.create_index("reason")
+    await db.purchase_returns.create_index("ledger_adjusted")
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@pharmacy.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
@@ -2017,6 +2154,7 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
     running = []
     total_purchases = float(dist.get("opening_balance", 0))
     total_paid = 0
+    total_adjustments = 0
     for t in txns:
 
           amt = float(t.get("amount", 0))
@@ -2025,6 +2163,11 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
 
              balance += amt
              total_purchases += amt
+
+          elif t["type"] == "purchase_return":
+
+             balance -= amt
+             total_adjustments += amt
 
           else:  # payment
 
@@ -2041,6 +2184,7 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
       "balance": round(balance, 2),
       "total_purchases": round(total_purchases, 2),
       "total_paid": round(total_paid, 2),
+      "total_adjustments": round(total_adjustments, 2),
     }
 @api_router.delete("/ledger/distributor/{did}/transaction/{txn_id}")
 async def delete_distributor_txn(
@@ -2091,6 +2235,416 @@ async def add_dist_payment(did: str, p: PaymentCreate, user: dict = Depends(requ
     return txn
 
 
+# ---------------- Purchase Returns / Expiry Returns ----------------
+def _purchase_return_query(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    distributor: Optional[str] = None,
+    medicine: Optional[str] = None,
+    reason: Optional[str] = None,
+    ledger_adjusted: Optional[bool] = None,
+    search: Optional[str] = None,
+) -> dict:
+    query = {}
+
+    if start or end:
+        query["return_date"] = {}
+        if start:
+            query["return_date"]["$gte"] = start
+        if end:
+            query["return_date"]["$lte"] = end
+
+    if distributor:
+        query["distributor"] = {"$regex": distributor, "$options": "i"}
+
+    if medicine:
+        query["medicine_name"] = {"$regex": medicine, "$options": "i"}
+
+    if reason:
+        query["reason"] = reason
+
+    if ledger_adjusted is not None:
+        query["ledger_adjusted"] = ledger_adjusted
+
+    if search:
+        query["$or"] = [
+            {"distributor": {"$regex": search, "$options": "i"}},
+            {"medicine_name": {"$regex": search, "$options": "i"}},
+            {"batch_number": {"$regex": search, "$options": "i"}},
+            {"reason": {"$regex": search, "$options": "i"}},
+            {"notes": {"$regex": search, "$options": "i"}},
+        ]
+
+    return query
+
+
+def _available_batch_stock(medicine: dict) -> float:
+    return float(medicine.get("purchased_units", 0) or 0) - float(medicine.get("sold_units", 0) or 0)
+
+
+def _return_public(return_doc: dict) -> dict:
+    return {key: value for key, value in return_doc.items() if key != "_id"}
+
+
+def _require_purchase_return_field(value, field_name: str):
+    if value in [None, ""]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} is required",
+        )
+    return value
+
+
+async def _find_purchase_return_medicine(payload: PurchaseReturnCreate, session=None) -> dict:
+    lookup_filters = []
+
+    if payload.medicine_id:
+        lookup_filters.append({"id": payload.medicine_id})
+
+    if payload.medicine_key:
+        lookup_filters.append({"medicine_key": payload.medicine_key})
+
+    if payload.medicine_name and payload.batch_number:
+        lookup_filters.append({
+            "name": payload.medicine_name,
+            "batch_no": payload.batch_number,
+        })
+
+    if not lookup_filters:
+        raise HTTPException(
+            status_code=400,
+            detail="medicine_name and batch_number are required unless medicine_id or medicine_key is provided",
+        )
+
+    medicine = await db.medicines.find_one(
+        {"$or": lookup_filters},
+        session=session,
+    )
+
+    if not medicine:
+        raise HTTPException(
+            status_code=400,
+            detail="Medicine batch not found",
+        )
+
+    if payload.batch_number and medicine.get("batch_no") != payload.batch_number:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected medicine does not match submitted batch_number",
+        )
+
+    return medicine
+
+
+def _purchase_return_ledger_transaction(return_doc: dict) -> dict:
+    return {
+        "id": str(uuid.uuid4()),
+        "distributor_id": return_doc.get("distributor_id"),
+        "type": "purchase_return",
+        "subtype": "Purchase Return / Expiry Return",
+        "direction": "credit_adjustment",
+        "amount": return_doc["return_amount"],
+        "reference": return_doc["id"],
+        "return_id": return_doc["id"],
+        "notes": (
+            f"{return_doc.get('medicine_name', '')}, "
+            f"Batch {return_doc.get('batch_number', '')}, "
+            f"Qty {return_doc.get('return_quantity', 0)}, "
+            f"Reason: {return_doc.get('reason', '')}"
+        ),
+        "created_at": return_doc["created_at"],
+    }
+
+
+async def _deduct_purchase_return_stock(medicine_id: str, quantity: float, session=None):
+    result = await db.medicines.update_one(
+        {
+            "id": medicine_id,
+            "$expr": {
+                "$gte": [
+                    {
+                        "$subtract": [
+                            {"$ifNull": ["$purchased_units", 0]},
+                            {"$ifNull": ["$sold_units", 0]},
+                        ]
+                    },
+                    quantity,
+                ]
+            },
+        },
+        {
+            "$inc": {
+                "sold_units": quantity,
+            }
+        },
+        session=session,
+    )
+
+    if result.modified_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Return quantity exceeds available stock for this batch",
+        )
+
+
+@api_router.post("/purchase-returns")
+async def create_purchase_return(
+    payload: PurchaseReturnCreate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    medicine = await _find_purchase_return_medicine(payload)
+    return_date = _require_purchase_return_field(payload.return_date, "return_date")
+    return_quantity = _require_purchase_return_field(payload.return_quantity, "return_quantity")
+    reason = _require_purchase_return_field(payload.reason, "reason")
+
+    medicine_name = payload.medicine_name or medicine.get("name")
+    batch_number = payload.batch_number or medicine.get("batch_no")
+    expiry_date = payload.expiry_date or medicine.get("expiry_date")
+    purchase_rate = (
+        payload.purchase_rate
+        if payload.purchase_rate is not None
+        else medicine.get("purchase_price")
+    )
+
+    medicine_name = _require_purchase_return_field(medicine_name, "medicine_name")
+    batch_number = _require_purchase_return_field(batch_number, "batch_number")
+    expiry_date = _require_purchase_return_field(expiry_date, "expiry_date")
+    purchase_rate = _require_purchase_return_field(purchase_rate, "purchase_rate")
+
+    if purchase_rate <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="purchase_rate must be greater than zero",
+        )
+
+    available_stock = _available_batch_stock(medicine)
+
+    if return_quantity > available_stock:
+        raise HTTPException(
+            status_code=400,
+            detail="Return quantity cannot exceed available stock in that batch",
+        )
+
+    distributor_filters = []
+    if payload.distributor_id:
+        distributor_filters.append({"id": payload.distributor_id})
+    if payload.distributor:
+        distributor_filters.extend([
+            {"id": payload.distributor},
+            {"name": payload.distributor},
+        ])
+
+    distributor = None
+    if distributor_filters:
+        distributor = await db.distributors.find_one(
+            {"$or": distributor_filters},
+            {"_id": 0},
+        )
+
+    distributor_id = (
+        (distributor.get("id") if distributor else None)
+        or payload.distributor_id
+        or medicine.get("distributor_id")
+    )
+    distributor_name = (
+        (distributor.get("name") if distributor else None)
+        or payload.distributor
+        or medicine.get("distributor_name")
+        or medicine.get("distributor")
+    )
+    distributor_name = _require_purchase_return_field(distributor_name, "distributor")
+
+    return_amount = round(return_quantity * purchase_rate, 2)
+    now = datetime.now(timezone.utc).isoformat()
+
+    purchase_return = {
+        "id": str(uuid.uuid4()),
+        "return_date": return_date,
+        "distributor": distributor_name,
+        "distributor_id": distributor_id,
+        "medicine_id": medicine.get("id"),
+        "medicine_key": medicine.get("medicine_key"),
+        "medicine_name": medicine_name,
+        "batch_number": batch_number,
+        "expiry_date": expiry_date,
+        "return_quantity": return_quantity,
+        "purchase_rate": purchase_rate,
+        "return_amount": return_amount,
+        "reason": reason,
+        "notes": payload.notes,
+        "adjust_distributor_ledger": payload.adjust_distributor_ledger,
+        "ledger_adjusted": payload.adjust_distributor_ledger,
+        "ledger_transaction_id": None,
+        "created_at": now,
+        "created_by": user.get("name", ""),
+    }
+
+    ledger_txn = None
+    if payload.adjust_distributor_ledger:
+        if not distributor_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Distributor ledger adjustment requires a matched distributor",
+            )
+        ledger_txn = _purchase_return_ledger_transaction(purchase_return)
+        purchase_return["ledger_transaction_id"] = ledger_txn["id"]
+
+    async def write_records(session=None):
+        current_medicine = await _find_purchase_return_medicine(payload, session=session)
+        await _deduct_purchase_return_stock(
+            current_medicine["id"],
+            return_quantity,
+            session=session,
+        )
+        await db.purchase_returns.insert_one(purchase_return, session=session)
+        if ledger_txn:
+            await db.distributor_transactions.insert_one(ledger_txn, session=session)
+        return _return_public(purchase_return)
+
+    async def transaction_operation(session):
+        return await write_records(session=session)
+
+    async def fallback_operation():
+        stock_deducted = False
+        try:
+            current_medicine = await _find_purchase_return_medicine(payload)
+            await _deduct_purchase_return_stock(
+                current_medicine["id"],
+                return_quantity,
+            )
+            stock_deducted = True
+            await db.purchase_returns.insert_one(purchase_return)
+            if ledger_txn:
+                await db.distributor_transactions.insert_one(ledger_txn)
+        except Exception:
+            if stock_deducted:
+                await db.medicines.update_one(
+                    {"id": medicine.get("id")},
+                    {"$inc": {"sold_units": -return_quantity}},
+                )
+            raise
+
+        return _return_public(purchase_return)
+
+    return await _run_with_transaction(
+        transaction_operation,
+        fallback_operation,
+    )
+
+
+@api_router.get("/purchase-returns")
+async def list_purchase_returns(
+    search: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    distributor: Optional[str] = None,
+    medicine: Optional[str] = None,
+    reason: Optional[str] = None,
+    ledger_adjusted: Optional[bool] = None,
+    page: int = 1,
+    page_size: int = 25,
+    user: dict = Depends(get_current_user),
+):
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
+    query = _purchase_return_query(
+        start=start,
+        end=end,
+        distributor=distributor,
+        medicine=medicine,
+        reason=reason,
+        ledger_adjusted=ledger_adjusted,
+        search=search,
+    )
+
+    total = await db.purchase_returns.count_documents(query)
+    items = await db.purchase_returns.find(
+        query,
+        {"_id": 0},
+    ).sort("return_date", -1).skip((page - 1) * page_size).limit(page_size).to_list(page_size)
+
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size,
+    }
+
+
+@api_router.get("/reports/purchase-returns")
+async def purchase_return_report(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    distributor: Optional[str] = None,
+    medicine: Optional[str] = None,
+    reason: Optional[str] = None,
+    ledger_adjusted: Optional[bool] = None,
+    user: dict = Depends(get_current_user),
+):
+    query = _purchase_return_query(
+        start=start,
+        end=end,
+        distributor=distributor,
+        medicine=medicine,
+        reason=reason,
+        ledger_adjusted=ledger_adjusted,
+    )
+    returns = await db.purchase_returns.find(query, {"_id": 0}).to_list(10000)
+
+    by_distributor = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
+    by_medicine = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
+    by_reason = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
+    by_ledger_status = {
+        "adjusted": {"quantity": 0.0, "value": 0.0, "count": 0},
+        "pending": {"quantity": 0.0, "value": 0.0, "count": 0},
+    }
+
+    total_quantity = 0.0
+    total_value = 0.0
+
+    def add_summary(bucket: dict, key: str, quantity: float, value: float):
+        bucket[key]["quantity"] += quantity
+        bucket[key]["value"] += value
+        bucket[key]["count"] += 1
+
+    for item in returns:
+        quantity = float(item.get("return_quantity", 0) or 0)
+        value = float(item.get("return_amount", 0) or 0)
+        total_quantity += quantity
+        total_value += value
+
+        add_summary(by_distributor, item.get("distributor") or "Unknown", quantity, value)
+        add_summary(by_medicine, item.get("medicine_name") or "Unknown", quantity, value)
+        add_summary(by_reason, item.get("reason") or "Unknown", quantity, value)
+        status_key = "adjusted" if item.get("ledger_adjusted") else "pending"
+        add_summary(by_ledger_status, status_key, quantity, value)
+
+    def finalize_summary(bucket: dict) -> list[dict]:
+        output = []
+        for key, values in bucket.items():
+            output.append({
+                "name": key,
+                "quantity": round(values["quantity"], 2),
+                "value": round(values["value"], 2),
+                "count": values["count"],
+            })
+        output.sort(key=lambda row: str(row["name"]).lower())
+        return output
+
+    return {
+        "start": start,
+        "end": end,
+        "total_returned_quantity": round(total_quantity, 2),
+        "total_return_value": round(total_value, 2),
+        "return_count": len(returns),
+        "returns_by_distributor": finalize_summary(by_distributor),
+        "returns_by_medicine": finalize_summary(by_medicine),
+        "returns_by_reason": finalize_summary(by_reason),
+        "ledger_adjusted_status": finalize_summary(by_ledger_status),
+    }
+
+
 async def _distributor_monthly_summary_data(month: str, distributor_id: Optional[str] = None):
     try:
         datetime.strptime(month, "%Y-%m")
@@ -2119,6 +2673,7 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
             "month": month,
             "purchase_total": 0.0,
             "payment_total": 0.0,
+            "adjustment_total": 0.0,
             "net_change": 0.0,
             "transaction_count": 0,
             "transactions": [],
@@ -2134,6 +2689,7 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
                 "month": month,
                 "purchase_total": 0.0,
                 "payment_total": 0.0,
+                "adjustment_total": 0.0,
                 "net_change": 0.0,
                 "transaction_count": 0,
                 "transactions": [],
@@ -2148,6 +2704,9 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
         elif txn.get("type") == "payment":
             summary["payment_total"] += amount
             summary["net_change"] -= amount
+        elif txn.get("type") == "purchase_return":
+            summary["adjustment_total"] += amount
+            summary["net_change"] -= amount
 
         summary["transaction_count"] += 1
         summary["transactions"].append(txn)
@@ -2155,13 +2714,16 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
     items = []
     total_purchases = 0.0
     total_payments = 0.0
+    total_adjustments = 0.0
 
     for summary in summaries.values():
         summary["purchase_total"] = round(summary["purchase_total"], 2)
         summary["payment_total"] = round(summary["payment_total"], 2)
+        summary["adjustment_total"] = round(summary["adjustment_total"], 2)
         summary["net_change"] = round(summary["net_change"], 2)
         total_purchases += summary["purchase_total"]
         total_payments += summary["payment_total"]
+        total_adjustments += summary["adjustment_total"]
         items.append(summary)
 
     items.sort(key=lambda item: str(item.get("distributor_name") or "").lower())
@@ -2171,7 +2733,8 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
         "distributor_id": distributor_id,
         "purchase_total": round(total_purchases, 2),
         "payment_total": round(total_payments, 2),
-        "net_change": round(total_purchases - total_payments, 2),
+        "adjustment_total": round(total_adjustments, 2),
+        "net_change": round(total_purchases - total_payments - total_adjustments, 2),
         "distributor_count": len(items),
         "items": items,
     }
@@ -2472,7 +3035,7 @@ async def dashboard_summary(
             if t.get("type") == "purchase":
                 bal += float(t.get("amount", 0))
 
-            elif t.get("type") == "payment":
+            elif t.get("type") in ["payment", "purchase_return"]:
                 bal -= float(t.get("amount", 0))
 
         if bal > 0:
@@ -2720,7 +3283,7 @@ async def outstanding_report(
             if t.get("type") == "purchase":
                 bal += float(t.get("amount", 0))
 
-            elif t.get("type") == "payment":
+            elif t.get("type") in ["payment", "purchase_return"]:
                 bal -= float(t.get("amount", 0))
 
         if bal > 0:
@@ -2842,13 +3405,14 @@ async def backup_export(user: dict = Depends(require_role("admin"))):
         "invoices": await db.invoices.find({}, {"_id": 0}).to_list(10000),
         "customer_transactions": await db.customer_transactions.find({}, {"_id": 0}).to_list(10000),
         "distributor_transactions": await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000),
+        "purchase_returns": await db.purchase_returns.find({}, {"_id": 0}).to_list(10000),
     }
     return data
 
 
 @api_router.post("/backup/import")
 async def backup_import(payload: dict, user: dict = Depends(require_role("admin"))):
-    collections = ["medicines", "distributors", "customers", "invoices", "customer_transactions", "distributor_transactions"]
+    collections = ["medicines", "distributors", "customers", "invoices", "customer_transactions", "distributor_transactions", "purchase_returns"]
     counts = {}
     for c in collections:
         items = payload.get(c, [])
