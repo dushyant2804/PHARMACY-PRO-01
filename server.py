@@ -22,7 +22,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
-from pydantic import BaseModel, Field, EmailStr, field_validator, model_validator
+from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator, model_validator
 from fastapi import UploadFile, File
 
 
@@ -449,6 +449,39 @@ class PaymentCreate(BaseModel):
     mode: str = "cash"
     notes: str = ""
     date: str| None = None
+
+
+class DistributorTransactionUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    receipt_number: Optional[str] = None
+    reference_number: Optional[str] = None
+    payment_mode: Optional[str] = None
+    notes: Optional[str] = None
+    transaction_date: Optional[str] = None
+
+    @field_validator(
+        "receipt_number",
+        "reference_number",
+        "payment_mode",
+        "notes",
+        "transaction_date",
+        mode="before",
+    )
+    @classmethod
+    def trim_editable_strings(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("transaction_date")
+    @classmethod
+    def require_valid_transaction_date(cls, value):
+        if value is not None and not parse_iso_date(value):
+            raise ValueError("transaction_date must be a valid ISO date")
+        return value
 
 
 class HistoricalSaleCreate(BaseModel):
@@ -2214,6 +2247,87 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
       "total_paid": round(total_paid, 2),
       "total_adjustments": round(total_adjustments, 2),
     }
+
+
+def _distributor_transaction_edit_user(user: dict) -> str:
+    return str(
+        user.get("id")
+        or user.get("email")
+        or user.get("name")
+        or "unknown"
+    )
+
+
+def _distributor_transaction_old_value(txn: dict, field_name: str):
+    if field_name == "payment_mode":
+        return txn.get("payment_mode", txn.get("mode"))
+    return txn.get(field_name)
+
+
+@api_router.patch("/distributor-transactions/{transaction_id}")
+async def update_distributor_transaction(
+    transaction_id: str,
+    payload: DistributorTransactionUpdate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one editable transaction field is required",
+        )
+
+    txn = await db.distributor_transactions.find_one(
+        {"id": transaction_id},
+        {"_id": 0},
+    )
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    old_values = {
+        field_name: _distributor_transaction_old_value(txn, field_name)
+        for field_name in changes
+    }
+    new_values = dict(changes)
+
+    edited_at = datetime.now(timezone.utc).isoformat()
+    edited_by = _distributor_transaction_edit_user(user)
+
+    set_values = {
+        field_name: value
+        for field_name, value in changes.items()
+        if field_name != "payment_mode"
+    }
+    if "payment_mode" in changes:
+        set_values["payment_mode"] = changes["payment_mode"]
+        set_values["mode"] = changes["payment_mode"]
+
+    set_values["edited_at"] = edited_at
+    set_values["edited_by"] = edited_by
+
+    updated = await db.distributor_transactions.find_one_and_update(
+        {"id": transaction_id},
+        {
+            "$set": set_values,
+            "$push": {
+                "edit_history": {
+                    "edited_at": edited_at,
+                    "edited_by": edited_by,
+                    "old_values": old_values,
+                    "new_values": new_values,
+                }
+            },
+        },
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    return updated
+
+
 @api_router.delete("/ledger/distributor/{did}/transaction/{txn_id}")
 async def delete_distributor_txn(
     did: str,
