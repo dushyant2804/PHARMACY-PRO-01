@@ -14,12 +14,15 @@ from typing import List, Optional, Literal
 from collections import defaultdict
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
-from pydantic import BaseModel, Field, EmailStr, field_validator
+from pydantic import BaseModel, Field, EmailStr, field_validator, model_validator
 from fastapi import UploadFile, File
 
 
@@ -34,6 +37,39 @@ app = FastAPI(title="Pharmacy Management API")
 def home():
     return {"message": "Pharmacy backend is running"}
 api_router = APIRouter(prefix="/api")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+
+    if request.url.path == "/api/purchase-returns" and request.method.upper() == "POST":
+        missing_fields = []
+        for error in errors:
+            if error.get("type") != "missing":
+                continue
+
+            location = error.get("loc") or []
+            if len(location) >= 2 and location[0] == "body":
+                missing_fields.append(str(location[-1]))
+
+        if missing_fields:
+            field_list = ", ".join(dict.fromkeys(missing_fields))
+            return JSONResponse(
+                status_code=422,
+                content=jsonable_encoder(
+                    {
+                        "detail": errors,
+                        "message": f"Missing field: {field_list}",
+                        "missing_fields": list(dict.fromkeys(missing_fields)),
+                    }
+                ),
+            )
+
+    return JSONResponse(
+        status_code=422,
+        content=jsonable_encoder({"detail": errors}),
+    )
 
 JWT_ALGORITHM = "HS256"
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development").lower()
@@ -432,7 +468,10 @@ class ExpenseCreate(BaseModel):
 class PurchaseReturnCreate(BaseModel):
     return_date: str
     distributor: str
+    distributor_id: str = ""
     medicine_name: str
+    medicine_key: str = ""
+    medicine_id: str = ""
     batch_number: str
     expiry_date: str
     return_quantity: float
@@ -440,6 +479,46 @@ class PurchaseReturnCreate(BaseModel):
     reason: Literal["Expired", "Damaged", "Wrong Item", "Other"]
     notes: str = ""
     adjust_distributor_ledger: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_frontend_payload(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+
+        alias_fields = {
+            "distributor": ("distributor_id",),
+            "batch_number": ("batch", "batch_no"),
+            "expiry_date": ("expiry",),
+            "return_quantity": ("quantity",),
+            "purchase_rate": ("rate",),
+        }
+
+        for field_name, aliases in alias_fields.items():
+            if normalized.get(field_name) not in (None, ""):
+                continue
+            for alias in aliases:
+                if normalized.get(alias) not in (None, ""):
+                    normalized[field_name] = normalized[alias]
+                    break
+
+        if normalized.get("medicine_key") in (None, "") and normalized.get("medicine_id") not in (None, ""):
+            normalized["medicine_key"] = normalized["medicine_id"]
+
+        reason = normalized.get("reason")
+        if isinstance(reason, str):
+            reason_lookup = {
+                "expired": "Expired",
+                "damaged": "Damaged",
+                "wrong item": "Wrong Item",
+                "wrong_item": "Wrong Item",
+                "other": "Other",
+            }
+            normalized["reason"] = reason_lookup.get(reason.strip().lower(), reason.strip())
+
+        return normalized
 
     @field_validator(
         "return_date",
@@ -2236,11 +2315,19 @@ def _return_public(return_doc: dict) -> dict:
 
 
 async def _find_purchase_return_medicine(payload: PurchaseReturnCreate, session=None) -> dict:
+    batch_filter = {"batch_no": payload.batch_number}
+    lookup_filters = [
+        {**batch_filter, "name": payload.medicine_name},
+    ]
+
+    if payload.medicine_key:
+        lookup_filters.append({**batch_filter, "medicine_key": payload.medicine_key})
+
+    if payload.medicine_id:
+        lookup_filters.append({"id": payload.medicine_id})
+
     medicine = await db.medicines.find_one(
-        {
-            "name": payload.medicine_name,
-            "batch_no": payload.batch_number,
-        },
+        {"$or": lookup_filters},
         session=session,
     )
 
@@ -2318,13 +2405,15 @@ async def create_purchase_return(
             detail="Return quantity cannot exceed available stock in that batch",
         )
 
+    distributor_lookup = [
+        {"id": payload.distributor},
+        {"name": payload.distributor},
+    ]
+    if payload.distributor_id:
+        distributor_lookup.append({"id": payload.distributor_id})
+
     distributor = await db.distributors.find_one(
-        {
-            "$or": [
-                {"id": payload.distributor},
-                {"name": payload.distributor},
-            ]
-        },
+        {"$or": distributor_lookup},
         {"_id": 0},
     )
 
