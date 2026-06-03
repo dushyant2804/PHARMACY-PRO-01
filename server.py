@@ -403,6 +403,10 @@ class Distributor(BaseModel):
     address: str = ""
     gstin: str = ""
     opening_balance: float = 0.0
+    opening_balance_invoice_number: Optional[str] = None
+    opening_balance_bill_number: Optional[str] = None
+    opening_balance_reference_number: Optional[str] = None
+    opening_balance_notes: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1436,7 +1440,27 @@ async def delete_medicine(med_id: str, user: dict = Depends(require_role("admin"
 # ---------------- Distributors ----------------
 @api_router.get("/distributors")
 async def list_distributors(user: dict = Depends(get_current_user)):
-    return await db.distributors.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
+    distributors = await db.distributors.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
+    distributor_ids = [d.get("id") for d in distributors if d.get("id")]
+    transactions_by_distributor = defaultdict(list)
+
+    if distributor_ids:
+        transactions = await db.distributor_transactions.find(
+            {"distributor_id": {"$in": distributor_ids}},
+            {"_id": 0},
+        ).to_list(10000)
+        for txn in transactions:
+            transactions_by_distributor[txn.get("distributor_id")].append(txn)
+
+    for distributor in distributors:
+        current_balance = _current_distributor_balance(
+            distributor,
+            transactions_by_distributor.get(distributor.get("id"), []),
+        )
+        distributor["current_balance"] = current_balance
+        distributor["outstanding_balance"] = current_balance
+
+    return distributors
 
 
 @api_router.post("/distributors")
@@ -2267,6 +2291,35 @@ def _distributor_transaction_metadata(payload: PaymentCreate) -> dict:
     }
 
 
+OPENING_BALANCE_EDITABLE_FIELDS = {
+    "invoice_number",
+    "bill_number",
+    "reference_number",
+    "notes",
+}
+
+
+def _opening_balance_transaction_id(distributor_id: str | None) -> str:
+    return f"opening-balance-{distributor_id}"
+
+
+def _is_opening_balance_transaction(txn: dict, distributor_id: str | None = None) -> bool:
+    txn_id = str(txn.get("id") or "")
+    if distributor_id and txn_id == _opening_balance_transaction_id(distributor_id):
+        return True
+
+    txn_type = str(txn.get("type") or "").strip().lower()
+    display_type = str(txn.get("display_type") or txn.get("subtype") or "").strip().lower()
+    notes = str(txn.get("notes") or "").strip().lower()
+    reference = str(txn.get("reference_number") or "").strip().lower()
+
+    return (
+        txn_type == "opening_balance"
+        or display_type == "opening balance"
+        or (txn_type == "purchase" and (notes == "opening balance" or reference == "opening balance"))
+    )
+
+
 def _opening_balance_transaction(distributor: dict) -> dict:
     opening_balance = float(distributor.get("opening_balance", 0) or 0)
 
@@ -2275,30 +2328,78 @@ def _opening_balance_transaction(distributor: dict) -> dict:
         created_at = datetime.now(timezone.utc).isoformat()
 
     return {
-        "id": f"opening-balance-{distributor.get('id')}",
+        "id": _opening_balance_transaction_id(distributor.get("id")),
         "distributor_id": distributor.get("id"),
-        "type": "opening_balance",
+        "type": "purchase",
         "subtype": "Opening Balance",
-        "display_type": "Opening Balance",
+        "display_type": "Purchase",
         "amount": opening_balance,
-        "notes": "Opening Balance",
+        "invoice_number": distributor.get("opening_balance_invoice_number"),
+        "bill_number": distributor.get("opening_balance_bill_number"),
+        "reference_number": distributor.get("opening_balance_reference_number") or "Opening Balance",
+        "notes": distributor.get("opening_balance_notes") or "Opening Balance",
         "created_at": created_at,
+        "is_opening_balance": True,
         "is_system_generated": True,
         "running_balance": round(opening_balance, 2),
     }
+
+
+def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict:
+    normalized = {
+        **txn,
+        "id": txn.get("id") or _opening_balance_transaction_id(distributor.get("id")),
+        "distributor_id": txn.get("distributor_id") or distributor.get("id"),
+        "type": "purchase",
+        "subtype": "Opening Balance",
+        "display_type": "Purchase",
+        "amount": float(txn.get("amount", distributor.get("opening_balance", 0)) or 0),
+        "reference_number": txn.get("reference_number") or "Opening Balance",
+        "notes": txn.get("notes") or "Opening Balance",
+        "created_at": (
+            txn.get("created_at")
+            or distributor.get("opening_balance_date")
+            or distributor.get("created_at")
+            or datetime.now(timezone.utc).isoformat()
+        ),
+        "is_opening_balance": True,
+    }
+    return normalized
 
 
 def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, str]:
     amount = float(txn.get("amount", 0) or 0)
     txn_type = txn.get("type")
 
-    if txn_type in ["purchase", "sale"]:
+    if txn_type in ["purchase", "sale", "opening_balance"]:
         return balance + amount, "purchase"
 
     if txn_type == "purchase_return":
         return balance - amount, "adjustment"
 
     return balance - amount, "payment"
+
+
+def _current_distributor_balance(distributor: dict, transactions: list[dict]) -> float:
+    opening_transactions = [
+        txn for txn in transactions
+        if _is_opening_balance_transaction(txn, distributor.get("id"))
+    ]
+    balance = 0.0 if opening_transactions else float(distributor.get("opening_balance", 0) or 0)
+    used_opening_transaction = False
+
+    for txn in transactions:
+        if _is_opening_balance_transaction(txn, distributor.get("id")):
+            if used_opening_transaction:
+                continue
+            normalized = _normalize_opening_balance_transaction(txn, distributor)
+            balance, _bucket = _apply_distributor_transaction(balance, normalized)
+            used_opening_transaction = True
+            continue
+
+        balance, _bucket = _apply_distributor_transaction(balance, txn)
+
+    return round(balance, 2)
 
 
 @api_router.get("/ledger/distributor/{did}")
@@ -2312,16 +2413,24 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
         {"_id": 0},
     ).sort("created_at", 1).to_list(1000)
 
-    opening_balance = float(dist.get("opening_balance", 0) or 0)
-    balance = opening_balance
-    running = []
-    total_purchases = opening_balance
-    total_paid = 0
-    total_adjustments = 0
-
-    running.append(_opening_balance_transaction(dist))
-
+    opening_txn = None
+    non_opening_txns = []
     for txn in txns:
+        if _is_opening_balance_transaction(txn, did):
+            if opening_txn is None:
+                opening_txn = _normalize_opening_balance_transaction(txn, dist)
+            continue
+        non_opening_txns.append(txn)
+
+    ledger_txns = [opening_txn or _opening_balance_transaction(dist), *non_opening_txns]
+
+    balance = 0.0
+    running = []
+    total_purchases = 0.0
+    total_paid = 0.0
+    total_adjustments = 0.0
+
+    for txn in ledger_txns:
         balance, bucket = _apply_distributor_transaction(balance, txn)
         amount = float(txn.get("amount", 0) or 0)
 
@@ -2375,12 +2484,74 @@ async def update_distributor_transaction(
             detail="At least one editable transaction field is required",
         )
 
+    if transaction_id.startswith("opening-balance-"):
+        if not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
+            raise HTTPException(
+                status_code=400,
+                detail="Opening balance can only edit invoice/bill number and notes/reference",
+            )
+
+        distributor_id = transaction_id.removeprefix("opening-balance-")
+        dist = await db.distributors.find_one({"id": distributor_id}, {"_id": 0})
+        if not dist:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        old_values = {
+            "invoice_number": dist.get("opening_balance_invoice_number"),
+            "bill_number": dist.get("opening_balance_bill_number"),
+            "reference_number": dist.get("opening_balance_reference_number"),
+            "notes": dist.get("opening_balance_notes"),
+        }
+        old_values = {field_name: old_values.get(field_name) for field_name in changes}
+
+        edited_at = datetime.now(timezone.utc).isoformat()
+        edited_by = _distributor_transaction_edit_user(user)
+        set_values = {
+            f"opening_balance_{field_name}": value
+            for field_name, value in changes.items()
+        }
+        set_values["opening_balance_edited_at"] = edited_at
+        set_values["opening_balance_edited_by"] = edited_by
+
+        updated_dist = await db.distributors.find_one_and_update(
+            {"id": distributor_id},
+            {
+                "$set": set_values,
+                "$push": {
+                    "opening_balance_edit_history": {
+                        "edited_at": edited_at,
+                        "edited_by": edited_by,
+                        "old_values": old_values,
+                        "new_values": dict(changes),
+                    }
+                },
+            },
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if not updated_dist:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        opening_txn = _opening_balance_transaction(updated_dist)
+        opening_txn["edited_at"] = updated_dist.get("opening_balance_edited_at")
+        opening_txn["edited_by"] = updated_dist.get("opening_balance_edited_by")
+        opening_txn["edit_history"] = updated_dist.get("opening_balance_edit_history", [])
+        return opening_txn
+
     txn = await db.distributor_transactions.find_one(
         {"id": transaction_id},
         {"_id": 0},
     )
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
+
+    is_opening_txn = _is_opening_balance_transaction(txn, txn.get("distributor_id"))
+    if is_opening_txn and not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
+        raise HTTPException(
+            status_code=400,
+            detail="Opening balance can only edit invoice/bill number and notes/reference",
+        )
 
     old_values = {
         field_name: _distributor_transaction_old_value(txn, field_name)
@@ -2423,6 +2594,13 @@ async def update_distributor_transaction(
     if not updated:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
+    if is_opening_txn:
+        distributor = await db.distributors.find_one(
+            {"id": updated.get("distributor_id")},
+            {"_id": 0},
+        ) or {}
+        return _normalize_opening_balance_transaction(updated, distributor)
+
     return updated
 
 
@@ -2432,6 +2610,16 @@ async def delete_distributor_txn(
     txn_id: str,
     user: dict = Depends(require_role("admin", "pharmacist"))
 ):
+    if txn_id == _opening_balance_transaction_id(did):
+        raise HTTPException(status_code=400, detail="Opening balance cannot be deleted")
+
+    txn = await db.distributor_transactions.find_one(
+        {"id": txn_id, "distributor_id": did},
+        {"_id": 0},
+    )
+    if txn and _is_opening_balance_transaction(txn, did):
+        raise HTTPException(status_code=400, detail="Opening balance cannot be deleted")
+
     result = await db.distributor_transactions.delete_one({
         "id": txn_id,
         "distributor_id": did
@@ -3252,20 +3440,12 @@ async def dashboard_summary(
 
     for d in distributors:
 
-        bal = float(d.get("opening_balance", 0))
-
         txns = await db.distributor_transactions.find(
             {"distributor_id": d["id"]},
             {"_id": 0}
         ).to_list(1000)
 
-        for t in txns:
-
-            if t.get("type") == "purchase":
-                bal += float(t.get("amount", 0))
-
-            elif t.get("type") in ["payment", "purchase_return"]:
-                bal -= float(t.get("amount", 0))
+        bal = _current_distributor_balance(d, txns)
 
         if bal > 0:
             distributor_outstanding += bal
@@ -3506,14 +3686,7 @@ async def outstanding_report(
             {"distributor_id": d["id"]}
         ).to_list(1000)
 
-        bal = float(d.get("opening_balance", 0.0))
-
-        for t in txns:
-            if t.get("type") == "purchase":
-                bal += float(t.get("amount", 0))
-
-            elif t.get("type") in ["payment", "purchase_return"]:
-                bal -= float(t.get("amount", 0))
+        bal = _current_distributor_balance(d, txns)
 
         if bal > 0:
             bal = round(bal, 2)
