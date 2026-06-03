@@ -448,24 +448,50 @@ class PaymentCreate(BaseModel):
     amount: float
     mode: str = "cash"
     notes: str = ""
-    date: str| None = None
+    date: str | None = None
+    receipt_number: Optional[str] = None
+    invoice_number: Optional[str] = None
+    bill_number: Optional[str] = None
+    reference_number: Optional[str] = None
+    payment_mode: Optional[str] = None
+
+    @field_validator(
+        "mode",
+        "notes",
+        "date",
+        "receipt_number",
+        "invoice_number",
+        "bill_number",
+        "reference_number",
+        "payment_mode",
+        mode="before",
+    )
+    @classmethod
+    def trim_transaction_strings(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 
 class DistributorTransactionUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     receipt_number: Optional[str] = None
+    invoice_number: Optional[str] = None
+    bill_number: Optional[str] = None
     reference_number: Optional[str] = None
     payment_mode: Optional[str] = None
     notes: Optional[str] = None
-    transaction_date: Optional[str] = None
 
     @field_validator(
         "receipt_number",
+        "invoice_number",
+        "bill_number",
         "reference_number",
         "payment_mode",
         "notes",
-        "transaction_date",
         mode="before",
     )
     @classmethod
@@ -474,13 +500,6 @@ class DistributorTransactionUpdate(BaseModel):
             return None
         if isinstance(value, str):
             return value.strip()
-        return value
-
-    @field_validator("transaction_date")
-    @classmethod
-    def require_valid_transaction_date(cls, value):
-        if value is not None and not parse_iso_date(value):
-            raise ValueError("transaction_date must be a valid ISO date")
         return value
 
 
@@ -2205,47 +2224,126 @@ async def get_invoice(inv_id: str, user: dict = Depends(get_current_user)):
 
 
 # ---------------- Ledgers ----------------
+DISTRIBUTOR_PURCHASE_MODES = {"cash", "upi", "credit"}
+
+
+def _transaction_payment_mode(payload: PaymentCreate) -> str:
+    mode = (payload.payment_mode or payload.mode or "cash").strip().lower()
+    return mode
+
+
+def _validate_distributor_purchase_mode(payload: PaymentCreate) -> str:
+    submitted_modes = [payload.mode, payload.payment_mode]
+    invalid_modes = {
+        str(mode).strip().lower()
+        for mode in submitted_modes
+        if mode and str(mode).strip().lower() not in DISTRIBUTOR_PURCHASE_MODES
+    }
+    if invalid_modes:
+        raise HTTPException(
+            status_code=400,
+            detail="Purchase payment mode must be cash, upi, or credit",
+        )
+
+    payment_mode = _transaction_payment_mode(payload)
+    if payment_mode not in DISTRIBUTOR_PURCHASE_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail="Purchase payment mode must be cash, upi, or credit",
+        )
+    return payment_mode
+
+
+def _distributor_transaction_metadata(payload: PaymentCreate) -> dict:
+    payment_mode = _transaction_payment_mode(payload)
+    return {
+        "receipt_number": payload.receipt_number,
+        "invoice_number": payload.invoice_number,
+        "bill_number": payload.bill_number,
+        "reference_number": payload.reference_number,
+        "payment_mode": payment_mode,
+        "mode": payment_mode,
+        "notes": payload.notes,
+    }
+
+
+def _opening_balance_transaction(distributor: dict) -> dict:
+    opening_balance = float(distributor.get("opening_balance", 0) or 0)
+
+    created_at = distributor.get("opening_balance_date") or distributor.get("created_at")
+    if not created_at:
+        created_at = datetime.now(timezone.utc).isoformat()
+
+    return {
+        "id": f"opening-balance-{distributor.get('id')}",
+        "distributor_id": distributor.get("id"),
+        "type": "opening_balance",
+        "subtype": "Opening Balance",
+        "display_type": "Opening Balance",
+        "amount": opening_balance,
+        "notes": "Opening Balance",
+        "created_at": created_at,
+        "is_system_generated": True,
+        "running_balance": round(opening_balance, 2),
+    }
+
+
+def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, str]:
+    amount = float(txn.get("amount", 0) or 0)
+    txn_type = txn.get("type")
+
+    if txn_type in ["purchase", "sale"]:
+        return balance + amount, "purchase"
+
+    if txn_type == "purchase_return":
+        return balance - amount, "adjustment"
+
+    return balance - amount, "payment"
+
+
 @api_router.get("/ledger/distributor/{did}")
 async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
     dist = await db.distributors.find_one({"id": did}, {"_id": 0})
     if not dist:
         raise HTTPException(status_code=404, detail="Distributor not found")
-    txns = await db.distributor_transactions.find({"distributor_id": did}, {"_id": 0}).sort("created_at", 1).to_list(1000)
-    balance = dist.get("opening_balance", 0.0)
+
+    txns = await db.distributor_transactions.find(
+        {"distributor_id": did},
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(1000)
+
+    opening_balance = float(dist.get("opening_balance", 0) or 0)
+    balance = opening_balance
     running = []
-    total_purchases = float(dist.get("opening_balance", 0))
+    total_purchases = opening_balance
     total_paid = 0
     total_adjustments = 0
-    for t in txns:
 
-          amt = float(t.get("amount", 0))
+    running.append(_opening_balance_transaction(dist))
 
-          if t["type"] in ["purchase", "sale"]:
+    for txn in txns:
+        balance, bucket = _apply_distributor_transaction(balance, txn)
+        amount = float(txn.get("amount", 0) or 0)
 
-             balance += amt
-             total_purchases += amt
+        if bucket == "purchase":
+            total_purchases += amount
+        elif bucket == "adjustment":
+            total_adjustments += amount
+        else:
+            total_paid += amount
 
-          elif t["type"] == "purchase_return":
+        running.append({
+            **txn,
+            "running_balance": round(balance, 2),
+        })
 
-             balance -= amt
-             total_adjustments += amt
-
-          else:  # payment
-
-             balance -= amt
-             total_paid += amt
-
-          running.append({
-            **t,
-            "running_balance": round(balance, 2)
-          })
     return {
-      "distributor": dist,
-      "transactions": running,
-      "balance": round(balance, 2),
-      "total_purchases": round(total_purchases, 2),
-      "total_paid": round(total_paid, 2),
-      "total_adjustments": round(total_adjustments, 2),
+        "distributor": dist,
+        "transactions": running,
+        "balance": round(balance, 2),
+        "total_purchases": round(total_purchases, 2),
+        "total_paid": round(total_paid, 2),
+        "total_adjustments": round(total_adjustments, 2),
     }
 
 
@@ -2346,31 +2444,74 @@ async def delete_distributor_txn(
 
     
 @api_router.post("/ledger/distributor/{did}/purchase")
-async def add_purchase(did: str, p: PaymentCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
-    txn = {
+async def add_purchase(
+    did: str,
+    p: PaymentCreate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    payment_mode = _validate_distributor_purchase_mode(p)
+
+    txn_date = p.date or datetime.now(timezone.utc).isoformat()
+    purchase_txn = {
         "id": str(uuid.uuid4()),
         "distributor_id": did,
         "type": "purchase",
         "amount": p.amount,
-        "mode": p.mode,
-        "notes": p.notes,
-        "created_at": p.date or datetime.now(timezone.utc).isoformat(),
+        "created_at": txn_date,
+        **_distributor_transaction_metadata(p),
     }
-    await db.distributor_transactions.insert_one(txn)
-    txn.pop("_id", None)
-    return txn
+
+    inserted_transactions = [purchase_txn]
+    auto_payment_txn = None
+
+    if payment_mode in {"cash", "upi"}:
+        auto_payment_txn = {
+            "id": str(uuid.uuid4()),
+            "distributor_id": did,
+            "type": "payment",
+            "amount": p.amount,
+            "created_at": txn_date,
+            "mode": payment_mode,
+            "payment_mode": payment_mode,
+            "notes": f"Auto payment for {payment_mode} purchase",
+            "linked_transaction_id": purchase_txn["id"],
+            "originating_purchase_transaction_id": purchase_txn["id"],
+            "is_auto_generated": True,
+            "receipt_number": p.receipt_number,
+            "invoice_number": p.invoice_number,
+            "bill_number": p.bill_number,
+            "reference_number": p.reference_number,
+        }
+        inserted_transactions.append(auto_payment_txn)
+
+    await db.distributor_transactions.insert_many(inserted_transactions)
+
+    for txn in inserted_transactions:
+        txn.pop("_id", None)
+
+    if auto_payment_txn:
+        return {
+            **purchase_txn,
+            "auto_payment_transaction": auto_payment_txn,
+            "transactions": inserted_transactions,
+        }
+
+    return purchase_txn
 
 
 @api_router.post("/ledger/distributor/{did}/payment")
-async def add_dist_payment(did: str, p: PaymentCreate, user: dict = Depends(require_role("admin", "pharmacist"))):
+async def add_dist_payment(
+    did: str,
+    p: PaymentCreate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
     txn = {
         "id": str(uuid.uuid4()),
         "distributor_id": did,
         "type": "payment",
         "amount": p.amount,
-        "mode": p.mode,
-        "notes": p.notes,
         "created_at": p.date or datetime.now(timezone.utc).isoformat(),
+        **_distributor_transaction_metadata(p),
     }
     await db.distributor_transactions.insert_one(txn)
     txn.pop("_id", None)
