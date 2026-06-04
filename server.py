@@ -13,7 +13,7 @@ from calendar import monthrange
 from typing import List, Optional, Literal
 from collections import defaultdict
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
@@ -2320,6 +2320,217 @@ def _is_opening_balance_transaction(txn: dict, distributor_id: str | None = None
     )
 
 
+
+def _parse_transaction_datetime(value):
+    if not value:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        return datetime.fromisoformat(normalized).replace(tzinfo=None)
+    except Exception:
+        pass
+
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:10], fmt)
+        except Exception:
+            continue
+
+    return None
+
+
+def _transaction_datetime(txn: dict):
+    for field_name in ("transaction_date", "date", "created_at", "return_date"):
+        parsed = _parse_transaction_datetime(txn.get(field_name))
+        if parsed:
+            return parsed
+    return datetime.min
+
+
+def _transaction_date(txn: dict):
+    parsed = _transaction_datetime(txn)
+    if parsed == datetime.min:
+        return None
+    return parsed.date()
+
+
+def calculate_financial_year(transaction_date) -> str:
+    parsed = transaction_date
+    if not isinstance(parsed, datetime):
+        parsed = _parse_transaction_datetime(transaction_date)
+    if not parsed:
+        raise ValueError("transaction_date must be a valid date")
+
+    start_year = parsed.year if parsed.month >= 4 else parsed.year - 1
+    return f"{start_year}-{str(start_year + 1)[-2:]}"
+
+
+def _parse_financial_year(financial_year: str) -> tuple[datetime, datetime]:
+    try:
+        start_text, end_text = financial_year.split("-", 1)
+        start_year = int(start_text)
+        if len(end_text) == 2:
+            end_year = (start_year // 100) * 100 + int(end_text)
+            if end_year < start_year:
+                end_year += 100
+        else:
+            end_year = int(end_text)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="financial_year must use format YYYY-YY, for example 2025-26",
+        )
+
+    if end_year != start_year + 1:
+        raise HTTPException(
+            status_code=400,
+            detail="financial_year end year must be the year after the start year",
+        )
+
+    return datetime(start_year, 4, 1), datetime(end_year, 4, 1)
+
+
+def _previous_financial_year(financial_year: str) -> str:
+    start_year = int(financial_year.split("-", 1)[0]) - 1
+    return f"{start_year}-{str(start_year + 1)[-2:]}"
+
+
+def _current_financial_year() -> str:
+    return calculate_financial_year(datetime.now(timezone.utc))
+
+
+def _sort_distributor_transactions(transactions: list[dict]) -> list[dict]:
+    return sorted(
+        transactions,
+        key=lambda txn: (
+            _transaction_datetime(txn),
+            str(txn.get("created_at") or ""),
+            str(txn.get("_id") or txn.get("_sort_id") or txn.get("id") or ""),
+        ),
+    )
+
+
+def _available_distributor_financial_years(transactions: list[dict]) -> list[str]:
+    years = {_current_financial_year()}
+    for txn in transactions:
+        txn_date = _transaction_date(txn)
+        if txn_date:
+            years.add(calculate_financial_year(datetime.combine(txn_date, datetime.min.time())))
+
+    return sorted(years, key=lambda year: int(year.split("-", 1)[0]))
+
+
+def _is_distributor_debit_bill(txn: dict) -> bool:
+    return txn.get("type") in {"purchase", "sale", "opening_balance"}
+
+
+def _is_distributor_credit(txn: dict) -> bool:
+    return txn.get("type") in {"payment", "purchase_return"}
+
+
+def _calculate_distributor_bill_due_status(ledger_txns: list[dict]) -> list[dict]:
+    enriched = []
+    open_bills = []
+
+    for txn in ledger_txns:
+        amount = round(float(txn.get("amount", 0) or 0), 2)
+        txn_type = txn.get("type")
+
+        if txn_type in {"brought_forward", "opening_balance_brought_forward"} or txn.get("display_type") == "brought_forward":
+            enriched.append({
+                **txn,
+                "due_status": "brought_forward",
+                "bill_amount": None,
+                "paid_amount": None,
+                "due_amount": None,
+            })
+            continue
+
+        if _is_distributor_debit_bill(txn):
+            row = {
+                **txn,
+                "bill_amount": amount,
+                "paid_amount": 0.0,
+                "due_amount": amount,
+                "due_status": "later_due",
+            }
+            enriched.append(row)
+            if amount > 0:
+                open_bills.append(row)
+            continue
+
+        if _is_distributor_credit(txn):
+            credit = amount
+            while credit > 0 and open_bills:
+                bill = open_bills[0]
+                due = round(float(bill.get("due_amount", 0) or 0), 2)
+                applied = min(due, credit)
+                bill["paid_amount"] = round(float(bill.get("paid_amount", 0) or 0) + applied, 2)
+                bill["due_amount"] = round(due - applied, 2)
+                credit = round(credit - applied, 2)
+                if bill["due_amount"] <= 0:
+                    bill["due_amount"] = 0.0
+                    open_bills.pop(0)
+
+            enriched.append({
+                **txn,
+                "due_status": "payment",
+                "bill_amount": None,
+                "paid_amount": None,
+                "due_amount": None,
+            })
+            continue
+
+        enriched.append({
+            **txn,
+            "due_status": "payment",
+            "bill_amount": None,
+            "paid_amount": None,
+            "due_amount": None,
+        })
+
+    oldest_due_assigned = False
+    for row in enriched:
+        if _is_distributor_debit_bill(row):
+            if round(float(row.get("due_amount", 0) or 0), 2) <= 0:
+                row["due_status"] = "cleared"
+            elif not oldest_due_assigned:
+                row["due_status"] = "oldest_due"
+                oldest_due_assigned = True
+            else:
+                row["due_status"] = "later_due"
+
+    return enriched
+
+
+def _brought_forward_transaction(did: str, financial_year: str, brought_forward_balance: float) -> dict:
+    fy_start, _fy_end = _parse_financial_year(financial_year)
+    return {
+        "id": f"brought-forward-{did}-{financial_year}",
+        "distributor_id": did,
+        "type": "brought_forward",
+        "display_type": "brought_forward",
+        "amount": round(brought_forward_balance, 2),
+        "created_at": fy_start.date().isoformat(),
+        "reference_number": f"B/F from FY {_previous_financial_year(financial_year)}",
+        "description": f"B/F from FY {_previous_financial_year(financial_year)}",
+        "notes": f"B/F from FY {_previous_financial_year(financial_year)}",
+        "is_system_generated": True,
+        "is_brought_forward": True,
+        "is_deletable": False,
+        "is_editable": False,
+        "running_balance": round(brought_forward_balance, 2),
+        "due_status": "brought_forward",
+        "bill_amount": None,
+        "paid_amount": None,
+        "due_amount": None,
+    }
+
 def _opening_balance_transaction(distributor: dict) -> dict:
     opening_balance = float(distributor.get("opening_balance", 0) or 0)
 
@@ -2403,37 +2614,109 @@ def _current_distributor_balance(distributor: dict, transactions: list[dict]) ->
 
 
 @api_router.get("/ledger/distributor/{did}")
-async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
+async def distributor_ledger(
+    did: str,
+    financial_year: Optional[str] = Query(default=None),
+    user: dict = Depends(get_current_user),
+):
     dist = await db.distributors.find_one({"id": did}, {"_id": 0})
     if not dist:
         raise HTTPException(status_code=404, detail="Distributor not found")
 
-    txns = await db.distributor_transactions.find(
+    raw_txns = await db.distributor_transactions.find(
         {"distributor_id": did},
-        {"_id": 0},
-    ).sort("created_at", 1).to_list(1000)
+    ).to_list(1000)
 
     opening_txn = None
     non_opening_txns = []
-    for txn in txns:
+    for txn in raw_txns:
+        txn["_sort_id"] = str(txn.get("_id") or txn.get("id") or "")
+        txn.pop("_id", None)
+
         if _is_opening_balance_transaction(txn, did):
             if opening_txn is None:
                 opening_txn = _normalize_opening_balance_transaction(txn, dist)
             continue
         non_opening_txns.append(txn)
 
-    ledger_txns = [opening_txn or _opening_balance_transaction(dist), *non_opening_txns]
+    ledger_txns = _sort_distributor_transactions([
+        opening_txn or _opening_balance_transaction(dist),
+        *non_opening_txns,
+    ])
+    available_financial_years = _available_distributor_financial_years(ledger_txns)
+
+    fy_start = None
+    fy_end = None
+    if financial_year:
+        fy_start, fy_end = _parse_financial_year(financial_year)
+        if financial_year not in available_financial_years:
+            available_financial_years.append(financial_year)
+            available_financial_years = sorted(
+                set(available_financial_years),
+                key=lambda year: int(year.split("-", 1)[0]),
+            )
 
     balance = 0.0
-    running = []
+    full_running = []
+    for txn in ledger_txns:
+        balance, _bucket = _apply_distributor_transaction(balance, txn)
+        full_running.append({
+            **txn,
+            "running_balance": round(balance, 2),
+        })
+
+    full_running = _calculate_distributor_bill_due_status(full_running)
+
+    brought_forward_balance = 0.0
+    visible_running = []
+    if financial_year:
+        brought_forward_balance = 0.0
+        period_balance = 0.0
+        period_txns = []
+
+        for txn in ledger_txns:
+            txn_dt = _transaction_datetime(txn)
+            if txn_dt == datetime.min:
+                continue
+
+            if txn_dt < fy_start:
+                brought_forward_balance, _bucket = _apply_distributor_transaction(
+                    brought_forward_balance,
+                    txn,
+                )
+            elif fy_start <= txn_dt < fy_end:
+                period_txns.append(txn)
+
+        status_by_id = {txn.get("id"): txn for txn in full_running if txn.get("id")}
+        period_balance = brought_forward_balance
+
+        if round(brought_forward_balance, 2) != 0:
+            visible_running.append(
+                _brought_forward_transaction(did, financial_year, brought_forward_balance)
+            )
+
+        for txn in period_txns:
+            period_balance, _bucket = _apply_distributor_transaction(period_balance, txn)
+            enriched = status_by_id.get(txn.get("id"), txn)
+            visible_running.append({
+                **enriched,
+                "running_balance": round(period_balance, 2),
+            })
+
+        running = visible_running
+        balance = period_balance
+    else:
+        running = full_running
+
     total_purchases = 0.0
     total_paid = 0.0
     total_adjustments = 0.0
+    for txn in running:
+        if txn.get("type") == "brought_forward":
+            continue
 
-    for txn in ledger_txns:
-        balance, bucket = _apply_distributor_transaction(balance, txn)
         amount = float(txn.get("amount", 0) or 0)
-
+        _next_balance, bucket = _apply_distributor_transaction(0.0, txn)
         if bucket == "purchase":
             total_purchases += amount
         elif bucket == "adjustment":
@@ -2441,15 +2724,17 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
         else:
             total_paid += amount
 
-        running.append({
-            **txn,
-            "running_balance": round(balance, 2),
-        })
-
     return {
         "distributor": dist,
         "transactions": running,
         "balance": round(balance, 2),
+        "closing_balance": round(balance, 2),
+        "opening_balance": round(brought_forward_balance, 2) if financial_year else 0.0,
+        "brought_forward_balance": round(brought_forward_balance, 2) if financial_year else 0.0,
+        "financial_year": financial_year,
+        "financial_year_start": fy_start.date().isoformat() if fy_start else None,
+        "financial_year_end": (fy_end.date() - timedelta(days=1)).isoformat() if fy_end else None,
+        "available_financial_years": available_financial_years,
         "total_purchases": round(total_purchases, 2),
         "total_paid": round(total_paid, 2),
         "total_adjustments": round(total_adjustments, 2),
