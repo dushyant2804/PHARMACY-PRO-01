@@ -2744,6 +2744,185 @@ def _distributor_financial_year_metadata(
     return metadata
 
 
+def _ledger_sort_datetime(value):
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        parsed_date = _parse_ledger_transaction_date(value)
+        if parsed_date:
+            return datetime.combine(parsed_date, datetime.min.time(), tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _distributor_fifo_sort_key(txn: dict):
+    transaction_date_value = (
+        txn.get("transaction_date")
+        or txn.get("date")
+        or txn.get("created_at")
+    )
+    return (
+        _ledger_sort_datetime(transaction_date_value),
+        _ledger_sort_datetime(txn.get("created_at")),
+        str(txn.get("id") or ""),
+    )
+
+
+def _distributor_bill_reference(txn: dict) -> str:
+    for field_name in (
+        "invoice_no",
+        "invoice_number",
+        "bill_no",
+        "bill_number",
+        "reference_no",
+        "reference_number",
+        "reference",
+    ):
+        value = txn.get(field_name)
+        if value not in (None, ""):
+            return str(value)
+    return str(txn.get("id") or "")
+
+
+def _is_fifo_purchase_bill(txn: dict, distributor_id: str) -> bool:
+    txn_type = txn.get("type")
+    if txn_type not in {"purchase", "sale", "opening_balance"}:
+        return False
+
+    if _is_opening_balance_transaction(txn, distributor_id):
+        normalized_type = _normalize_opening_balance_transaction(
+            txn,
+            {"id": distributor_id, "opening_balance": txn.get("amount", 0)},
+        ).get("type")
+        return normalized_type in {"purchase", "sale", "opening_balance"}
+
+    return True
+
+
+def _is_fifo_credit_transaction(txn: dict) -> bool:
+    if txn.get("type") == "purchase_return":
+        return True
+    return txn.get("type") not in {"purchase", "sale", "opening_balance"}
+
+
+def _round_money(value: float) -> float:
+    return round(float(value or 0), 2)
+
+
+def _build_distributor_fifo_metadata(
+    transactions: list[dict],
+    distributor_id: str,
+) -> dict[str, dict]:
+    metadata_by_id: dict[str, dict] = {}
+    unpaid_bills: list[dict] = []
+
+    for txn in sorted(transactions, key=_distributor_fifo_sort_key):
+        txn_id = txn.get("id")
+        if not txn_id:
+            continue
+
+        amount = _round_money(txn.get("amount", 0))
+        if amount <= 0:
+            continue
+
+        if _is_fifo_purchase_bill(txn, distributor_id):
+            bill = {
+                "transaction_id": txn_id,
+                "invoice_no": _distributor_bill_reference(txn),
+                "bill_amount": amount,
+                "paid_amount": 0.0,
+                "due_amount": amount,
+            }
+            unpaid_bills.append(bill)
+            metadata_by_id[txn_id] = {
+                "bill_amount": amount,
+                "paid_amount": 0.0,
+                "due_amount": amount,
+                "bill_status": "oldest_due",
+            }
+            continue
+
+        if not _is_fifo_credit_transaction(txn):
+            continue
+
+        remaining_credit = amount
+        allocations = []
+
+        for bill in unpaid_bills:
+            if remaining_credit <= 0:
+                break
+            if bill["due_amount"] <= 0:
+                continue
+
+            allocated_amount = min(remaining_credit, bill["due_amount"])
+            allocated_amount = _round_money(allocated_amount)
+            if allocated_amount <= 0:
+                continue
+
+            bill["paid_amount"] = _round_money(bill["paid_amount"] + allocated_amount)
+            bill["due_amount"] = _round_money(bill["due_amount"] - allocated_amount)
+            remaining_credit = _round_money(remaining_credit - allocated_amount)
+            allocations.append({
+                "invoice_no": bill["invoice_no"],
+                "transaction_id": bill["transaction_id"],
+                "amount": allocated_amount,
+            })
+
+            bill_metadata = metadata_by_id.get(bill["transaction_id"], {})
+            bill_metadata.update({
+                "bill_amount": _round_money(bill["bill_amount"]),
+                "paid_amount": _round_money(bill["paid_amount"]),
+                "due_amount": _round_money(bill["due_amount"]),
+            })
+            metadata_by_id[bill["transaction_id"]] = bill_metadata
+
+        metadata_by_id[txn_id] = {"adjusted_against": allocations}
+
+    oldest_due_transaction_id = None
+    for bill in unpaid_bills:
+        bill_metadata = metadata_by_id.get(bill["transaction_id"], {})
+        due_amount = _round_money(bill_metadata.get("due_amount", bill["due_amount"]))
+        if due_amount <= 0:
+            bill_status = "cleared"
+        elif oldest_due_transaction_id is None:
+            bill_status = "oldest_due"
+            oldest_due_transaction_id = bill["transaction_id"]
+        else:
+            bill_status = "later_due"
+
+        bill_metadata.update({
+            "bill_amount": _round_money(bill["bill_amount"]),
+            "paid_amount": _round_money(bill_metadata.get("paid_amount", bill["paid_amount"])),
+            "due_amount": due_amount,
+            "bill_status": bill_status,
+        })
+        metadata_by_id[bill["transaction_id"]] = bill_metadata
+
+    return metadata_by_id
+
+
+def _distributor_fifo_metadata_transactions(
+    transactions: list[dict],
+    financial_year: str | None,
+) -> list[dict]:
+    if not financial_year:
+        return list(transactions)
+
+    _start_date, end_date = _financial_year_date_range(financial_year)
+    return [
+        txn
+        for txn in transactions
+        if (txn_date := _distributor_transaction_date(txn)) and txn_date <= end_date
+    ]
+
 def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, str]:
     amount = float(txn.get("amount", 0) or 0)
     txn_type = txn.get("type")
@@ -2816,6 +2995,10 @@ async def distributor_ledger(
         ledger_txns,
         financial_year,
     )
+    fifo_metadata_by_id = _build_distributor_fifo_metadata(
+        _distributor_fifo_metadata_transactions(ledger_txns, financial_year),
+        did,
+    )
 
     if financial_year:
         ledger_txns = _filter_transactions_by_financial_year(ledger_txns, financial_year)
@@ -2839,6 +3022,7 @@ async def distributor_ledger(
 
         running.append({
             **txn,
+            **fifo_metadata_by_id.get(txn.get("id"), {}),
             "running_balance": round(balance, 2),
         })
 
