@@ -2367,6 +2367,85 @@ def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict
     return normalized
 
 
+def _parse_ledger_transaction_date(value: str | None):
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except ValueError:
+        try:
+            return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+
+def _distributor_transaction_date(txn: dict):
+    return _parse_ledger_transaction_date(
+        txn.get("transaction_date")
+        or txn.get("date")
+        or txn.get("created_at")
+    )
+
+
+def _financial_year_for_date(value) -> str:
+    start_year = value.year if value.month >= 4 else value.year - 1
+    return f"{start_year}-{str(start_year + 1)[-2:]}"
+
+
+def _current_financial_year() -> str:
+    return _financial_year_for_date(datetime.now(timezone.utc).date())
+
+
+def _financial_year_date_range(financial_year: str):
+    try:
+        start_text, end_text = financial_year.split("-", 1)
+        start_year = int(start_text)
+        end_year_suffix = int(end_text)
+    except (AttributeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="financial_year must use YYYY-YY format, for example 2025-26",
+        )
+
+    if (
+        len(start_text) != 4
+        or len(end_text) != 2
+        or (start_year + 1) % 100 != end_year_suffix
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="financial_year must use YYYY-YY format, for example 2025-26",
+        )
+
+    return (
+        datetime(start_year, 4, 1).date(),
+        datetime(start_year + 1, 3, 31).date(),
+    )
+
+
+def _available_financial_years(transactions: list[dict]) -> list[str]:
+    years = {
+        _financial_year_for_date(txn_date)
+        for txn in transactions
+        if (txn_date := _distributor_transaction_date(txn))
+    }
+    return sorted(years, key=lambda year: int(year.split("-", 1)[0]), reverse=True)
+
+
+def _filter_transactions_by_financial_year(
+    transactions: list[dict],
+    financial_year: str,
+) -> list[dict]:
+    start_date, end_date = _financial_year_date_range(financial_year)
+    return [
+        txn
+        for txn in transactions
+        if (txn_date := _distributor_transaction_date(txn))
+        and start_date <= txn_date <= end_date
+    ]
+
+
 def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, str]:
     amount = float(txn.get("amount", 0) or 0)
     txn_type = txn.get("type")
@@ -2403,7 +2482,11 @@ def _current_distributor_balance(distributor: dict, transactions: list[dict]) ->
 
 
 @api_router.get("/ledger/distributor/{did}")
-async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
+async def distributor_ledger(
+    did: str,
+    financial_year: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
     dist = await db.distributors.find_one({"id": did}, {"_id": 0})
     if not dist:
         raise HTTPException(status_code=404, detail="Distributor not found")
@@ -2422,7 +2505,14 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
             continue
         non_opening_txns.append(txn)
 
-    ledger_txns = [opening_txn or _opening_balance_transaction(dist), *non_opening_txns]
+    ledger_txns = [
+        opening_txn or _opening_balance_transaction(dist),
+        *non_opening_txns,
+    ]
+    available_financial_years = _available_financial_years(ledger_txns)
+
+    if financial_year:
+        ledger_txns = _filter_transactions_by_financial_year(ledger_txns, financial_year)
 
     balance = 0.0
     running = []
@@ -2453,6 +2543,8 @@ async def distributor_ledger(did: str, user: dict = Depends(get_current_user)):
         "total_purchases": round(total_purchases, 2),
         "total_paid": round(total_paid, 2),
         "total_adjustments": round(total_adjustments, 2),
+        "available_financial_years": available_financial_years,
+        "current_financial_year": _current_financial_year(),
     }
 
 
