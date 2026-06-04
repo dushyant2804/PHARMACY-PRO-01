@@ -403,6 +403,7 @@ class Distributor(BaseModel):
     address: str = ""
     gstin: str = ""
     opening_balance: float = 0.0
+    opening_balance_date: Optional[str] = None
     opening_balance_invoice_number: Optional[str] = None
     opening_balance_bill_number: Optional[str] = None
     opening_balance_reference_number: Optional[str] = None
@@ -1471,8 +1472,19 @@ async def create_distributor(d: Distributor, user: dict = Depends(require_role("
 
 @api_router.put("/distributors/{did}")
 async def update_distributor(did: str, d: Distributor, user: dict = Depends(require_role("admin", "pharmacist"))):
+    existing = await db.distributors.find_one({"id": did}, {"_id": 0}) or {}
     data = d.model_dump()
     data["id"] = did
+
+    if "created_at" not in d.model_fields_set and existing.get("created_at"):
+        data["created_at"] = existing["created_at"]
+
+    if (
+        "opening_balance_date" not in d.model_fields_set
+        and existing.get("opening_balance_date")
+    ):
+        data["opening_balance_date"] = existing["opening_balance_date"]
+
     await db.distributors.update_one({"id": did}, {"$set": data})
     return data
 
@@ -2320,12 +2332,41 @@ def _is_opening_balance_transaction(txn: dict, distributor_id: str | None = None
     )
 
 
+DISTRIBUTOR_OPENING_BALANCE_DATE_FIELDS = (
+    "opening_balance_date",
+    "opening_date",
+    "balance_date",
+    "transaction_date",
+    "date",
+)
+
+
+def _first_present_field(source: dict, field_names: tuple[str, ...]):
+    for field_name in field_names:
+        value = source.get(field_name)
+        if value:
+            return value
+    return None
+
+
+def _distributor_opening_balance_date(distributor: dict):
+    return _first_present_field(distributor, DISTRIBUTOR_OPENING_BALANCE_DATE_FIELDS)
+
+
+def _opening_balance_transaction_date(txn: dict, distributor: dict):
+    return (
+        _first_present_field(txn, DISTRIBUTOR_OPENING_BALANCE_DATE_FIELDS)
+        or _distributor_opening_balance_date(distributor)
+        or txn.get("created_at")
+        or distributor.get("created_at")
+        or datetime.now(timezone.utc).isoformat()
+    )
+
+
 def _opening_balance_transaction(distributor: dict) -> dict:
     opening_balance = float(distributor.get("opening_balance", 0) or 0)
 
-    created_at = distributor.get("opening_balance_date") or distributor.get("created_at")
-    if not created_at:
-        created_at = datetime.now(timezone.utc).isoformat()
+    transaction_date = _opening_balance_transaction_date({}, distributor)
 
     return {
         "id": _opening_balance_transaction_id(distributor.get("id")),
@@ -2338,7 +2379,8 @@ def _opening_balance_transaction(distributor: dict) -> dict:
         "bill_number": distributor.get("opening_balance_bill_number"),
         "reference_number": distributor.get("opening_balance_reference_number") or "Opening Balance",
         "notes": distributor.get("opening_balance_notes") or "Opening Balance",
-        "created_at": created_at,
+        "created_at": transaction_date,
+        "transaction_date": transaction_date,
         "is_opening_balance": True,
         "is_system_generated": True,
         "running_balance": round(opening_balance, 2),
@@ -2346,6 +2388,7 @@ def _opening_balance_transaction(distributor: dict) -> dict:
 
 
 def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict:
+    transaction_date = _opening_balance_transaction_date(txn, distributor)
     normalized = {
         **txn,
         "id": txn.get("id") or _opening_balance_transaction_id(distributor.get("id")),
@@ -2356,12 +2399,8 @@ def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict
         "amount": float(txn.get("amount", distributor.get("opening_balance", 0)) or 0),
         "reference_number": txn.get("reference_number") or "Opening Balance",
         "notes": txn.get("notes") or "Opening Balance",
-        "created_at": (
-            txn.get("created_at")
-            or distributor.get("opening_balance_date")
-            or distributor.get("created_at")
-            or datetime.now(timezone.utc).isoformat()
-        ),
+        "created_at": transaction_date,
+        "transaction_date": transaction_date,
         "is_opening_balance": True,
     }
     return normalized
