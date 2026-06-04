@@ -2660,6 +2660,90 @@ def _filter_transactions_by_financial_year(
     ]
 
 
+def _previous_financial_year(financial_year: str) -> str:
+    start_year, _end_year = _financial_year_date_range(financial_year)
+    previous_start_year = start_year.year - 1
+    return f"{previous_start_year}-{str(previous_start_year + 1)[-2:]}"
+
+
+def _next_financial_year(financial_year: str) -> str:
+    start_year, _end_year = _financial_year_date_range(financial_year)
+    next_start_year = start_year.year + 1
+    return f"{next_start_year}-{str(next_start_year + 1)[-2:]}"
+
+
+def _distributor_balance_until_date(
+    transactions: list[dict],
+    end_date,
+    inclusive: bool = True,
+) -> float:
+    balance = 0.0
+
+    for txn in transactions:
+        txn_date = _distributor_transaction_date(txn)
+        if not txn_date:
+            continue
+
+        if inclusive:
+            include_transaction = txn_date <= end_date
+        else:
+            include_transaction = txn_date < end_date
+
+        if include_transaction:
+            balance, _bucket = _apply_distributor_transaction(balance, txn)
+
+    return round(balance, 2)
+
+
+def _distributor_financial_year_metadata(
+    transactions: list[dict],
+    financial_year: str | None,
+) -> dict:
+    if not financial_year:
+        return {
+            "brought_forward_balance": None,
+            "brought_forward_from_financial_year": None,
+            "balance_till_date": None,
+            "carried_forward_balance": None,
+            "carried_forward_to_financial_year": None,
+            "is_financial_year_closed": None,
+        }
+
+    start_date, end_date = _financial_year_date_range(financial_year)
+    today = datetime.now(timezone.utc).date()
+    is_closed = end_date < today
+
+    metadata = {
+        "brought_forward_balance": _distributor_balance_until_date(
+            transactions,
+            start_date,
+            inclusive=False,
+        ),
+        "brought_forward_from_financial_year": _previous_financial_year(financial_year),
+        "balance_till_date": None,
+        "carried_forward_balance": None,
+        "carried_forward_to_financial_year": None,
+        "is_financial_year_closed": is_closed,
+    }
+
+    if is_closed:
+        metadata["carried_forward_balance"] = _distributor_balance_until_date(
+            transactions,
+            end_date,
+            inclusive=True,
+        )
+        metadata["carried_forward_to_financial_year"] = _next_financial_year(financial_year)
+    else:
+        till_date = min(today, end_date)
+        metadata["balance_till_date"] = _distributor_balance_until_date(
+            transactions,
+            till_date,
+            inclusive=True,
+        )
+
+    return metadata
+
+
 def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, str]:
     amount = float(txn.get("amount", 0) or 0)
     txn_type = txn.get("type")
@@ -2728,6 +2812,10 @@ async def distributor_ledger(
         *non_opening_txns,
     ]
     available_financial_years = _available_financial_years(ledger_txns)
+    financial_year_metadata = _distributor_financial_year_metadata(
+        ledger_txns,
+        financial_year,
+    )
 
     if financial_year:
         ledger_txns = _filter_transactions_by_financial_year(ledger_txns, financial_year)
@@ -2763,6 +2851,7 @@ async def distributor_ledger(
         "total_adjustments": round(total_adjustments, 2),
         "available_financial_years": available_financial_years,
         "current_financial_year": _current_financial_year(),
+        **financial_year_metadata,
     }
 
 
