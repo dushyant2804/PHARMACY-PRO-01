@@ -3861,6 +3861,43 @@ class POCreate(BaseModel):
     grand_total: float = 0
 
 
+def _calculate_purchase_order_totals(payload: POCreate) -> dict:
+    """Calculate Purchase Order totals with GST based on discounted taxable amount."""
+    item_subtotals = [
+        float(item.purchase_price or 0) * float(item.quantity or 0)
+        for item in payload.items
+    ]
+    sub_total = round(sum(item_subtotals), 2)
+    scheme_discount = round(float(payload.scheme_discount or 0), 2)
+    cash_discount = round(float(payload.cash_discount or 0), 2)
+    total_discount = scheme_discount + cash_discount
+    taxable_amount = sub_total - total_discount
+
+    total_gst = 0.0
+    if sub_total:
+        for item, line_subtotal in zip(payload.items, item_subtotals):
+            discount_share = total_discount * (line_subtotal / sub_total)
+            line_taxable_amount = line_subtotal - discount_share
+            total_gst += line_taxable_amount * (float(item.gst_rate or 0) / 100.0)
+
+    total_gst = round(total_gst, 2)
+    total_cgst = round(total_gst / 2, 2)
+    total_sgst = round(total_gst - total_cgst, 2)
+    round_off = round(float(payload.round_off or 0), 2)
+    grand_total = round(taxable_amount + total_gst + round_off, 2)
+
+    return {
+        "sub_total": sub_total,
+        "scheme_discount": scheme_discount,
+        "cash_discount": cash_discount,
+        "total_cgst": total_cgst,
+        "total_sgst": total_sgst,
+        "round_off": round_off,
+        "grand_total": grand_total,
+        "total": grand_total,
+    }
+
+
 @api_router.post("/purchase-orders")
 async def create_po(
     payload: POCreate,
@@ -3881,10 +3918,7 @@ async def create_po(
 
         return expiry[:5]
 
-    total = sum(
-        i.purchase_price * i.quantity
-        for i in payload.items
-    )
+    po_totals = _calculate_purchase_order_totals(payload)
 
     po = {
     "id": str(uuid.uuid4()),
@@ -3902,15 +3936,15 @@ async def create_po(
         }
         for i in payload.items
     ],
-    "total": round(payload.grand_total, 2),
+    "total": po_totals["total"],
 
-    "sub_total": payload.sub_total,
-    "scheme_discount": payload.scheme_discount,
-    "cash_discount": payload.cash_discount,
-    "total_cgst": payload.total_cgst,
-    "total_sgst": payload.total_sgst,
-    "round_off": payload.round_off,
-    "grand_total": payload.grand_total,
+    "sub_total": po_totals["sub_total"],
+    "scheme_discount": po_totals["scheme_discount"],
+    "cash_discount": po_totals["cash_discount"],
+    "total_cgst": po_totals["total_cgst"],
+    "total_sgst": po_totals["total_sgst"],
+    "round_off": po_totals["round_off"],
+    "grand_total": po_totals["grand_total"],
 
     "notes": payload.notes,
     "created_at": datetime.now(timezone.utc).isoformat(),
@@ -3999,10 +4033,7 @@ async def update_po(
 
 # ONLY UPDATE PO — DO NOT TOUCH INVENTORY
 
-    total = sum(
-        i.purchase_price * i.quantity
-        for i in payload.items
-    )
+    po_totals = _calculate_purchase_order_totals(payload)
 
     await db.purchase_orders.update_one(
         {"id": po_id},
@@ -4021,28 +4052,28 @@ async def update_po(
                    }
                    for i in payload.items
                 ],
-                "total": round(payload.grand_total, 2),
+                "total": po_totals["total"],
 
                 "sub_total":
-                  payload.sub_total,
+                  po_totals["sub_total"],
 
                 "scheme_discount":
-                  payload.scheme_discount,
+                  po_totals["scheme_discount"],
 
                 "cash_discount":
-                  payload.cash_discount,
+                  po_totals["cash_discount"],
 
                 "total_cgst":
-                  payload.total_cgst,
+                  po_totals["total_cgst"],
 
                 "total_sgst":
-                  payload.total_sgst,
+                  po_totals["total_sgst"],
 
                 "round_off":
-                  payload.round_off,
+                  po_totals["round_off"],
 
                 "grand_total":
-                  payload.grand_total,
+                  po_totals["grand_total"],
             }
         }
     )
