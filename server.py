@@ -489,6 +489,7 @@ class DistributorTransactionUpdate(BaseModel):
     reference_number: Optional[str] = None
     payment_mode: Optional[str] = None
     notes: Optional[str] = None
+    opening_balance_date: Optional[str] = None
 
     @field_validator(
         "receipt_number",
@@ -497,6 +498,7 @@ class DistributorTransactionUpdate(BaseModel):
         "reference_number",
         "payment_mode",
         "notes",
+        "opening_balance_date",
         mode="before",
     )
     @classmethod
@@ -505,6 +507,33 @@ class DistributorTransactionUpdate(BaseModel):
             return None
         if isinstance(value, str):
             return value.strip()
+        return value
+
+    @field_validator("opening_balance_date")
+    @classmethod
+    def require_valid_opening_balance_date(cls, value):
+        if value and not parse_iso_date(value):
+            raise ValueError("opening_balance_date must be a valid ISO date")
+        return value
+
+
+class DistributorOpeningBalanceDateUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    opening_balance_date: str
+
+    @field_validator("opening_balance_date", mode="before")
+    @classmethod
+    def trim_opening_balance_date(cls, value):
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("opening_balance_date")
+    @classmethod
+    def require_valid_opening_balance_date(cls, value):
+        if not parse_iso_date(value):
+            raise ValueError("opening_balance_date must be a valid ISO date")
         return value
 
 
@@ -1454,6 +1483,10 @@ async def list_distributors(user: dict = Depends(get_current_user)):
             transactions_by_distributor[txn.get("distributor_id")].append(txn)
 
     for distributor in distributors:
+        opening_balance_date = _distributor_opening_balance_date(distributor)
+        if opening_balance_date:
+            distributor["opening_balance_date"] = opening_balance_date
+
         current_balance = _current_distributor_balance(
             distributor,
             transactions_by_distributor.get(distributor.get("id"), []),
@@ -1486,7 +1519,38 @@ async def update_distributor(did: str, d: Distributor, user: dict = Depends(requ
         data["opening_balance_date"] = existing["opening_balance_date"]
 
     await db.distributors.update_one({"id": did}, {"$set": data})
+
+    if "opening_balance_date" in d.model_fields_set:
+        await _sync_distributor_opening_balance_transaction_date(data, data["opening_balance_date"])
+
     return data
+
+
+@api_router.patch("/distributors/{did}/opening-balance-date")
+async def update_distributor_opening_balance_date(
+    did: str,
+    payload: DistributorOpeningBalanceDateUpdate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    updated_dist = await db.distributors.find_one_and_update(
+        {"id": did},
+        {"$set": {"opening_balance_date": payload.opening_balance_date}},
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated_dist:
+        raise HTTPException(status_code=404, detail="Distributor not found")
+
+    matched_transaction = await _sync_distributor_opening_balance_transaction_date(
+        updated_dist,
+        payload.opening_balance_date,
+    )
+
+    return {
+        **updated_dist,
+        "opening_balance_date": payload.opening_balance_date,
+        "opening_balance_transaction_updated": matched_transaction is not None,
+    }
 
 
 @api_router.delete("/distributors/{did}")
@@ -2308,6 +2372,7 @@ OPENING_BALANCE_EDITABLE_FIELDS = {
     "bill_number",
     "reference_number",
     "notes",
+    "opening_balance_date",
 }
 
 
@@ -2351,6 +2416,67 @@ def _first_present_field(source: dict, field_names: tuple[str, ...]):
 
 def _distributor_opening_balance_date(distributor: dict):
     return _first_present_field(distributor, DISTRIBUTOR_OPENING_BALANCE_DATE_FIELDS)
+
+
+def _opening_balance_amount_matches(txn: dict, distributor: dict) -> bool:
+    try:
+        txn_amount = round(float(txn.get("amount", 0) or 0), 2)
+        opening_balance = round(float(distributor.get("opening_balance", 0) or 0), 2)
+        return txn_amount == opening_balance
+    except (TypeError, ValueError):
+        return False
+
+
+async def _find_distributor_opening_balance_transaction(distributor: dict):
+    distributor_id = distributor.get("id")
+    if not distributor_id:
+        return None
+
+    txns = await db.distributor_transactions.find(
+        {"distributor_id": distributor_id},
+    ).sort("created_at", 1).to_list(1000)
+
+    candidates = [
+        txn for txn in txns
+        if _is_opening_balance_transaction(txn, distributor_id)
+    ]
+    if not candidates:
+        return None
+
+    amount_matches = [
+        txn for txn in candidates
+        if _opening_balance_amount_matches(txn, distributor)
+    ]
+    return (amount_matches or candidates)[0]
+
+
+async def _sync_distributor_opening_balance_transaction_date(
+    distributor: dict,
+    opening_balance_date: str,
+):
+    matched_transaction = await _find_distributor_opening_balance_transaction(distributor)
+    if not matched_transaction:
+        return None
+
+    update_filter = {"distributor_id": distributor.get("id")}
+    if matched_transaction.get("id"):
+        update_filter["id"] = matched_transaction.get("id")
+    else:
+        update_filter["_id"] = matched_transaction.get("_id")
+
+    updated = await db.distributor_transactions.find_one_and_update(
+        update_filter,
+        {
+            "$set": {
+                "opening_balance_date": opening_balance_date,
+                "transaction_date": opening_balance_date,
+                "date": opening_balance_date,
+            }
+        },
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    return updated
 
 
 def _opening_balance_transaction_date(txn: dict, distributor: dict):
@@ -2530,6 +2656,10 @@ async def distributor_ledger(
     if not dist:
         raise HTTPException(status_code=404, detail="Distributor not found")
 
+    opening_balance_date = _distributor_opening_balance_date(dist)
+    if opening_balance_date:
+        dist["opening_balance_date"] = opening_balance_date
+
     txns = await db.distributor_transactions.find(
         {"distributor_id": did},
         {"_id": 0},
@@ -2619,7 +2749,7 @@ async def update_distributor_transaction(
         if not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
             raise HTTPException(
                 status_code=400,
-                detail="Opening balance can only edit invoice/bill number and notes/reference",
+                detail="Opening balance can only edit invoice/bill number, notes/reference, and opening balance date",
             )
 
         distributor_id = transaction_id.removeprefix("opening-balance-")
@@ -2632,6 +2762,7 @@ async def update_distributor_transaction(
             "bill_number": dist.get("opening_balance_bill_number"),
             "reference_number": dist.get("opening_balance_reference_number"),
             "notes": dist.get("opening_balance_notes"),
+            "opening_balance_date": dist.get("opening_balance_date"),
         }
         old_values = {field_name: old_values.get(field_name) for field_name in changes}
 
@@ -2640,7 +2771,10 @@ async def update_distributor_transaction(
         set_values = {
             f"opening_balance_{field_name}": value
             for field_name, value in changes.items()
+            if field_name != "opening_balance_date"
         }
+        if "opening_balance_date" in changes:
+            set_values["opening_balance_date"] = changes["opening_balance_date"]
         set_values["opening_balance_edited_at"] = edited_at
         set_values["opening_balance_edited_by"] = edited_by
 
@@ -2664,6 +2798,12 @@ async def update_distributor_transaction(
         if not updated_dist:
             raise HTTPException(status_code=404, detail="Transaction not found")
 
+        if "opening_balance_date" in changes:
+            await _sync_distributor_opening_balance_transaction_date(
+                updated_dist,
+                changes["opening_balance_date"],
+            )
+
         opening_txn = _opening_balance_transaction(updated_dist)
         opening_txn["edited_at"] = updated_dist.get("opening_balance_edited_at")
         opening_txn["edited_by"] = updated_dist.get("opening_balance_edited_by")
@@ -2681,7 +2821,7 @@ async def update_distributor_transaction(
     if is_opening_txn and not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
         raise HTTPException(
             status_code=400,
-            detail="Opening balance can only edit invoice/bill number and notes/reference",
+            detail="Opening balance can only edit invoice/bill number, notes/reference, and opening balance date",
         )
 
     old_values = {
@@ -2701,6 +2841,10 @@ async def update_distributor_transaction(
     if "payment_mode" in changes:
         set_values["payment_mode"] = changes["payment_mode"]
         set_values["mode"] = changes["payment_mode"]
+
+    if is_opening_txn and "opening_balance_date" in changes:
+        set_values["transaction_date"] = changes["opening_balance_date"]
+        set_values["date"] = changes["opening_balance_date"]
 
     set_values["edited_at"] = edited_at
     set_values["edited_by"] = edited_by
@@ -2726,6 +2870,12 @@ async def update_distributor_transaction(
         raise HTTPException(status_code=404, detail="Transaction not found")
 
     if is_opening_txn:
+        if "opening_balance_date" in changes:
+            await db.distributors.update_one(
+                {"id": updated.get("distributor_id")},
+                {"$set": {"opening_balance_date": changes["opening_balance_date"]}},
+            )
+
         distributor = await db.distributors.find_one(
             {"id": updated.get("distributor_id")},
             {"_id": 0},
