@@ -490,6 +490,8 @@ class DistributorTransactionUpdate(BaseModel):
     payment_mode: Optional[str] = None
     notes: Optional[str] = None
     opening_balance_date: Optional[str] = None
+    date: Optional[str] = None
+    transaction_date: Optional[str] = None
 
     @field_validator(
         "receipt_number",
@@ -499,6 +501,8 @@ class DistributorTransactionUpdate(BaseModel):
         "payment_mode",
         "notes",
         "opening_balance_date",
+        "date",
+        "transaction_date",
         mode="before",
     )
     @classmethod
@@ -509,12 +513,23 @@ class DistributorTransactionUpdate(BaseModel):
             return value.strip()
         return value
 
-    @field_validator("opening_balance_date")
+    @field_validator("opening_balance_date", "date", "transaction_date")
     @classmethod
     def require_valid_opening_balance_date(cls, value):
         if value and not parse_iso_date(value):
-            raise ValueError("opening_balance_date must be a valid ISO date")
+            raise ValueError("date fields must be valid ISO dates")
         return value
+
+    @model_validator(mode="after")
+    def require_matching_opening_balance_date_aliases(self):
+        submitted_dates = [
+            parse_iso_date(value)
+            for value in (self.opening_balance_date, self.date, self.transaction_date)
+            if value
+        ]
+        if submitted_dates and any(value != submitted_dates[0] for value in submitted_dates):
+            raise ValueError("opening balance date aliases must match")
+        return self
 
 
 class DistributorOpeningBalanceDateUpdate(BaseModel):
@@ -2367,6 +2382,8 @@ def _distributor_transaction_metadata(payload: PaymentCreate) -> dict:
     }
 
 
+OPENING_BALANCE_DATE_EDIT_FIELDS = {"opening_balance_date", "date", "transaction_date"}
+
 OPENING_BALANCE_EDITABLE_FIELDS = {
     "invoice_number",
     "bill_number",
@@ -2374,6 +2391,34 @@ OPENING_BALANCE_EDITABLE_FIELDS = {
     "notes",
     "opening_balance_date",
 }
+
+
+def _distributor_transaction_update_date(changes: dict) -> str | None:
+    for field_name in ("opening_balance_date", "date", "transaction_date"):
+        value = changes.get(field_name)
+        if value:
+            return value
+    return None
+
+
+def _normalize_opening_balance_update_changes(changes: dict) -> dict:
+    normalized = {
+        field_name: value
+        for field_name, value in changes.items()
+        if field_name not in OPENING_BALANCE_DATE_EDIT_FIELDS
+    }
+    opening_balance_date = _distributor_transaction_update_date(changes)
+    if opening_balance_date:
+        normalized["opening_balance_date"] = opening_balance_date
+    return normalized
+
+
+def _strip_normal_transaction_date_changes(changes: dict) -> dict:
+    return {
+        field_name: value
+        for field_name, value in changes.items()
+        if field_name not in OPENING_BALANCE_DATE_EDIT_FIELDS
+    }
 
 
 def _opening_balance_transaction_id(distributor_id: str | None) -> str:
@@ -2506,7 +2551,9 @@ def _opening_balance_transaction(distributor: dict) -> dict:
         "reference_number": distributor.get("opening_balance_reference_number") or "Opening Balance",
         "notes": distributor.get("opening_balance_notes") or "Opening Balance",
         "created_at": transaction_date,
+        "opening_balance_date": transaction_date,
         "transaction_date": transaction_date,
+        "date": transaction_date,
         "is_opening_balance": True,
         "is_system_generated": True,
         "running_balance": round(opening_balance, 2),
@@ -2526,7 +2573,9 @@ def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict
         "reference_number": txn.get("reference_number") or "Opening Balance",
         "notes": txn.get("notes") or "Opening Balance",
         "created_at": transaction_date,
+        "opening_balance_date": transaction_date,
         "transaction_date": transaction_date,
+        "date": transaction_date,
         "is_opening_balance": True,
     }
     return normalized
@@ -2746,6 +2795,12 @@ async def update_distributor_transaction(
         )
 
     if transaction_id.startswith("opening-balance-"):
+        changes = _normalize_opening_balance_update_changes(changes)
+        if not changes:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one editable transaction field is required",
+            )
         if not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
             raise HTTPException(
                 status_code=400,
@@ -2818,11 +2873,25 @@ async def update_distributor_transaction(
         raise HTTPException(status_code=404, detail="Transaction not found")
 
     is_opening_txn = _is_opening_balance_transaction(txn, txn.get("distributor_id"))
-    if is_opening_txn and not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
-        raise HTTPException(
-            status_code=400,
-            detail="Opening balance can only edit invoice/bill number, notes/reference, and opening balance date",
-        )
+    if is_opening_txn:
+        changes = _normalize_opening_balance_update_changes(changes)
+        if not changes:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one editable transaction field is required",
+            )
+        if not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
+            raise HTTPException(
+                status_code=400,
+                detail="Opening balance can only edit invoice/bill number, notes/reference, and opening balance date",
+            )
+    else:
+        changes = _strip_normal_transaction_date_changes(changes)
+        if not changes:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one editable transaction field is required",
+            )
 
     old_values = {
         field_name: _distributor_transaction_old_value(txn, field_name)
