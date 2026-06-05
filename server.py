@@ -483,10 +483,15 @@ class PaymentCreate(BaseModel):
 class DistributorTransactionUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    receipt_no: Optional[str] = None
     receipt_number: Optional[str] = None
+    invoice_no: Optional[str] = None
     invoice_number: Optional[str] = None
+    bill_no: Optional[str] = None
     bill_number: Optional[str] = None
+    reference_no: Optional[str] = None
     reference_number: Optional[str] = None
+    reference: Optional[str] = None
     payment_mode: Optional[str] = None
     notes: Optional[str] = None
     opening_balance_date: Optional[str] = None
@@ -494,10 +499,15 @@ class DistributorTransactionUpdate(BaseModel):
     transaction_date: Optional[str] = None
 
     @field_validator(
+        "receipt_no",
         "receipt_number",
+        "invoice_no",
         "invoice_number",
+        "bill_no",
         "bill_number",
+        "reference_no",
         "reference_number",
+        "reference",
         "payment_mode",
         "notes",
         "opening_balance_date",
@@ -2384,12 +2394,37 @@ def _distributor_transaction_metadata(payload: PaymentCreate) -> dict:
 
 OPENING_BALANCE_DATE_EDIT_FIELDS = {"opening_balance_date", "date", "transaction_date"}
 
-OPENING_BALANCE_EDITABLE_FIELDS = {
+OPENING_BALANCE_METADATA_FIELD_ALIASES = {
+    "invoice_no": "invoice_number",
+    "invoice_number": "invoice_number",
+    "bill_no": "bill_number",
+    "bill_number": "bill_number",
+    "receipt_no": "receipt_number",
+    "receipt_number": "receipt_number",
+    "reference_no": "reference_number",
+    "reference_number": "reference_number",
+    "reference": "reference_number",
+    "notes": "notes",
+}
+
+OPENING_BALANCE_EDITABLE_FIELDS = (
+    set(OPENING_BALANCE_METADATA_FIELD_ALIASES)
+    | set(OPENING_BALANCE_METADATA_FIELD_ALIASES.values())
+    | {"opening_balance_date"}
+)
+
+OPENING_BALANCE_NORMALIZED_EDITABLE_FIELDS = (
+    set(OPENING_BALANCE_METADATA_FIELD_ALIASES.values())
+    | {"opening_balance_date"}
+)
+
+DISTRIBUTOR_TRANSACTION_EDITABLE_FIELDS = {
+    "receipt_number",
     "invoice_number",
     "bill_number",
     "reference_number",
+    "payment_mode",
     "notes",
-    "opening_balance_date",
 }
 
 
@@ -2402,11 +2437,22 @@ def _distributor_transaction_update_date(changes: dict) -> str | None:
 
 
 def _normalize_opening_balance_update_changes(changes: dict) -> dict:
-    normalized = {
-        field_name: value
-        for field_name, value in changes.items()
-        if field_name not in OPENING_BALANCE_DATE_EDIT_FIELDS
-    }
+    normalized = {}
+    for field_name, value in changes.items():
+        if field_name in OPENING_BALANCE_DATE_EDIT_FIELDS:
+            continue
+
+        normalized_field_name = OPENING_BALANCE_METADATA_FIELD_ALIASES.get(field_name, field_name)
+        if (
+            normalized_field_name in normalized
+            and normalized[normalized_field_name] != value
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Opening balance {normalized_field_name} aliases must match",
+            )
+        normalized[normalized_field_name] = value
+
     opening_balance_date = _distributor_transaction_update_date(changes)
     if opening_balance_date:
         normalized["opening_balance_date"] = opening_balance_date
@@ -2548,6 +2594,7 @@ def _opening_balance_transaction(distributor: dict) -> dict:
         "amount": opening_balance,
         "invoice_number": distributor.get("opening_balance_invoice_number"),
         "bill_number": distributor.get("opening_balance_bill_number"),
+        "receipt_number": distributor.get("opening_balance_receipt_number"),
         "reference_number": distributor.get("opening_balance_reference_number") or "Opening Balance",
         "notes": distributor.get("opening_balance_notes") or "Opening Balance",
         "created_at": transaction_date,
@@ -3074,10 +3121,10 @@ async def update_distributor_transaction(
                 status_code=400,
                 detail="At least one editable transaction field is required",
             )
-        if not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
+        if not set(changes).issubset(OPENING_BALANCE_NORMALIZED_EDITABLE_FIELDS):
             raise HTTPException(
                 status_code=400,
-                detail="Opening balance can only edit invoice/bill number, notes/reference, and opening balance date",
+                detail="Opening balance can only edit invoice/bill/receipt number, notes/reference, and opening balance date",
             )
 
         distributor_id = transaction_id.removeprefix("opening-balance-")
@@ -3088,6 +3135,7 @@ async def update_distributor_transaction(
         old_values = {
             "invoice_number": dist.get("opening_balance_invoice_number"),
             "bill_number": dist.get("opening_balance_bill_number"),
+            "receipt_number": dist.get("opening_balance_receipt_number"),
             "reference_number": dist.get("opening_balance_reference_number"),
             "notes": dist.get("opening_balance_notes"),
             "opening_balance_date": dist.get("opening_balance_date"),
@@ -3153,10 +3201,10 @@ async def update_distributor_transaction(
                 status_code=400,
                 detail="At least one editable transaction field is required",
             )
-        if not set(changes).issubset(OPENING_BALANCE_EDITABLE_FIELDS):
+        if not set(changes).issubset(OPENING_BALANCE_NORMALIZED_EDITABLE_FIELDS):
             raise HTTPException(
                 status_code=400,
-                detail="Opening balance can only edit invoice/bill number, notes/reference, and opening balance date",
+                detail="Opening balance can only edit invoice/bill/receipt number, notes/reference, and opening balance date",
             )
     else:
         changes = _strip_normal_transaction_date_changes(changes)
@@ -3164,6 +3212,11 @@ async def update_distributor_transaction(
             raise HTTPException(
                 status_code=400,
                 detail="At least one editable transaction field is required",
+            )
+        if not set(changes).issubset(DISTRIBUTOR_TRANSACTION_EDITABLE_FIELDS):
+            raise HTTPException(
+                status_code=400,
+                detail="Distributor transactions can only edit invoice/bill/receipt/reference number, payment mode, and notes",
             )
 
     old_values = {
