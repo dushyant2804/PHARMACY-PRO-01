@@ -8,7 +8,7 @@ import uuid
 import logging
 import bcrypt
 import jwt
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from calendar import monthrange
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Literal
@@ -2582,7 +2582,7 @@ def _opening_balance_transaction_date(txn: dict, distributor: dict):
 
 
 def _opening_balance_transaction(distributor: dict) -> dict:
-    opening_balance = float(distributor.get("opening_balance", 0) or 0)
+    opening_balance = _safe_float(distributor.get("opening_balance", 0))
 
     transaction_date = _opening_balance_transaction_date({}, distributor)
 
@@ -2617,7 +2617,7 @@ def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict
         "type": "purchase",
         "subtype": "Opening Balance",
         "display_type": "Purchase",
-        "amount": float(txn.get("amount", distributor.get("opening_balance", 0)) or 0),
+        "amount": _safe_float(txn.get("amount", distributor.get("opening_balance", 0))),
         "reference_number": txn.get("reference_number") or "Opening Balance",
         "notes": txn.get("notes") or "Opening Balance",
         "created_at": transaction_date,
@@ -2635,14 +2635,16 @@ def _parse_ledger_transaction_date(value: str | None):
 
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         try:
             return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
-        except ValueError:
+        except (TypeError, ValueError, OverflowError):
             return None
 
 
 def _distributor_transaction_date(txn: dict):
+    if not isinstance(txn, dict):
+        return None
     return _parse_ledger_transaction_date(
         txn.get("transaction_date")
         or txn.get("date")
@@ -2804,7 +2806,7 @@ def _ledger_sort_datetime(value):
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         parsed_date = _parse_ledger_transaction_date(value)
         if parsed_date:
             return datetime.combine(parsed_date, datetime.min.time(), tzinfo=timezone.utc)
@@ -2812,6 +2814,8 @@ def _ledger_sort_datetime(value):
 
 
 def _distributor_fifo_sort_key(txn: dict):
+    if not isinstance(txn, dict):
+        txn = {}
     transaction_date_value = (
         txn.get("transaction_date")
         or txn.get("date")
@@ -2825,6 +2829,8 @@ def _distributor_fifo_sort_key(txn: dict):
 
 
 def _distributor_bill_reference(txn: dict) -> str:
+    if not isinstance(txn, dict):
+        return ""
     for field_name in (
         "invoice_no",
         "invoice_number",
@@ -2841,6 +2847,8 @@ def _distributor_bill_reference(txn: dict) -> str:
 
 
 def _is_fifo_purchase_bill(txn: dict, distributor_id: str) -> bool:
+    if not isinstance(txn, dict):
+        return False
     txn_type = txn.get("type")
     if txn_type not in {"purchase", "sale", "opening_balance"}:
         return False
@@ -2856,13 +2864,57 @@ def _is_fifo_purchase_bill(txn: dict, distributor_id: str) -> bool:
 
 
 def _is_fifo_credit_transaction(txn: dict) -> bool:
+    if not isinstance(txn, dict):
+        return False
     if txn.get("type") == "purchase_return":
         return True
     return txn.get("type") not in {"purchase", "sale", "opening_balance"}
 
 
-def _round_money(value: float) -> float:
-    return round(float(value or 0), 2)
+def _safe_float(value, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _round_ledger_money(value: float) -> float:
+    return round(_safe_float(value), 2)
+
+
+def _serializable_transaction_id(value) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _json_safe_ledger_value(value):
+    if isinstance(value, Decimal):
+        return _round_ledger_money(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_json_safe_ledger_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe_ledger_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_ledger_value(item) for key, item in value.items()}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _json_safe_ledger_transaction(txn: dict) -> dict:
+    safe_txn = _json_safe_ledger_value(txn if isinstance(txn, dict) else {})
+    for id_field in ("id", "distributor_id", "purchase_order_id", "sale_id"):
+        if safe_txn.get(id_field) not in (None, ""):
+            safe_txn[id_field] = str(safe_txn[id_field])
+    return safe_txn
 
 
 def _build_distributor_fifo_metadata(
@@ -2872,90 +2924,127 @@ def _build_distributor_fifo_metadata(
     metadata_by_id: dict[str, dict] = {}
     unpaid_bills: list[dict] = []
 
-    for txn in sorted(transactions, key=_distributor_fifo_sort_key):
-        txn_id = txn.get("id")
-        if not txn_id:
-            continue
+    try:
+        sorted_transactions = sorted(transactions, key=_distributor_fifo_sort_key)
+    except Exception:
+        logger.exception(
+            "Failed to sort distributor FIFO metadata rows; returning ledger without FIFO metadata. distributor_id=%s",
+            distributor_id,
+        )
+        return metadata_by_id
 
-        amount = _round_money(txn.get("amount", 0))
-        if amount <= 0:
-            continue
+    for txn in sorted_transactions:
+        txn_id = _serializable_transaction_id(txn.get("id") if isinstance(txn, dict) else None)
+        txn_type = txn.get("type") if isinstance(txn, dict) else None
 
-        if _is_fifo_purchase_bill(txn, distributor_id):
-            bill = {
-                "transaction_id": txn_id,
-                "invoice_no": _distributor_bill_reference(txn),
-                "bill_amount": amount,
-                "paid_amount": 0.0,
-                "due_amount": amount,
-            }
-            unpaid_bills.append(bill)
-            metadata_by_id[txn_id] = {
-                "bill_amount": amount,
-                "paid_amount": 0.0,
-                "due_amount": amount,
-                "bill_status": "oldest_due",
-            }
-            continue
-
-        if not _is_fifo_credit_transaction(txn):
-            continue
-
-        remaining_credit = amount
-        allocations = []
-
-        for bill in unpaid_bills:
-            if remaining_credit <= 0:
-                break
-            if bill["due_amount"] <= 0:
+        try:
+            if not txn_id:
                 continue
 
-            allocated_amount = min(remaining_credit, bill["due_amount"])
-            allocated_amount = _round_money(allocated_amount)
-            if allocated_amount <= 0:
+            amount = _round_ledger_money(txn.get("amount", 0))
+            if amount <= 0:
+                if _is_fifo_credit_transaction(txn):
+                    metadata_by_id[txn_id] = {"adjusted_against": []}
                 continue
 
-            bill["paid_amount"] = _round_money(bill["paid_amount"] + allocated_amount)
-            bill["due_amount"] = _round_money(bill["due_amount"] - allocated_amount)
-            remaining_credit = _round_money(remaining_credit - allocated_amount)
-            allocations.append({
-                "invoice_no": bill["invoice_no"],
-                "transaction_id": bill["transaction_id"],
-                "amount": allocated_amount,
-            })
+            if _is_fifo_purchase_bill(txn, distributor_id):
+                bill = {
+                    "transaction_id": txn_id,
+                    "invoice_no": _distributor_bill_reference(txn),
+                    "bill_amount": amount,
+                    "paid_amount": 0.0,
+                    "due_amount": amount,
+                }
+                unpaid_bills.append(bill)
+                metadata_by_id[txn_id] = {
+                    "bill_amount": amount,
+                    "paid_amount": 0.0,
+                    "due_amount": amount,
+                    "bill_status": "oldest_due",
+                }
+                continue
 
-            bill_metadata = metadata_by_id.get(bill["transaction_id"], {})
-            bill_metadata.update({
-                "bill_amount": _round_money(bill["bill_amount"]),
-                "paid_amount": _round_money(bill["paid_amount"]),
-                "due_amount": _round_money(bill["due_amount"]),
-            })
-            metadata_by_id[bill["transaction_id"]] = bill_metadata
+            if not _is_fifo_credit_transaction(txn):
+                continue
 
-        metadata_by_id[txn_id] = {"adjusted_against": allocations}
+            remaining_credit = amount
+            allocations = []
+
+            for bill in unpaid_bills:
+                if remaining_credit <= 0:
+                    break
+                if _round_ledger_money(bill.get("due_amount")) <= 0:
+                    continue
+
+                allocated_amount = min(remaining_credit, _round_ledger_money(bill.get("due_amount")))
+                allocated_amount = _round_ledger_money(allocated_amount)
+                if allocated_amount <= 0:
+                    continue
+
+                bill["paid_amount"] = _round_ledger_money(bill.get("paid_amount") + allocated_amount)
+                bill["due_amount"] = _round_ledger_money(bill.get("due_amount") - allocated_amount)
+                remaining_credit = _round_ledger_money(remaining_credit - allocated_amount)
+                allocations.append({
+                    "invoice_no": str(bill.get("invoice_no") or bill.get("transaction_id") or ""),
+                    "transaction_id": _serializable_transaction_id(bill.get("transaction_id")),
+                    "amount": allocated_amount,
+                })
+
+                bill_transaction_id = _serializable_transaction_id(bill.get("transaction_id"))
+                if not bill_transaction_id:
+                    continue
+                bill_metadata = metadata_by_id.get(bill_transaction_id, {})
+                bill_metadata.update({
+                    "bill_amount": _round_ledger_money(bill.get("bill_amount")),
+                    "paid_amount": _round_ledger_money(bill.get("paid_amount")),
+                    "due_amount": _round_ledger_money(bill.get("due_amount")),
+                })
+                metadata_by_id[bill_transaction_id] = bill_metadata
+
+            metadata_by_id[txn_id] = {"adjusted_against": allocations}
+        except Exception:
+            logger.exception(
+                "Skipping distributor FIFO metadata for malformed row. distributor_id=%s transaction_id=%s row_type=%s helper_section=allocation",
+                distributor_id,
+                txn_id,
+                txn_type,
+            )
+            if txn_id and _is_fifo_credit_transaction(txn if isinstance(txn, dict) else {}):
+                metadata_by_id.setdefault(txn_id, {"adjusted_against": []})
+            continue
 
     oldest_due_transaction_id = None
     for bill in unpaid_bills:
-        bill_metadata = metadata_by_id.get(bill["transaction_id"], {})
-        due_amount = _round_money(bill_metadata.get("due_amount", bill["due_amount"]))
-        if due_amount <= 0:
-            bill_status = "cleared"
-        elif oldest_due_transaction_id is None:
-            bill_status = "oldest_due"
-            oldest_due_transaction_id = bill["transaction_id"]
-        else:
-            bill_status = "later_due"
+        try:
+            bill_transaction_id = _serializable_transaction_id(bill.get("transaction_id"))
+            if not bill_transaction_id:
+                continue
+            bill_metadata = metadata_by_id.get(bill_transaction_id, {})
+            due_amount = _round_ledger_money(bill_metadata.get("due_amount", bill.get("due_amount")))
+            if due_amount <= 0:
+                bill_status = "cleared"
+            elif oldest_due_transaction_id is None:
+                bill_status = "oldest_due"
+                oldest_due_transaction_id = bill_transaction_id
+            else:
+                bill_status = "later_due"
 
-        bill_metadata.update({
-            "bill_amount": _round_money(bill["bill_amount"]),
-            "paid_amount": _round_money(bill_metadata.get("paid_amount", bill["paid_amount"])),
-            "due_amount": due_amount,
-            "bill_status": bill_status,
-        })
-        metadata_by_id[bill["transaction_id"]] = bill_metadata
+            bill_metadata.update({
+                "bill_amount": _round_ledger_money(bill.get("bill_amount")),
+                "paid_amount": _round_ledger_money(bill_metadata.get("paid_amount", bill.get("paid_amount"))),
+                "due_amount": due_amount,
+                "bill_status": bill_status,
+            })
+            metadata_by_id[bill_transaction_id] = bill_metadata
+        except Exception:
+            logger.exception(
+                "Skipping distributor FIFO bill status metadata. distributor_id=%s transaction_id=%s helper_section=bill_status",
+                distributor_id,
+                bill.get("transaction_id") if isinstance(bill, dict) else None,
+            )
+            continue
 
-    return metadata_by_id
-
+    return _json_safe_ledger_value(metadata_by_id)
 
 def _distributor_fifo_metadata_transactions(
     transactions: list[dict],
@@ -2972,8 +3061,8 @@ def _distributor_fifo_metadata_transactions(
     ]
 
 def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, str]:
-    amount = float(txn.get("amount", 0) or 0)
-    txn_type = txn.get("type")
+    amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
+    txn_type = txn.get("type") if isinstance(txn, dict) else None
 
     if txn_type in ["purchase", "sale", "opening_balance"]:
         return balance + amount, "purchase"
@@ -2989,7 +3078,7 @@ def _current_distributor_balance(distributor: dict, transactions: list[dict]) ->
         txn for txn in transactions
         if _is_opening_balance_transaction(txn, distributor.get("id"))
     ]
-    balance = 0.0 if opening_transactions else float(distributor.get("opening_balance", 0) or 0)
+    balance = 0.0 if opening_transactions else _safe_float(distributor.get("opening_balance", 0))
     used_opening_transaction = False
 
     for txn in transactions:
@@ -3043,10 +3132,17 @@ async def distributor_ledger(
         ledger_txns,
         financial_year,
     )
-    fifo_metadata_by_id = _build_distributor_fifo_metadata(
-        _distributor_fifo_metadata_transactions(ledger_txns, financial_year),
-        did,
-    )
+    try:
+        fifo_metadata_by_id = _build_distributor_fifo_metadata(
+            _distributor_fifo_metadata_transactions(ledger_txns, financial_year),
+            did,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to build distributor FIFO metadata; returning ledger without FIFO metadata. distributor_id=%s",
+            did,
+        )
+        fifo_metadata_by_id = {}
 
     if financial_year:
         ledger_txns = _filter_transactions_by_financial_year(ledger_txns, financial_year)
@@ -3059,7 +3155,7 @@ async def distributor_ledger(
 
     for txn in ledger_txns:
         balance, bucket = _apply_distributor_transaction(balance, txn)
-        amount = float(txn.get("amount", 0) or 0)
+        amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
 
         if bucket == "purchase":
             total_purchases += amount
@@ -3068,11 +3164,12 @@ async def distributor_ledger(
         else:
             total_paid += amount
 
-        running.append({
-            **txn,
-            **fifo_metadata_by_id.get(txn.get("id"), {}),
+        txn_id = _serializable_transaction_id(txn.get("id") if isinstance(txn, dict) else None)
+        running.append(_json_safe_ledger_transaction({
+            **(txn if isinstance(txn, dict) else {}),
+            **fifo_metadata_by_id.get(txn_id, {}),
             "running_balance": round(balance, 2),
-        })
+        }))
 
     return {
         "distributor": dist,
@@ -4543,7 +4640,12 @@ WHOLE_RUPEE = Decimal("1")
 
 
 def _to_decimal(value) -> Decimal:
-    return Decimal(str(value or 0))
+    if value in (None, ""):
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
 
 
 def _round_money(value: Decimal) -> Decimal:
