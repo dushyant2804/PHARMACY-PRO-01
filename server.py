@@ -2917,12 +2917,20 @@ def _json_safe_ledger_transaction(txn: dict) -> dict:
     return safe_txn
 
 
+def _fifo_debug_enabled(distributor_id: str) -> bool:
+    debug_distributor_id = os.environ.get("DISTRIBUTOR_FIFO_DEBUG_LEDGER_ID")
+    return debug_distributor_id in {"*", str(distributor_id)}
+
+
 def _build_distributor_fifo_metadata(
     transactions: list[dict],
     distributor_id: str,
 ) -> dict[str, dict]:
     metadata_by_id: dict[str, dict] = {}
     unpaid_bills: list[dict] = []
+    pending_credits: list[dict] = []
+    allocation_sequence: list[dict] = []
+    debug_enabled = _fifo_debug_enabled(distributor_id)
 
     try:
         sorted_transactions = sorted(transactions, key=_distributor_fifo_sort_key)
@@ -2933,7 +2941,93 @@ def _build_distributor_fifo_metadata(
         )
         return metadata_by_id
 
-    for txn in sorted_transactions:
+    def record_debug_row(
+        txn: dict | None,
+        txn_id: str | None,
+        stage: str,
+        sequence_no: int | None = None,
+    ):
+        if not debug_enabled:
+            return
+        try:
+            safe_txn = txn if isinstance(txn, dict) else {}
+            snapshot = metadata_by_id.get(txn_id or "", {}) if txn_id else {}
+            logger.info(
+                "Distributor FIFO debug distributor_id=%s stage=%s sequence=%s transaction_id=%s type=%s amount=%s paid_amount=%s due_amount=%s bill_status=%s allocation_sequence=%s",
+                distributor_id,
+                stage,
+                sequence_no,
+                txn_id,
+                safe_txn.get("type"),
+                _round_ledger_money(safe_txn.get("amount", 0)),
+                snapshot.get("paid_amount"),
+                snapshot.get("due_amount"),
+                snapshot.get("bill_status"),
+                allocation_sequence,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to write distributor FIFO debug row. distributor_id=%s transaction_id=%s",
+                distributor_id,
+                txn_id,
+            )
+
+    def allocate_credit(credit: dict):
+        remaining_credit = _round_ledger_money(credit.get("remaining_amount"))
+        if remaining_credit <= 0:
+            credit["remaining_amount"] = 0.0
+            return
+
+        credit_id = _serializable_transaction_id(credit.get("transaction_id"))
+        allocations = metadata_by_id.setdefault(credit_id, {"adjusted_against": []}).setdefault(
+            "adjusted_against",
+            [],
+        ) if credit_id else []
+
+        for bill in unpaid_bills:
+            if remaining_credit <= 0:
+                break
+
+            bill_due_amount = _round_ledger_money(bill.get("due_amount"))
+            if bill_due_amount <= 0:
+                continue
+
+            allocated_amount = _round_ledger_money(min(remaining_credit, bill_due_amount))
+            if allocated_amount <= 0:
+                continue
+
+            bill["paid_amount"] = _round_ledger_money(bill.get("paid_amount") + allocated_amount)
+            bill["due_amount"] = _round_ledger_money(bill.get("due_amount") - allocated_amount)
+            remaining_credit = _round_ledger_money(remaining_credit - allocated_amount)
+            credit["remaining_amount"] = remaining_credit
+
+            allocation = {
+                "invoice_no": str(bill.get("invoice_no") or bill.get("transaction_id") or ""),
+                "transaction_id": _serializable_transaction_id(bill.get("transaction_id")),
+                "amount": allocated_amount,
+            }
+            allocations.append(allocation)
+            allocation_sequence.append({
+                "credit_transaction_id": credit_id,
+                "bill_transaction_id": allocation["transaction_id"],
+                "amount": allocated_amount,
+            })
+
+            bill_transaction_id = _serializable_transaction_id(bill.get("transaction_id"))
+            if not bill_transaction_id:
+                continue
+            bill_metadata = metadata_by_id.get(bill_transaction_id, {})
+            bill_metadata.update({
+                "bill_amount": _round_ledger_money(bill.get("bill_amount")),
+                "paid_amount": _round_ledger_money(bill.get("paid_amount")),
+                "due_amount": _round_ledger_money(bill.get("due_amount")),
+            })
+            metadata_by_id[bill_transaction_id] = bill_metadata
+
+        if credit_id:
+            metadata_by_id[credit_id] = {"adjusted_against": allocations}
+
+    for sequence_no, txn in enumerate(sorted_transactions, start=1):
         txn_id = _serializable_transaction_id(txn.get("id") if isinstance(txn, dict) else None)
         txn_type = txn.get("type") if isinstance(txn, dict) else None
 
@@ -2945,6 +3039,7 @@ def _build_distributor_fifo_metadata(
             if amount <= 0:
                 if _is_fifo_credit_transaction(txn):
                     metadata_by_id[txn_id] = {"adjusted_against": []}
+                    record_debug_row(txn, txn_id, "skipped_empty_credit", sequence_no)
                 continue
 
             if _is_fifo_purchase_bill(txn, distributor_id):
@@ -2960,48 +3055,31 @@ def _build_distributor_fifo_metadata(
                     "bill_amount": amount,
                     "paid_amount": 0.0,
                     "due_amount": amount,
-                    "bill_status": "oldest_due",
+                    "bill_status": "later_due",
                 }
+
+                for credit in pending_credits:
+                    allocate_credit(credit)
+                pending_credits = [
+                    credit
+                    for credit in pending_credits
+                    if _round_ledger_money(credit.get("remaining_amount")) > 0
+                ]
+                record_debug_row(txn, txn_id, "bill_processed", sequence_no)
                 continue
 
             if not _is_fifo_credit_transaction(txn):
                 continue
 
-            remaining_credit = amount
-            allocations = []
-
-            for bill in unpaid_bills:
-                if remaining_credit <= 0:
-                    break
-                if _round_ledger_money(bill.get("due_amount")) <= 0:
-                    continue
-
-                allocated_amount = min(remaining_credit, _round_ledger_money(bill.get("due_amount")))
-                allocated_amount = _round_ledger_money(allocated_amount)
-                if allocated_amount <= 0:
-                    continue
-
-                bill["paid_amount"] = _round_ledger_money(bill.get("paid_amount") + allocated_amount)
-                bill["due_amount"] = _round_ledger_money(bill.get("due_amount") - allocated_amount)
-                remaining_credit = _round_ledger_money(remaining_credit - allocated_amount)
-                allocations.append({
-                    "invoice_no": str(bill.get("invoice_no") or bill.get("transaction_id") or ""),
-                    "transaction_id": _serializable_transaction_id(bill.get("transaction_id")),
-                    "amount": allocated_amount,
-                })
-
-                bill_transaction_id = _serializable_transaction_id(bill.get("transaction_id"))
-                if not bill_transaction_id:
-                    continue
-                bill_metadata = metadata_by_id.get(bill_transaction_id, {})
-                bill_metadata.update({
-                    "bill_amount": _round_ledger_money(bill.get("bill_amount")),
-                    "paid_amount": _round_ledger_money(bill.get("paid_amount")),
-                    "due_amount": _round_ledger_money(bill.get("due_amount")),
-                })
-                metadata_by_id[bill_transaction_id] = bill_metadata
-
-            metadata_by_id[txn_id] = {"adjusted_against": allocations}
+            credit = {
+                "transaction_id": txn_id,
+                "remaining_amount": amount,
+            }
+            metadata_by_id[txn_id] = {"adjusted_against": []}
+            allocate_credit(credit)
+            if _round_ledger_money(credit.get("remaining_amount")) > 0:
+                pending_credits.append(credit)
+            record_debug_row(txn, txn_id, "credit_processed", sequence_no)
         except Exception:
             logger.exception(
                 "Skipping distributor FIFO metadata for malformed row. distributor_id=%s transaction_id=%s row_type=%s helper_section=allocation",
@@ -3036,6 +3114,15 @@ def _build_distributor_fifo_metadata(
                 "bill_status": bill_status,
             })
             metadata_by_id[bill_transaction_id] = bill_metadata
+            record_debug_row(
+                {
+                    "id": bill_transaction_id,
+                    "type": "purchase",
+                    "amount": bill.get("bill_amount"),
+                },
+                bill_transaction_id,
+                "bill_status_finalized",
+            )
         except Exception:
             logger.exception(
                 "Skipping distributor FIFO bill status metadata. distributor_id=%s transaction_id=%s helper_section=bill_status",
@@ -3043,6 +3130,14 @@ def _build_distributor_fifo_metadata(
                 bill.get("transaction_id") if isinstance(bill, dict) else None,
             )
             continue
+
+    if debug_enabled:
+        logger.info(
+            "Distributor FIFO debug completed distributor_id=%s allocation_sequence=%s oldest_due_transaction_id=%s",
+            distributor_id,
+            allocation_sequence,
+            oldest_due_transaction_id,
+        )
 
     return _json_safe_ledger_value(metadata_by_id)
 
