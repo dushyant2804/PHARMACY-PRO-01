@@ -10,6 +10,7 @@ import bcrypt
 import jwt
 from datetime import datetime, timezone, timedelta
 from calendar import monthrange
+from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Literal
 from collections import defaultdict
 
@@ -4537,40 +4538,84 @@ class POCreate(BaseModel):
     grand_total: float = 0
 
 
+MONEY = Decimal("0.01")
+WHOLE_RUPEE = Decimal("1")
+
+
+def _to_decimal(value) -> Decimal:
+    return Decimal(str(value or 0))
+
+
+def _round_money(value: Decimal) -> Decimal:
+    return value.quantize(MONEY, rounding=ROUND_HALF_UP)
+
+
+def _money_float(value: Decimal) -> float:
+    return float(_round_money(value))
+
+
 def _calculate_purchase_order_totals(payload: POCreate) -> dict:
-    """Calculate Purchase Order totals with GST based on discounted taxable amount."""
-    item_subtotals = [
-        float(item.purchase_price or 0) * float(item.quantity or 0)
-        for item in payload.items
-    ]
-    sub_total = round(sum(item_subtotals), 2)
-    scheme_discount = round(float(payload.scheme_discount or 0), 2)
-    cash_discount = round(float(payload.cash_discount or 0), 2)
+    """Calculate PO totals with order discount applied slab-wise before GST."""
+    slab_subtotals: dict[Decimal, Decimal] = defaultdict(Decimal)
+
+    for item in payload.items:
+        # Free quantity is intentionally excluded from the PO taxable subtotal.
+        line_subtotal = _to_decimal(item.purchase_price) * _to_decimal(item.quantity)
+        gst_rate = _to_decimal(item.gst_rate)
+        slab_subtotals[gst_rate] += line_subtotal
+
+    sub_total_raw = sum(slab_subtotals.values(), Decimal("0"))
+    sub_total = _round_money(sub_total_raw)
+    scheme_discount = _round_money(_to_decimal(payload.scheme_discount))
+    cash_discount = _round_money(_to_decimal(payload.cash_discount))
     total_discount = scheme_discount + cash_discount
-    taxable_amount = sub_total - total_discount
+    taxable_total = sub_total - total_discount
 
-    total_gst = 0.0
-    if sub_total:
-        for item, line_subtotal in zip(payload.items, item_subtotals):
-            discount_share = total_discount * (line_subtotal / sub_total)
-            line_taxable_amount = line_subtotal - discount_share
-            total_gst += line_taxable_amount * (float(item.gst_rate or 0) / 100.0)
+    gst_breakup = []
+    total_cgst = Decimal("0")
+    total_sgst = Decimal("0")
 
-    total_gst = round(total_gst, 2)
-    total_cgst = round(total_gst / 2, 2)
-    total_sgst = round(total_gst - total_cgst, 2)
-    round_off = round(float(payload.round_off or 0), 2)
-    grand_total = round(taxable_amount + total_gst + round_off, 2)
+    for gst_rate in sorted(slab_subtotals):
+        slab_subtotal = slab_subtotals[gst_rate]
+        slab_discount = (
+            total_discount * slab_subtotal / sub_total_raw
+            if sub_total_raw
+            else Decimal("0")
+        )
+        slab_taxable = slab_subtotal - slab_discount
+        slab_gst = slab_taxable * gst_rate / Decimal("100")
+        slab_cgst = _round_money(slab_gst / Decimal("2"))
+        slab_sgst = _round_money(slab_gst / Decimal("2"))
+
+        total_cgst += slab_cgst
+        total_sgst += slab_sgst
+
+        gst_breakup.append({
+            "gst_rate": _money_float(gst_rate),
+            "sub_total": _money_float(slab_subtotal),
+            "discount": _money_float(slab_discount),
+            "taxable_total": _money_float(slab_taxable),
+            "cgst": _money_float(slab_cgst),
+            "sgst": _money_float(slab_sgst),
+            "gst": _money_float(slab_cgst + slab_sgst),
+        })
+
+    total = _round_money(taxable_total + total_cgst + total_sgst)
+    grand_total_decimal = total.quantize(WHOLE_RUPEE, rounding=ROUND_HALF_UP)
+    round_off = grand_total_decimal - total
 
     return {
-        "sub_total": sub_total,
-        "scheme_discount": scheme_discount,
-        "cash_discount": cash_discount,
-        "total_cgst": total_cgst,
-        "total_sgst": total_sgst,
-        "round_off": round_off,
-        "grand_total": grand_total,
-        "total": grand_total,
+        "sub_total": _money_float(sub_total),
+        "scheme_discount": _money_float(scheme_discount),
+        "cash_discount": _money_float(cash_discount),
+        "discount": _money_float(total_discount),
+        "taxable_total": _money_float(taxable_total),
+        "total_cgst": _money_float(total_cgst),
+        "total_sgst": _money_float(total_sgst),
+        "total": _money_float(total),
+        "round_off": _money_float(round_off),
+        "grand_total": _money_float(grand_total_decimal),
+        "gst_breakup": gst_breakup,
     }
 
 
@@ -4617,10 +4662,13 @@ async def create_po(
     "sub_total": po_totals["sub_total"],
     "scheme_discount": po_totals["scheme_discount"],
     "cash_discount": po_totals["cash_discount"],
+    "discount": po_totals["discount"],
+    "taxable_total": po_totals["taxable_total"],
     "total_cgst": po_totals["total_cgst"],
     "total_sgst": po_totals["total_sgst"],
     "round_off": po_totals["round_off"],
     "grand_total": po_totals["grand_total"],
+    "gst_breakup": po_totals["gst_breakup"],
 
     "notes": payload.notes,
     "created_at": datetime.now(timezone.utc).isoformat(),
@@ -4739,6 +4787,12 @@ async def update_po(
                 "cash_discount":
                   po_totals["cash_discount"],
 
+                "discount":
+                  po_totals["discount"],
+
+                "taxable_total":
+                  po_totals["taxable_total"],
+
                 "total_cgst":
                   po_totals["total_cgst"],
 
@@ -4750,6 +4804,9 @@ async def update_po(
 
                 "grand_total":
                   po_totals["grand_total"],
+
+                "gst_breakup":
+                  po_totals["gst_breakup"],
             }
         }
     )
