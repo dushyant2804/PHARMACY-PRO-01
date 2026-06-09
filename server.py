@@ -8,6 +8,13 @@ import uuid
 import logging
 import bcrypt
 import jwt
+import asyncio
+import hashlib
+import hmac
+import secrets
+import smtplib
+from contextvars import ContextVar
+from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta, date
 from calendar import monthrange
 from decimal import Decimal, ROUND_HALF_UP
@@ -30,7 +37,125 @@ from fastapi import UploadFile, File
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+raw_db = client[os.environ['DB_NAME']]
+
+REAL_TENANT_ID = os.environ.get("REAL_TENANT_ID", "real_shop")
+DEMO_TENANT_ID = os.environ.get("DEMO_TENANT_ID", "demo_shop")
+BUSINESS_COLLECTIONS = {
+    "counters", "customer_transactions", "customers", "daily_sales",
+    "daily_summary", "distributor_transactions", "distributors",
+    "doctor_history", "expenses", "historical_sales", "invoices",
+    "medicines", "purchase_orders", "purchase_returns",
+    "regular_patients", "settings",
+}
+_request_active = ContextVar("request_active", default=False)
+_current_tenant = ContextVar("current_tenant", default=None)
+_current_demo = ContextVar("current_demo", default=False)
+
+
+def _tenant_filter(query: Optional[dict], tenant_id: str) -> dict:
+    query = dict(query or {})
+    if not query:
+        return {"tenant_id": tenant_id}
+    return {"$and": [{"tenant_id": tenant_id}, query]}
+
+
+class TenantAwareCollection:
+    """Motor collection proxy that enforces tenant scope and demo read-only rules."""
+
+    def __init__(self, collection, name: str):
+        self._collection = collection
+        self._name = name
+
+    def _scope(self, query=None):
+        if not _request_active.get():
+            return query or {}
+        tenant_id = _current_tenant.get()
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        return _tenant_filter(query, tenant_id)
+
+    def _write_guard(self):
+        if _request_active.get() and _current_demo.get():
+            raise HTTPException(status_code=403, detail="Demo account is read-only")
+
+    def _owned(self, document: dict) -> dict:
+        result = dict(document)
+        if _request_active.get():
+            tenant_id = _current_tenant.get()
+            if not tenant_id:
+                raise HTTPException(status_code=401, detail="Not authenticated")
+            result["tenant_id"] = tenant_id
+        return result
+
+    def find(self, query=None, *args, **kwargs):
+        return self._collection.find(self._scope(query), *args, **kwargs)
+
+    async def find_one(self, query=None, *args, **kwargs):
+        return await self._collection.find_one(self._scope(query), *args, **kwargs)
+
+    async def count_documents(self, query, *args, **kwargs):
+        return await self._collection.count_documents(self._scope(query), *args, **kwargs)
+
+    async def insert_one(self, document, *args, **kwargs):
+        self._write_guard()
+        return await self._collection.insert_one(self._owned(document), *args, **kwargs)
+
+    async def insert_many(self, documents, *args, **kwargs):
+        self._write_guard()
+        return await self._collection.insert_many([self._owned(d) for d in documents], *args, **kwargs)
+
+    def _owned_update(self, update):
+        if _request_active.get() and isinstance(update, list):
+            return [*update, {"$set": {"tenant_id": _current_tenant.get()}}]
+        if not _request_active.get() or not isinstance(update, dict) or any(not str(k).startswith("$") for k in update):
+            return update
+        result = dict(update)
+        result["$setOnInsert"] = {**result.get("$setOnInsert", {}), "tenant_id": _current_tenant.get()}
+        return result
+
+    async def update_one(self, query, update, *args, **kwargs):
+        self._write_guard()
+        return await self._collection.update_one(self._scope(query), self._owned_update(update), *args, **kwargs)
+
+    async def update_many(self, query, update, *args, **kwargs):
+        self._write_guard()
+        return await self._collection.update_many(self._scope(query), self._owned_update(update), *args, **kwargs)
+
+    async def find_one_and_update(self, query, update, *args, **kwargs):
+        self._write_guard()
+        return await self._collection.find_one_and_update(self._scope(query), self._owned_update(update), *args, **kwargs)
+
+    async def replace_one(self, query, replacement, *args, **kwargs):
+        self._write_guard()
+        return await self._collection.replace_one(self._scope(query), self._owned(replacement), *args, **kwargs)
+
+    async def delete_one(self, query, *args, **kwargs):
+        self._write_guard()
+        return await self._collection.delete_one(self._scope(query), *args, **kwargs)
+
+    async def delete_many(self, query, *args, **kwargs):
+        self._write_guard()
+        return await self._collection.delete_many(self._scope(query), *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._collection, name)
+
+
+class TenantAwareDatabase:
+    def __init__(self, database):
+        self._database = database
+
+    def __getattr__(self, name):
+        collection = getattr(self._database, name)
+        return TenantAwareCollection(collection, name) if name in BUSINESS_COLLECTIONS else collection
+
+    def __getitem__(self, name):
+        collection = self._database[name]
+        return TenantAwareCollection(collection, name) if name in BUSINESS_COLLECTIONS else collection
+
+
+db = TenantAwareDatabase(raw_db)
 
 app = FastAPI(title="Pharmacy Management API")
 
@@ -84,6 +209,65 @@ logger = logging.getLogger("pharmacy")
 logging.basicConfig(level=logging.INFO)
 
 EXPIRY_WARNING_DAYS = 90
+PASSWORD_MAX_AGE_DAYS = 183
+PASSWORD_RESET_ATTEMPTS = 5
+PASSWORD_RESET_TTL_MINUTES = 10
+FORGOT_PASSWORD_RATE_LIMIT = 5
+FORGOT_PASSWORD_WINDOW_MINUTES = 15
+
+
+def _password_expired(user: dict, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    changed_at = user.get("password_changed_at") or user.get("created_at")
+    if not changed_at:
+        return True
+    try:
+        changed = datetime.fromisoformat(str(changed_at).replace("Z", "+00:00"))
+        if changed.tzinfo is None:
+            changed = changed.replace(tzinfo=timezone.utc)
+        return now - changed > timedelta(days=PASSWORD_MAX_AGE_DAYS)
+    except (TypeError, ValueError):
+        return True
+
+
+def _validate_password_strength(password: str) -> None:
+    if len(password) < 10 or not any(c.islower() for c in password) or not any(c.isupper() for c in password) or not any(c.isdigit() for c in password):
+        raise HTTPException(
+            status_code=422,
+            detail="Password must be at least 10 characters and include uppercase, lowercase, and a number",
+        )
+
+
+def _otp_hash(email: str, otp: str) -> str:
+    return hmac.new(JWT_SECRET.encode(), f"{email.lower()}:{otp}".encode(), hashlib.sha256).hexdigest()
+
+
+@app.middleware("http")
+async def tenant_security_context(request: Request, call_next):
+    active_token = _request_active.set(True)
+    tenant_token = _current_tenant.set(None)
+    demo_token = _current_demo.set(False)
+    try:
+        token = request.cookies.get("access_token")
+        auth = request.headers.get("Authorization", "")
+        if not token and auth.startswith("Bearer "):
+            token = auth[7:]
+        if token:
+            try:
+                payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+                user = await raw_db.users.find_one({"id": payload.get("sub")})
+                if user:
+                    _current_tenant.set(user.get("tenant_id"))
+                    _current_demo.set(bool(user.get("is_demo")))
+            except jwt.InvalidTokenError:
+                pass
+        if _current_demo.get() and request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in {"/api/auth/login", "/api/auth/logout"}:
+            return JSONResponse(status_code=403, content={"detail": "Demo account is read-only"})
+        return await call_next(request)
+    finally:
+        _current_demo.reset(demo_token)
+        _current_tenant.reset(tenant_token)
+        _request_active.reset(active_token)
 
 
 def parse_expiry_date(expiry):
@@ -255,9 +439,14 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+        user = await raw_db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        if user.get("is_demo") and request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in {"/api/auth/logout"}:
+            raise HTTPException(status_code=403, detail="Demo account is read-only")
+        if _password_expired(user) and request.url.path not in {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me"}:
+            raise HTTPException(status_code=403, detail="Password expired; change password to continue", headers={"X-Password-Expired": "true"})
+        user["password_expired"] = _password_expired(user)
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -287,6 +476,21 @@ class UserCreateByAdmin(UserRegister):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    otp: str
+    new_password: str
 
 
 class Medicine(BaseModel):
@@ -701,31 +905,80 @@ class PurchaseReturnCreate(BaseModel):
         return value
     
 # ---------------- Startup ----------------
+async def _backfill_tenant_data(now_iso: str) -> None:
+    await raw_db.users.update_many(
+        {"tenant_id": {"$exists": False}},
+        {"$set": {"tenant_id": REAL_TENANT_ID, "is_demo": False, "password_changed_at": now_iso}},
+    )
+    await raw_db.users.update_many(
+        {"password_changed_at": {"$exists": False}},
+        {"$set": {"password_changed_at": now_iso}},
+    )
+    for collection_name in BUSINESS_COLLECTIONS:
+        collection = raw_db[collection_name]
+        await collection.update_many(
+            {"tenant_id": {"$exists": False}},
+            {"$set": {"tenant_id": REAL_TENANT_ID}},
+        )
+        await collection.create_index("tenant_id")
+
+
+async def _seed_demo_data(now_iso: str) -> None:
+    demo_email = os.environ.get("DEMO_EMAIL", "demo@pharmacy.com").lower()
+    demo_password = os.environ.get("DEMO_PASSWORD", "DemoAccess123")
+    await raw_db.users.update_one(
+        {"email": demo_email},
+        {"$setOnInsert": {
+            "id": "demo-user", "email": demo_email, "password_hash": hash_password(demo_password),
+            "name": "Demo Pharmacist", "role": "admin", "created_at": now_iso,
+            "password_changed_at": now_iso,
+        }, "$set": {"tenant_id": DEMO_TENANT_ID, "is_demo": True}},
+        upsert=True,
+    )
+    demo_documents = {
+        "distributors": [{"id": "demo-dist-1", "name": "Demo Health Distributors", "phone": "555-0101", "email": "orders@example.invalid", "created_at": now_iso}],
+        "medicines": [
+            {"id": "demo-med-1", "medicine_key": "paracetamol 500mg::DEMO-B1", "name": "Paracetamol 500mg", "batch_no": "DEMO-B1", "expiry_date": "2027-12-31", "manufacturer": "Demo Labs", "distributor": "Demo Health Distributors", "distributor_id": "demo-dist-1", "purchase_price": 1.0, "mrp": 2.0, "purchased_units": 250, "sold_units": 25, "category": "OTC", "gst_rate": 5, "created_at": now_iso},
+            {"id": "demo-med-2", "medicine_key": "vitamin c::DEMO-B2", "name": "Vitamin C", "batch_no": "DEMO-B2", "expiry_date": "2028-06-30", "manufacturer": "Demo Labs", "distributor": "Demo Health Distributors", "distributor_id": "demo-dist-1", "purchase_price": 2.0, "mrp": 4.0, "purchased_units": 100, "sold_units": 10, "category": "Supplements", "gst_rate": 12, "created_at": now_iso},
+        ],
+        "customers": [{"id": "demo-customer-1", "name": "Demo Customer", "phone": "555-0110", "email": "customer@example.invalid", "created_at": now_iso}],
+        "purchase_orders": [{"id": "demo-po-1", "po_number": "DEMO-PO-001", "distributor_id": "demo-dist-1", "distributor_name": "Demo Health Distributors", "invoice_ref": "DEMO-SUP-001", "items": [{"name": "Paracetamol 500mg", "batch_no": "DEMO-B1", "quantity": 250, "free_quantity": 0, "purchase_price": 1.0, "mrp": 2.0, "gst_rate": 5}], "sub_total": 250, "grand_total": 262.5, "created_at": now_iso}],
+        "invoices": [{"id": "demo-invoice-1", "invoice_number": "DEMO-INV-001", "customer_id": "demo-customer-1", "customer_name": "Demo Customer", "items": [{"medicine_id": "demo-med-1", "name": "Paracetamol 500mg", "quantity": 5, "price": 2.0}], "subtotal": 10, "grand_total": 10, "total": 10, "created_at": now_iso}],
+        "customer_transactions": [{"id": "demo-customer-txn-1", "customer_id": "demo-customer-1", "type": "sale", "amount": 10, "reference": "DEMO-INV-001", "created_at": now_iso}],
+        "distributor_transactions": [{"id": "demo-dist-txn-1", "distributor_id": "demo-dist-1", "type": "purchase", "amount": 262.5, "reference": "DEMO-PO-001", "created_at": now_iso}],
+        "expenses": [{"id": "demo-expense-1", "category": "Utilities", "amount": 25, "description": "Demo electricity bill", "created_at": now_iso}],
+        "daily_summary": [{"id": "demo-summary-1", "date": datetime.now(timezone.utc).date().isoformat(), "sales": 10, "expenses": 25, "created_at": now_iso}],
+    }
+    for collection_name, documents in demo_documents.items():
+        collection = raw_db[collection_name]
+        for document in documents:
+            owned = {**document, "tenant_id": DEMO_TENANT_ID}
+            await collection.replace_one({"id": document["id"], "tenant_id": DEMO_TENANT_ID}, owned, upsert=True)
+
+
 @app.on_event("startup")
 async def startup():
-    await db.users.create_index("email", unique=True)
-    await db.medicines.create_index("name")
-    await db.medicines.create_index("barcode")
-    await db.invoices.create_index("created_at")
-    await db.purchase_returns.create_index("return_date")
-    await db.purchase_returns.create_index("distributor")
-    await db.purchase_returns.create_index("medicine_name")
-    await db.purchase_returns.create_index("reason")
-    await db.purchase_returns.create_index("ledger_adjusted")
-    # Seed admin
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@pharmacy.com")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await raw_db.users.create_index("email", unique=True)
+    await raw_db.password_reset_requests.create_index("created_at", expireAfterSeconds=FORGOT_PASSWORD_WINDOW_MINUTES * 60)
+    await _backfill_tenant_data(now_iso)
+    for collection_name, indexes in {
+        "medicines": ["name", "barcode"], "invoices": ["created_at"],
+        "purchase_returns": ["return_date", "distributor", "medicine_name", "reason", "ledger_adjusted"],
+    }.items():
+        for index in indexes:
+            await raw_db[collection_name].create_index(index)
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@pharmacy.com").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.users.find_one({"email": admin_email})
+    existing = await raw_db.users.find_one({"email": admin_email})
     if not existing:
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "email": admin_email,
-            "password_hash": hash_password(admin_password),
-            "name": "Administrator",
-            "role": "admin",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+        await raw_db.users.insert_one({
+            "id": str(uuid.uuid4()), "email": admin_email, "password_hash": hash_password(admin_password),
+            "name": "Administrator", "role": "admin", "tenant_id": REAL_TENANT_ID, "is_demo": False,
+            "created_at": now_iso, "password_changed_at": now_iso,
         })
-        logger.info(f"Seeded admin user: {admin_email}")
+        logger.info("Seeded admin user: %s", admin_email)
+    await _seed_demo_data(now_iso)
 
 
 @app.on_event("shutdown")
@@ -734,21 +987,46 @@ async def shutdown():
 
 
 # ---------------- Auth routes ----------------
-async def _create_user(payload: UserRegister, role: str) -> dict:
+async def _create_user(payload: UserRegister, role: str, tenant_id: Optional[str] = None) -> dict:
     email = payload.email.lower()
-    existing = await db.users.find_one({"email": email})
+    existing = await raw_db.users.find_one({"email": email})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
+    _validate_password_strength(payload.password)
+    now_iso = datetime.now(timezone.utc).isoformat()
     user = {
-        "id": str(uuid.uuid4()),
-        "email": email,
-        "password_hash": hash_password(payload.password),
-        "name": payload.name,
-        "role": role,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "id": str(uuid.uuid4()), "email": email, "password_hash": hash_password(payload.password),
+        "name": payload.name, "role": role, "tenant_id": tenant_id or f"shop_{uuid.uuid4().hex}",
+        "is_demo": False, "created_at": now_iso, "password_changed_at": now_iso,
     }
-    await db.users.insert_one(user)
-    return {"id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"]}
+    await raw_db.users.insert_one(user)
+    return {key: user[key] for key in ("id", "email", "name", "role", "tenant_id", "is_demo")}
+
+
+async def _send_password_reset_email(email: str, otp: str) -> bool:
+    host = os.environ.get("SMTP_HOST")
+    sender = os.environ.get("SMTP_FROM")
+    if not host or not sender:
+        return False
+    message = EmailMessage()
+    message["Subject"] = "Pharmacy Pro password reset code"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(f"Your password reset code expires in 10 minutes: {otp}")
+
+    def send():
+        port = int(os.environ.get("SMTP_PORT", "587"))
+        with smtplib.SMTP(host, port, timeout=10) as smtp:
+            if os.environ.get("SMTP_STARTTLS", "true").lower() == "true":
+                smtp.starttls()
+            username = os.environ.get("SMTP_USERNAME")
+            password = os.environ.get("SMTP_PASSWORD")
+            if username and password:
+                smtp.login(username, password)
+            smtp.send_message(message)
+
+    await asyncio.to_thread(send)
+    return True
 
 
 @api_router.post("/auth/register")
@@ -759,12 +1037,16 @@ async def register(payload: UserRegister):
 @api_router.post("/auth/login")
 async def login(payload: UserLogin, response: Response):
     email = payload.email.lower()
-    user = await db.users.find_one({"email": email})
+    user = await raw_db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_access_token(user["id"], user["email"], user["role"])
-    response.set_cookie("access_token", token, httponly=True, samesite="lax", max_age=43200, path="/")
-    return {"id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"], "token": token}
+    response.set_cookie("access_token", token, httponly=True, samesite="lax", secure=ENVIRONMENT in {"production", "prod"}, max_age=43200, path="/")
+    return {
+        "id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"],
+        "tenant_id": user["tenant_id"], "is_demo": bool(user.get("is_demo")),
+        "password_expired": _password_expired(user), "token": token,
+    }
 
 
 @api_router.post("/auth/logout")
@@ -780,16 +1062,74 @@ async def me(user: dict = Depends(get_current_user)):
 
 @api_router.get("/auth/users")
 async def list_users(user: dict = Depends(require_role("admin"))):
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(1000)
-    return users
+    return await raw_db.users.find({"tenant_id": user["tenant_id"]}, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0}).to_list(1000)
 
 
 @api_router.post("/auth/users")
-async def create_user_by_admin(
-    payload: UserCreateByAdmin,
-    user: dict = Depends(require_role("admin"))
-):
-    return await _create_user(payload, payload.role)
+async def create_user_by_admin(payload: UserCreateByAdmin, user: dict = Depends(require_role("admin"))):
+    return await _create_user(payload, payload.role, user["tenant_id"])
+
+
+@api_router.post("/auth/change-password")
+async def change_password(payload: ChangePasswordRequest, user: dict = Depends(get_current_user)):
+    stored = await raw_db.users.find_one({"id": user["id"]})
+    if not stored or not verify_password(payload.old_password, stored["password_hash"]):
+        raise HTTPException(status_code=400, detail="Old password is incorrect")
+    _validate_password_strength(payload.new_password)
+    if verify_password(payload.new_password, stored["password_hash"]):
+        raise HTTPException(status_code=422, detail="New password must be different from old password")
+    changed_at = datetime.now(timezone.utc).isoformat()
+    await raw_db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": hash_password(payload.new_password), "password_changed_at": changed_at}, "$unset": {"reset_otp_hash": "", "reset_otp_expires_at": "", "reset_otp_attempts": ""}})
+    return {"ok": True, "password_changed_at": changed_at}
+
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest, request: Request):
+    email = payload.email.lower()
+    now = datetime.now(timezone.utc)
+    client_key = request.client.host if request.client else "unknown"
+    recent = await raw_db.password_reset_requests.count_documents({"client_key": client_key, "created_at": {"$gt": now - timedelta(minutes=FORGOT_PASSWORD_WINDOW_MINUTES)}})
+    if recent >= FORGOT_PASSWORD_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many password reset requests; try again later")
+    await raw_db.password_reset_requests.insert_one({"client_key": client_key, "created_at": now})
+    user = None if _current_demo.get() else await raw_db.users.find_one({"email": email, "is_demo": {"$ne": True}})
+    delivered = False
+    if user:
+        otp = f"{secrets.randbelow(1_000_000):06d}"
+        await raw_db.users.update_one({"id": user["id"]}, {"$set": {"reset_otp_hash": _otp_hash(email, otp), "reset_otp_expires_at": now + timedelta(minutes=PASSWORD_RESET_TTL_MINUTES), "reset_otp_attempts": 0}})
+        try:
+            delivered = await _send_password_reset_email(email, otp)
+        except Exception as exc:
+            logger.warning("Password reset email delivery failed: %s", type(exc).__name__)
+    result = {"message": "If the email is registered, a reset code will be sent."}
+    smtp_configured = bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_FROM"))
+    result["delivery_configured"] = smtp_configured
+    if not smtp_configured:
+        result["todo"] = "Configure SMTP_HOST, SMTP_PORT, SMTP_FROM, and optional SMTP_USERNAME/SMTP_PASSWORD."
+    return result
+
+
+@api_router.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordRequest):
+    if _current_demo.get():
+        raise HTTPException(status_code=403, detail="Demo account cannot reset passwords")
+    email = payload.email.lower()
+    user = await raw_db.users.find_one({"email": email, "is_demo": {"$ne": True}})
+    generic_error = HTTPException(status_code=400, detail="Invalid or expired reset code")
+    if not user or not user.get("reset_otp_hash") or int(user.get("reset_otp_attempts", 0)) >= PASSWORD_RESET_ATTEMPTS:
+        raise generic_error
+    expiry = user.get("reset_otp_expires_at")
+    if isinstance(expiry, datetime) and expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if not expiry or expiry < datetime.now(timezone.utc):
+        raise generic_error
+    if not hmac.compare_digest(user["reset_otp_hash"], _otp_hash(email, payload.otp)):
+        await raw_db.users.update_one({"id": user["id"]}, {"$inc": {"reset_otp_attempts": 1}})
+        raise generic_error
+    _validate_password_strength(payload.new_password)
+    changed_at = datetime.now(timezone.utc).isoformat()
+    await raw_db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": hash_password(payload.new_password), "password_changed_at": changed_at}, "$unset": {"reset_otp_hash": "", "reset_otp_expires_at": "", "reset_otp_attempts": ""}})
+    return {"ok": True, "password_changed_at": changed_at}
 
 
 # ---------------- Medicines ----------------
@@ -1648,7 +1988,7 @@ async def _next_document_no(prefix: str) -> str:
     existing_max = await _existing_document_max_sequence(prefix, today)
     counter = await db.counters.find_one_and_update(
         {
-            "_id": f"{prefix}-{today}"
+            "_id": f"{_current_tenant.get() or REAL_TENANT_ID}:{prefix}-{today}"
         },
         [
             {
