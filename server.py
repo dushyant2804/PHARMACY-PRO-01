@@ -1070,6 +1070,28 @@ async def create_user_by_admin(payload: UserCreateByAdmin, user: dict = Depends(
     return await _create_user(payload, payload.role, user["tenant_id"])
 
 
+@api_router.delete("/users/{user_id}")
+async def delete_user(user_id: str, user: dict = Depends(require_role("admin"))):
+    if user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Cannot delete currently logged in user")
+
+    tenant_id = user["tenant_id"]
+    target = await raw_db.users.find_one({"id": user_id, "tenant_id": tenant_id})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.get("is_demo"):
+        raise HTTPException(status_code=400, detail="Cannot delete protected demo user")
+    if target.get("role") == "admin":
+        admin_count = await raw_db.users.count_documents({"tenant_id": tenant_id, "role": "admin"})
+        if admin_count <= 1:
+            raise HTTPException(status_code=400, detail="Cannot delete last admin user")
+
+    result = await raw_db.users.delete_one({"id": user_id, "tenant_id": tenant_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ok": True}
+
+
 @api_router.post("/auth/change-password")
 async def change_password(payload: ChangePasswordRequest, user: dict = Depends(get_current_user)):
     stored = await raw_db.users.find_one({"id": user["id"]})
