@@ -25,11 +25,26 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
 
         http_response = Response()
         response = await version(http_response)
+        self.assertEqual(
+            set(response),
+            {"version", "build", "release_notes", "message", "updated_at", "update_type"},
+        )
         self.assertEqual(response["version"], APP_VERSION)
         self.assertTrue(response["build"])
         self.assertIsInstance(response["message"], str)
         self.assertEqual(response["release_notes"], APP_RELEASE_NOTES)
-        self.assertEqual(http_response.headers["cache-control"], "no-store, max-age=0")
+        self.assertGreaterEqual(len(response["release_notes"].splitlines()), 2)
+        self.assertIn(response["update_type"], ("patch", "minor", "major"))
+        self.assertTrue(response["updated_at"].endswith("Z"))
+        self.assertEqual(http_response.headers["cache-control"], "no-store")
+
+    def test_version_config_supports_expected_update_types_and_returns_a_copy(self):
+        from version_config import SUPPORTED_UPDATE_TYPES, VERSION_METADATA, get_version_metadata
+
+        self.assertEqual(SUPPORTED_UPDATE_TYPES, ("patch", "minor", "major"))
+        metadata = get_version_metadata()
+        metadata["message"] = "changed by caller"
+        self.assertNotEqual(metadata["message"], VERSION_METADATA["message"])
 
     def test_signup_accepts_email_or_mobile_and_requires_matching_method(self):
         email_signup = SignupRequest(

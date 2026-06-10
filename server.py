@@ -35,6 +35,8 @@ from pymongo.errors import PyMongoError
 from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator, model_validator
 from fastapi import UploadFile, File
 
+from version_config import VERSION_METADATA, get_version_metadata
+
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -239,15 +241,11 @@ FORGOT_PASSWORD_RATE_LIMIT = 5
 FORGOT_PASSWORD_WINDOW_MINUTES = 15
 SIGNUP_OTP_TTL_MINUTES = 10
 SIGNUP_OTP_ATTEMPTS = 5
-APP_VERSION = os.environ.get("APP_VERSION", "2.0.0")
-APP_BUILD = os.environ.get("APP_BUILD", APP_VERSION)
-APP_UPDATE_MESSAGE = os.environ.get("APP_UPDATE_MESSAGE", "Backend security, onboarding, analytics, and purchase-order adjustment update")
-APP_RELEASE_NOTES = [
-    "Isolated, restart-safe demo pharmacy tenant",
-    "Verified email or mobile self-signup with pharmacy onboarding",
-    "Tenant-safe report analytics APIs",
-    "Purchase-return credit adjustments for purchase orders",
-]
+# Compatibility aliases; version_config.py is the single source of release metadata.
+APP_VERSION = VERSION_METADATA["version"]
+APP_BUILD = VERSION_METADATA["build"]
+APP_UPDATE_MESSAGE = VERSION_METADATA["message"]
+APP_RELEASE_NOTES = VERSION_METADATA["release_notes"]
 
 
 def _password_expired(user: dict, now: Optional[datetime] = None) -> bool:
@@ -1219,10 +1217,9 @@ async def _send_signup_otp(method: str, identifier: str, otp: str) -> bool:
 
 
 @api_router.get("/version")
-async def version(response: Response = None):
-    if response is not None:
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-    return {"version": APP_VERSION, "build": APP_BUILD, "message": APP_UPDATE_MESSAGE, "release_notes": APP_RELEASE_NOTES}
+async def version(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return get_version_metadata()
 
 
 @api_router.post("/auth/signup/request-otp")
