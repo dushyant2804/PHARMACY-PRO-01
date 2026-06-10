@@ -313,8 +313,58 @@ def parse_expiry_date(expiry):
         return None
 
 
+def _stock_quantity(medicine: dict, canonical_key: str, *fallback_keys: str) -> float:
+    """Read a stock quantity while supporting older/imported field names."""
+    for key in (canonical_key, *fallback_keys):
+        if key in medicine and medicine.get(key) is not None:
+            return float(medicine.get(key) or 0)
+    return 0.0
+
+
+def _purchased_stock(medicine: dict) -> float:
+    if "purchased_units" in medicine and medicine.get("purchased_units") is not None:
+        return float(medicine.get("purchased_units") or 0)
+    return _stock_quantity(medicine, "purchased_quantity", "quantity") + _stock_quantity(
+        medicine, "free_quantity", "free_units"
+    )
+
+
+def _purchase_return_stock(medicine: dict) -> float:
+    return _stock_quantity(
+        medicine,
+        "purchase_return_units",
+        "purchase_return_quantity",
+        "returned_quantity",
+        "returned_units",
+    )
+
+
 def _available_stock(medicine: dict) -> float:
-    return max(0.0, float(medicine.get("purchased_units", 0) or 0) - float(medicine.get("sold_units", 0) or 0))
+    return max(
+        0.0,
+        _purchased_stock(medicine)
+        - _stock_quantity(medicine, "sold_units", "sold_quantity")
+        - _purchase_return_stock(medicine),
+    )
+
+
+def _return_status(medicine: dict) -> str:
+    purchased = _purchased_stock(medicine)
+    sold = _stock_quantity(medicine, "sold_units", "sold_quantity")
+    returned = _purchase_return_stock(medicine)
+    available = _available_stock(medicine)
+
+    # A pure full purchase return is reported as Returned. In every mixed case,
+    # exhausted usable stock takes priority over the partial-return label.
+    if returned > 0 and returned >= purchased and sold <= 0:
+        return "Returned"
+    if available <= 0:
+        return "Sold Out"
+    if returned >= purchased and returned > 0:
+        return "Returned"
+    if returned > 0:
+        return "Partially Returned"
+    return "Not Returned"
 
 
 def expiry_details(expiry, today):
@@ -1517,20 +1567,16 @@ async def list_medicines(
 
     for m in items:
 
-        purchased = int(
-            m.get("purchased_units", 0)
-        )
-
-        sold = int(
-            m.get("sold_units", 0)
-        )
-
-        qty = max(
-            purchased - sold,
-            0
-        )
+        purchased = _purchased_stock(m)
+        sold = _stock_quantity(m, "sold_units", "sold_quantity")
+        returned = _purchase_return_stock(m)
+        qty = _available_stock(m)
+        return_status = _return_status(m)
 
         m["quantity_units"] = qty
+        m["available_stock"] = qty
+        m["return_status"] = return_status
+        m["status"] = return_status
 
         # EXPIRY WARNING SYSTEM
 
@@ -1565,7 +1611,19 @@ async def list_medicines(
                     m.get("low_stock_threshold"),
 
                 "sold_units":
-                    sold,
+                    0,
+
+                "purchased_units":
+                    0,
+
+                "purchase_return_units":
+                    0,
+
+                "return_status":
+                    return_status,
+
+                "status":
+                    return_status,
 
                 "name":
                     m.get("name"),
@@ -1593,6 +1651,15 @@ async def list_medicines(
             }
 
         grouped[name]["total_stock"] += qty
+        grouped[name]["purchase_return_units"] += returned
+        grouped[name]["return_status"] = _return_status({
+            "purchased_units": grouped[name].get("purchased_units", 0) + purchased,
+            "sold_units": grouped[name].get("sold_units", 0) + sold,
+            "purchase_return_units": grouped[name]["purchase_return_units"],
+        })
+        grouped[name]["status"] = grouped[name]["return_status"]
+        grouped[name]["purchased_units"] = grouped[name].get("purchased_units", 0) + purchased
+        grouped[name]["sold_units"] = grouped[name].get("sold_units", 0) + sold
 
         # UPGRADE GROUP WARNING LEVEL
 
@@ -1693,11 +1760,23 @@ async def list_medicines(
             "quantity_units":
                 qty,
 
+            "available_stock":
+                qty,
+
             "purchased_units":
                 purchased,
 
             "sold_units":
                 sold,
+
+            "purchase_return_units":
+                returned,
+
+            "return_status":
+                return_status,
+
+            "status":
+                return_status,
 
             "pack_size":
                 m.get("pack_size"),
@@ -2307,21 +2386,7 @@ async def _build_fifo_stock_plan(
 
     for batch in batches:
 
-        purchased = int(
-            batch.get(
-                "purchased_units",
-                0
-            )
-        )
-
-        sold = int(
-            batch.get(
-                "sold_units",
-                0
-            )
-        )
-
-        available = purchased - sold
+        available = _available_stock(batch)
 
         if available <= 0:
             continue
@@ -2368,8 +2433,13 @@ async def _apply_fifo_stock_plan(
                     "$gte": [
                         {
                             "$subtract": [
-                                {"$ifNull": ["$purchased_units", 0]},
-                                {"$ifNull": ["$sold_units", 0]},
+                                {
+                                    "$subtract": [
+                                        {"$ifNull": ["$purchased_units", 0]},
+                                        {"$ifNull": ["$sold_units", 0]},
+                                    ]
+                                },
+                                {"$ifNull": ["$purchase_return_units", 0]},
                             ]
                         },
                         step["deduct"],
@@ -4179,7 +4249,7 @@ def _purchase_return_query(
 
 
 def _available_batch_stock(medicine: dict) -> float:
-    return float(medicine.get("purchased_units", 0) or 0) - float(medicine.get("sold_units", 0) or 0)
+    return _available_stock(medicine)
 
 
 def _return_public(return_doc: dict) -> dict:
@@ -4240,8 +4310,13 @@ async def _deduct_purchase_return_stock(medicine_id: str, quantity: float, sessi
                 "$gte": [
                     {
                         "$subtract": [
-                            {"$ifNull": ["$purchased_units", 0]},
-                            {"$ifNull": ["$sold_units", 0]},
+                            {
+                                "$subtract": [
+                                    {"$ifNull": ["$purchased_units", 0]},
+                                    {"$ifNull": ["$sold_units", 0]},
+                                ]
+                            },
+                            {"$ifNull": ["$purchase_return_units", 0]},
                         ]
                     },
                     quantity,
@@ -4250,7 +4325,7 @@ async def _deduct_purchase_return_stock(medicine_id: str, quantity: float, sessi
         },
         {
             "$inc": {
-                "sold_units": quantity,
+                "purchase_return_units": quantity,
             }
         },
         session=session,
@@ -4366,7 +4441,7 @@ async def create_purchase_return(
             if stock_deducted:
                 await db.medicines.update_one(
                     {"id": medicine.get("id")},
-                    {"$inc": {"sold_units": -payload.return_quantity}},
+                    {"$inc": {"purchase_return_units": -payload.return_quantity}},
                 )
             raise
 
@@ -4779,10 +4854,7 @@ async def dashboard_summary(
 
     for m in medicines:
 
-        purchased = int(m.get("purchased_units", 0))
-        sold = int(m.get("sold_units", 0))
-
-        available = max(0, purchased - sold)
+        available = _available_stock(m)
 
         stock_value += available * float(m.get("purchase_price", 0))
 
@@ -5030,10 +5102,7 @@ async def stock_valuation(
 
     for m in medicines:
 
-        available = (
-            int(m.get("purchased_units", 0))
-            - int(m.get("sold_units", 0))
-        )
+        available = _available_stock(m)
 
         total_units += available
 
@@ -6175,6 +6244,11 @@ async def rebuild_inventory():
                     # MANUAL SOLD QTY PRESERVED
                     "sold_units":
                         existing.get("sold_units", 0)
+                        if existing else 0,
+
+                    # PURCHASE RETURNS PRESERVED
+                    "purchase_return_units":
+                        _purchase_return_stock(existing)
                         if existing else 0,
 
                     # MANUAL THRESHOLD PRESERVED
