@@ -42,7 +42,7 @@ client = AsyncIOMotorClient(mongo_url)
 raw_db = client[os.environ['DB_NAME']]
 
 REAL_TENANT_ID = os.environ.get("REAL_TENANT_ID", "real_shop")
-DEMO_TENANT_ID = os.environ.get("DEMO_TENANT_ID", "demo_shop")
+DEMO_TENANT_ID = "demo_shop"
 BUSINESS_COLLECTIONS = {
     "counters", "customer_transactions", "customers", "daily_sales",
     "daily_summary", "distributor_transactions", "distributors",
@@ -60,6 +60,16 @@ def _tenant_filter(query: Optional[dict], tenant_id: str) -> dict:
     if not query:
         return {"tenant_id": tenant_id}
     return {"$and": [{"tenant_id": tenant_id}, query]}
+
+
+def _canonicalize_user_tenant(user: dict) -> dict:
+    """Return an auth-safe user whose demo identity can never inherit another shop."""
+    result = dict(user)
+    if result.get("id") == "demo-user" or result.get("is_demo"):
+        result["tenant_id"] = DEMO_TENANT_ID
+        result["shop_id"] = DEMO_TENANT_ID
+        result["is_demo"] = True
+    return result
 
 
 class TenantAwareCollection:
@@ -100,6 +110,15 @@ class TenantAwareCollection:
     async def count_documents(self, query, *args, **kwargs):
         return await self._collection.count_documents(self._scope(query), *args, **kwargs)
 
+    def aggregate(self, pipeline, *args, **kwargs):
+        scoped_pipeline = list(pipeline or [])
+        if _request_active.get():
+            scoped_pipeline.insert(0, {"$match": self._scope({})})
+        return self._collection.aggregate(scoped_pipeline, *args, **kwargs)
+
+    async def distinct(self, key, query=None, *args, **kwargs):
+        return await self._collection.distinct(key, self._scope(query), *args, **kwargs)
+
     async def insert_one(self, document, *args, **kwargs):
         self._write_guard()
         return await self._collection.insert_one(self._owned(document), *args, **kwargs)
@@ -110,7 +129,8 @@ class TenantAwareCollection:
 
     def _owned_update(self, update):
         if _request_active.get() and isinstance(update, list):
-            return [*update, {"$set": {"tenant_id": _current_tenant.get()}}]
+            tenant_id = _current_tenant.get()
+            return [*update, {"$set": {"tenant_id": tenant_id, "shop_id": tenant_id}}]
         if not _request_active.get() or not isinstance(update, dict) or any(not str(k).startswith("$") for k in update):
             return update
         result = dict(update)
@@ -271,6 +291,7 @@ async def tenant_security_context(request: Request, call_next):
                 payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
                 user = await raw_db.users.find_one({"id": payload.get("sub")})
                 if user:
+                    user = _canonicalize_user_tenant(user)
                     _current_tenant.set(user.get("tenant_id"))
                     _current_demo.set(bool(user.get("is_demo")))
             except jwt.InvalidTokenError:
@@ -510,6 +531,7 @@ async def get_current_user(request: Request) -> dict:
         user = await raw_db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        user = _canonicalize_user_tenant(user)
         if user.get("is_demo") and request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in {"/api/auth/logout"}:
             raise HTTPException(status_code=403, detail="Demo account is read-only")
         if _password_expired(user) and request.url.path not in {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me"}:
@@ -1034,9 +1056,10 @@ async def _seed_demo_data(now_iso: str) -> None:
     demo_email = os.environ.get("DEMO_EMAIL", "demo@pharmacy.com").strip().lower()
     demo_password = os.environ.get("DEMO_PASSWORD", "DemoAccess123")
     await raw_db.users.delete_many({
-        "tenant_id": DEMO_TENANT_ID,
-        "id": {"$ne": "demo-user"},
-        "is_demo": True,
+        "$or": [
+            {"is_demo": True, "id": {"$ne": "demo-user"}},
+            {"email": demo_email, "id": {"$ne": "demo-user"}},
+        ]
     })
     await raw_db.users.replace_one(
         {"id": "demo-user"},
@@ -1060,10 +1083,14 @@ async def _seed_demo_data(now_iso: str) -> None:
         "customer_transactions": [{"id": "demo-customer-txn-1", "customer_id": "demo-customer-1", "type": "sale", "amount": 10, "reference": "DEMO-INV-001", "created_at": now_iso}],
         "distributor_transactions": [{"id": "demo-dist-txn-1", "distributor_id": "demo-dist-1", "type": "purchase", "amount": 262.5, "reference": "DEMO-PO-001", "created_at": now_iso}],
         "expenses": [{"id": "demo-expense-1", "category": "Utilities", "amount": 25, "description": "Demo electricity bill", "created_at": now_iso}],
-        "daily_summary": [{"id": "demo-summary-1", "date": datetime.now(timezone.utc).date().isoformat(), "sales": 10, "expenses": 25, "created_at": now_iso}],
+        "daily_summary": [{"id": "demo-summary-1", "date": datetime.now(timezone.utc).date().isoformat(), "total_sales": 10, "cash": 10, "upi": 0, "pending": 0, "expenses": 25, "created_at": now_iso}],
+        "daily_sales": [{"id": "demo-sale-1", "medicine_id": "demo-med-1", "medicine_name": "Paracetamol 500mg", "quantity": 5, "unit_type": "unit", "total_amount": 10, "customer_name": "Demo Customer", "payment_status": "paid", "sale_date": datetime.now(timezone.utc).date().isoformat(), "created_at": now_iso}],
+        "settings": [{"id": "demo-settings-main", "key": "main", "business_name": "Demo Pharmacy", "business_address": "Demo shop — isolated sample data", "business_phone": "555-0100", "business_gstin": "", "signature_b64": ""}],
     }
     for collection_name, documents in demo_documents.items():
         collection = raw_db[collection_name]
+        demo_ids = [document["id"] for document in documents]
+        await collection.delete_many({"id": {"$in": demo_ids}, "tenant_id": {"$ne": DEMO_TENANT_ID}})
         for document in documents:
             owned = {**document, "tenant_id": DEMO_TENANT_ID, "shop_id": DEMO_TENANT_ID}
             await collection.replace_one({"id": document["id"], "tenant_id": DEMO_TENANT_ID}, owned, upsert=True)
@@ -1269,6 +1296,7 @@ async def register(payload: UserRegister):
 
 
 def _login_response(user: dict, response: Response) -> dict:
+    user = _canonicalize_user_tenant(user)
     token = create_access_token(user["id"], user.get("email", user.get("mobile", "")), user["role"])
     response.set_cookie("access_token", token, httponly=True, samesite="lax", secure=ENVIRONMENT in {"production", "prod"}, max_age=43200, path="/")
     return {
