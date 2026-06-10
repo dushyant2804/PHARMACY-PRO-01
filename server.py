@@ -220,6 +220,7 @@ FORGOT_PASSWORD_WINDOW_MINUTES = 15
 SIGNUP_OTP_TTL_MINUTES = 10
 SIGNUP_OTP_ATTEMPTS = 5
 APP_VERSION = os.environ.get("APP_VERSION", "2.0.0")
+APP_BUILD = os.environ.get("APP_BUILD", APP_VERSION)
 APP_UPDATE_MESSAGE = os.environ.get("APP_UPDATE_MESSAGE", "Backend security, onboarding, analytics, and purchase-order adjustment update")
 APP_RELEASE_NOTES = [
     "Isolated, restart-safe demo pharmacy tenant",
@@ -274,7 +275,7 @@ async def tenant_security_context(request: Request, call_next):
                     _current_demo.set(bool(user.get("is_demo")))
             except jwt.InvalidTokenError:
                 pass
-        if _current_demo.get() and request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in {"/api/auth/login", "/api/auth/logout"}:
+        if _current_demo.get() and request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in {"/api/auth/login", "/api/auth/demo-login", "/api/auth/logout"}:
             return JSONResponse(status_code=403, content={"detail": "Demo account is read-only"})
         return await call_next(request)
     finally:
@@ -310,6 +311,10 @@ def parse_expiry_date(expiry):
         return datetime.fromisoformat(value).date()
     except Exception:
         return None
+
+
+def _available_stock(medicine: dict) -> float:
+    return max(0.0, float(medicine.get("purchased_units", 0) or 0) - float(medicine.get("sold_units", 0) or 0))
 
 
 def expiry_details(expiry, today):
@@ -976,17 +981,21 @@ async def _backfill_tenant_data(now_iso: str) -> None:
 
 
 async def _seed_demo_data(now_iso: str) -> None:
-    demo_email = os.environ.get("DEMO_EMAIL", "demo@pharmacy.com").lower()
+    demo_email = os.environ.get("DEMO_EMAIL", "demo@pharmacy.com").strip().lower()
     demo_password = os.environ.get("DEMO_PASSWORD", "DemoAccess123")
-    await raw_db.users.update_one(
-        {"email": demo_email},
-        {"$setOnInsert": {
-            "id": "demo-user", "email": demo_email, "name": "Demo Pharmacist",
-            "role": "admin", "created_at": now_iso,
-        }, "$set": {
+    await raw_db.users.delete_many({
+        "tenant_id": DEMO_TENANT_ID,
+        "id": {"$ne": "demo-user"},
+        "is_demo": True,
+    })
+    await raw_db.users.replace_one(
+        {"id": "demo-user"},
+        {
+            "id": "demo-user", "email": demo_email, "name": "Demo Pharmacist", "role": "admin",
             "password_hash": hash_password(demo_password), "password_changed_at": now_iso,
             "tenant_id": DEMO_TENANT_ID, "shop_id": DEMO_TENANT_ID, "is_demo": True, "active": True,
-        }},
+            "created_at": now_iso,
+        },
         upsert=True,
     )
     demo_documents = {
@@ -1133,8 +1142,10 @@ async def _send_signup_otp(method: str, identifier: str, otp: str) -> bool:
 
 
 @api_router.get("/version")
-async def version():
-    return {"version": APP_VERSION, "message": APP_UPDATE_MESSAGE, "release_notes": APP_RELEASE_NOTES}
+async def version(response: Response = None):
+    if response is not None:
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+    return {"version": APP_VERSION, "build": APP_BUILD, "message": APP_UPDATE_MESSAGE, "release_notes": APP_RELEASE_NOTES}
 
 
 @api_router.post("/auth/signup/request-otp")
@@ -1207,12 +1218,7 @@ async def register(payload: UserRegister):
     return await _create_user(payload, "cashier")
 
 
-@api_router.post("/auth/login")
-async def login(payload: UserLogin, response: Response):
-    identifier = str(payload.email or payload.mobile or payload.identifier or "").strip().lower()
-    user = await raw_db.users.find_one({"$or": [{"email": identifier}, {"mobile": identifier}]})
-    if not user or user.get("active", True) is False or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+def _login_response(user: dict, response: Response) -> dict:
     token = create_access_token(user["id"], user.get("email", user.get("mobile", "")), user["role"])
     response.set_cookie("access_token", token, httponly=True, samesite="lax", secure=ENVIRONMENT in {"production", "prod"}, max_age=43200, path="/")
     return {
@@ -1220,6 +1226,25 @@ async def login(payload: UserLogin, response: Response):
         "tenant_id": user["tenant_id"], "shop_id": user.get("shop_id", user["tenant_id"]), "is_demo": bool(user.get("is_demo")),
         "password_expired": _password_expired(user), "token": token,
     }
+
+
+@api_router.post("/auth/login")
+async def login(payload: UserLogin, response: Response):
+    identifier = str(payload.email or payload.mobile or payload.identifier or "").strip().lower()
+    user = await raw_db.users.find_one({"$or": [{"email": identifier}, {"mobile": identifier}]})
+    if not user or user.get("active", True) is False or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return _login_response(user, response)
+
+
+@api_router.post("/auth/demo-login")
+async def demo_login(response: Response):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await _seed_demo_data(now_iso)
+    user = await raw_db.users.find_one({"id": "demo-user", "tenant_id": DEMO_TENANT_ID, "is_demo": True, "active": True})
+    if not user:
+        raise HTTPException(status_code=503, detail="Demo account is unavailable")
+    return _login_response(user, response)
 
 
 @api_router.post("/auth/logout")
@@ -4775,6 +4800,9 @@ async def dashboard_summary(
                 "threshold": threshold,
             })
 
+        if available <= 0:
+            continue
+
         expiry_info = expiry_details(
             m.get("expiry_date"),
             today
@@ -5137,6 +5165,8 @@ async def expiry_report(user: dict = Depends(get_current_user)):
     expired, near = [], []
 
     for m in medicines:
+        if _available_stock(m) <= 0:
+            continue
         details = expiry_details(
             m.get("expiry_date"),
             today
@@ -5220,22 +5250,23 @@ async def _analytics_snapshot(months: int = 12, limit: int = 10) -> dict:
     cutoff_iso = cutoff.isoformat()
 
     invoices = await db.invoices.find({"created_at": {"$gte": cutoff_iso}}, {"_id": 0}).to_list(10000)
-    purchase_orders = await db.purchase_orders.find({"created_at": {"$gte": cutoff_iso}}, {"_id": 0}).to_list(10000)
+    purchase_orders = await db.purchase_orders.find({}, {"_id": 0}).to_list(10000)
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(10000)
-    customer_txns = await db.customer_transactions.find({"created_at": {"$gte": cutoff_iso}}, {"_id": 0}).to_list(10000)
+    customer_txns = await db.customer_transactions.find({}, {"_id": 0}).to_list(10000)
+    distributor_txns = await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000)
 
     sales_by_month = defaultdict(float)
     purchases_by_month = defaultdict(float)
     payment_modes = defaultdict(float)
     medicine_sales = defaultdict(lambda: {"quantity": 0.0, "revenue": 0.0})
-    recovery_by_month = defaultdict(lambda: {"charged": 0.0, "recovered": 0.0})
+    recovery_by_month = defaultdict(lambda: {"customer_charged": 0.0, "customer_recovered": 0.0, "distributor_charged": 0.0, "distributor_recovered": 0.0})
 
     for invoice in invoices:
         month = _month_key(invoice.get("created_at"))
         total = float(invoice.get("total", invoice.get("grand_total", 0)) or 0)
         if month:
             sales_by_month[month] += total
-        payment_modes[str(invoice.get("payment_mode") or "unknown").lower()] += total
+            payment_modes[str(invoice.get("payment_mode") or "unknown").lower()] += total
         for item in invoice.get("items", []):
             name = str(item.get("name") or "Unknown")
             quantity = float(item.get("units_dispensed", item.get("quantity", 0)) or 0)
@@ -5244,37 +5275,57 @@ async def _analytics_snapshot(months: int = 12, limit: int = 10) -> dict:
 
     for po in purchase_orders:
         month = _month_key(po.get("created_at") or po.get("po_date"))
-        if month:
+        if month and month >= cutoff.strftime("%Y-%m"):
             purchases_by_month[month] += float(po.get("final_payable_total", po.get("grand_total", 0)) or 0)
 
     for txn in customer_txns:
-        month = _month_key(txn.get("created_at"))
-        if not month:
+        month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+        if not month or month < cutoff.strftime("%Y-%m"):
             continue
         if txn.get("type") == "sale":
-            recovery_by_month[month]["charged"] += float(txn.get("amount", 0) or 0)
+            recovery_by_month[month]["customer_charged"] += float(txn.get("amount", 0) or 0)
         elif txn.get("type") == "payment":
-            recovery_by_month[month]["recovered"] += float(txn.get("amount", 0) or 0)
+            recovery_by_month[month]["customer_recovered"] += float(txn.get("amount", 0) or 0)
+
+    for txn in distributor_txns:
+        month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+        if not month or month < cutoff.strftime("%Y-%m"):
+            continue
+        txn_type = str(txn.get("type") or "").lower()
+        if txn_type in {"purchase", "opening_balance"}:
+            recovery_by_month[month]["distributor_charged"] += float(txn.get("amount", 0) or 0)
+        elif txn_type in {"payment", "purchase_return", "credit", "credit_adjustment"}:
+            recovery_by_month[month]["distributor_recovered"] += float(txn.get("amount", 0) or 0)
 
     expiry_buckets = {"expired": {"count": 0, "units": 0.0, "cost_value": 0.0}, "within_30_days": {"count": 0, "units": 0.0, "cost_value": 0.0}, "within_90_days": {"count": 0, "units": 0.0, "cost_value": 0.0}, "safe": {"count": 0, "units": 0.0, "cost_value": 0.0}}
     today = datetime.now(timezone.utc).date()
     for medicine in medicines:
-        available = max(0.0, float(medicine.get("purchased_units", 0) or 0) - float(medicine.get("sold_units", 0) or 0))
-        expiry = parse_expiry_date(medicine.get("expiry_date"))
-        days = (expiry - today).days if expiry else 999999
-        bucket = "expired" if days < 0 else "within_30_days" if days <= 30 else "within_90_days" if days <= 90 else "safe"
+        available = _available_stock(medicine)
+        if available <= 0:
+            continue
+        details = expiry_details(medicine.get("expiry_date"), today)
+        days = details["days_to_expiry"]
+        bucket = "expired" if details["expiry_status"] == "expired" else "within_30_days" if days is not None and days <= 30 else "within_90_days" if details["expiry_status"] == "warning" else "safe"
         expiry_buckets[bucket]["count"] += 1
         expiry_buckets[bucket]["units"] += available
         expiry_buckets[bucket]["cost_value"] += available * float(medicine.get("purchase_price", 0) or 0)
 
-    month_keys = sorted(set(sales_by_month) | set(purchases_by_month) | set(recovery_by_month))
+    purchase_sales_months = sorted(set(sales_by_month) | set(purchases_by_month))
+    recovery_months = sorted(recovery_by_month)
+    recovery_trends = []
+    for month in recovery_months:
+        values = recovery_by_month[month]
+        charged = values["customer_charged"] + values["distributor_charged"]
+        recovered = values["customer_recovered"] + values["distributor_recovered"]
+        recovery_trends.append({"month": month, **{key: round(value, 2) for key, value in values.items()}, "charged": round(charged, 2), "recovered": round(recovered, 2), "net_outstanding_change": round(charged - recovered, 2)})
+
     return {
-        "monthly_sales_trend": [{"month": month, "sales": round(sales_by_month[month], 2)} for month in month_keys],
+        "monthly_sales_trend": [{"month": month, "sales": round(sales_by_month[month], 2)} for month in sorted(sales_by_month)],
         "top_selling_medicines": [{"medicine_name": name, "quantity": round(values["quantity"], 2), "revenue": round(values["revenue"], 2)} for name, values in sorted(medicine_sales.items(), key=lambda item: item[1]["quantity"], reverse=True)[:limit]],
         "expiry_risk": [{"bucket": bucket, "count": values["count"], "units": round(values["units"], 2), "cost_value": round(values["cost_value"], 2)} for bucket, values in expiry_buckets.items()],
         "payment_mode_distribution": [{"mode": mode, "amount": round(amount, 2)} for mode, amount in sorted(payment_modes.items())],
-        "purchase_vs_sales": [{"month": month, "purchases": round(purchases_by_month[month], 2), "sales": round(sales_by_month[month], 2)} for month in month_keys],
-        "outstanding_recovery_trends": [{"month": month, "charged": round(recovery_by_month[month]["charged"], 2), "recovered": round(recovery_by_month[month]["recovered"], 2), "net_outstanding_change": round(recovery_by_month[month]["charged"] - recovery_by_month[month]["recovered"], 2)} for month in month_keys],
+        "purchase_vs_sales": [{"month": month, "purchases": round(purchases_by_month[month], 2), "sales": round(sales_by_month[month], 2)} for month in purchase_sales_months],
+        "outstanding_recovery_trends": recovery_trends,
     }
 
 
@@ -5441,6 +5492,10 @@ def _calculate_purchase_order_totals(payload: POCreate) -> dict:
     }
 
 
+def _purchase_return_credit(item: dict) -> float:
+    return round(float(item.get("return_quantity", 0) or 0) * float(item.get("purchase_rate", 0) or 0), 2)
+
+
 async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[str] = None) -> tuple[list[dict], float]:
     return_ids = list(dict.fromkeys(payload.purchase_return_ids))
     if not return_ids:
@@ -5454,7 +5509,9 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
         assigned_po = item.get("po_adjustment_id")
         if assigned_po and assigned_po != allow_po_id:
             raise HTTPException(status_code=409, detail="Purchase return credit is already assigned to another purchase order")
-    credit = round(sum(float(item.get("return_amount", 0) or 0) for item in returns), 2)
+    for item in returns:
+        item["return_amount"] = _purchase_return_credit(item)
+    credit = round(sum(item["return_amount"] for item in returns), 2)
     return returns, credit
 
 
@@ -5464,14 +5521,36 @@ def _apply_po_return_credit(po_totals: dict, returns: list[dict], credit: float)
         "purchase_return_adjustment": credit,
         "purchase_return_details": [{"id": item["id"], "medicine_name": item.get("medicine_name"), "batch_number": item.get("batch_number"), "return_amount": round(float(item.get("return_amount", 0) or 0), 2)} for item in returns],
         "subtotal_after_purchase_return": round(max(0.0, float(po_totals.get("sub_total", po_totals["grand_total"])) - credit), 2),
-        "final_payable_total": round(max(0.0, float(po_totals["grand_total"]) - credit), 2),
+        "final_payable_total": round(max(0.0, float(po_totals.get("sub_total", po_totals["grand_total"])) - credit), 2),
     }
 
 
 @api_router.get("/purchase-orders/eligible-purchase-returns/{distributor_id}")
 async def eligible_po_purchase_returns(distributor_id: str, user: dict = Depends(get_current_user)):
     returns = await db.purchase_returns.find({"distributor_id": distributor_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]}, {"_id": 0}).sort("return_date", -1).to_list(1000)
-    return [{"id": item["id"], "medicine_id": item.get("medicine_id"), "medicine_name": item.get("medicine_name"), "batch_number": item.get("batch_number"), "return_quantity": item.get("return_quantity"), "return_amount": item.get("return_amount"), "return_date": item.get("return_date")} for item in returns]
+    result = []
+    for item in returns:
+        medicine = await db.medicines.find_one({"id": item.get("medicine_id")}, {"_id": 0}) if item.get("medicine_id") else None
+        medicine = medicine or {}
+        credit = _purchase_return_credit(item)
+        result.append({
+            "id": item["id"], "medicine_id": item.get("medicine_id"),
+            "medicine_name": item.get("medicine_name") or medicine.get("name"),
+            "batch_number": item.get("batch_number") or medicine.get("batch_no"),
+            "expiry_date": item.get("expiry_date") or medicine.get("expiry_date"),
+            "manufacturer": item.get("manufacturer") or medicine.get("manufacturer"),
+            "category": item.get("category") or medicine.get("category"),
+            "purchase_rate": float(item.get("purchase_rate", medicine.get("purchase_price", 0)) or 0),
+            "mrp": float(item.get("mrp", medicine.get("mrp", 0)) or 0),
+            "gst_rate": float(item.get("gst_rate", medicine.get("gst_rate", 0)) or 0),
+            "available_return_quantity": float(item.get("return_quantity", 0) or 0),
+            "return_quantity": float(item.get("return_quantity", 0) or 0),
+            "distributor_id": item.get("distributor_id"),
+            "distributor_name": item.get("distributor") or item.get("distributor_name"),
+            "calculated_return_credit_amount": credit, "return_amount": credit,
+            "return_date": item.get("return_date"),
+        })
+    return result
 
 
 @api_router.post("/purchase-orders")
