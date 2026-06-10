@@ -4,7 +4,7 @@ Pharmacy management API with backend-enforced tenant isolation.
 
 ## Tenant and demo isolation
 
-At startup, records without a `tenant_id` are assigned to `REAL_TENANT_ID` (default: `real_shop`) without deleting existing records. The seeded demo account uses `DEMO_TENANT_ID` (default: `demo_shop`) and receives its own distributors, medicines, customers, purchase order, invoice, ledger transactions, expense, and daily summary. All business collection access is scoped by the authenticated user's tenant in the backend, and demo writes are rejected with HTTP 403.
+At startup, records without a `tenant_id` are assigned to `REAL_TENANT_ID` (default: `real_shop`) without deleting existing records. The seeded demo account always uses the fixed `demo_shop` tenant/shop and receives its own settings, distributors, medicines, customers, purchase order, invoice, ledger transactions, expense, daily sale, and daily summary. All business collection access is scoped by the authenticated user's tenant in the backend, and demo writes are rejected with HTTP 403.
 
 Demo credentials can be configured with `DEMO_EMAIL` and `DEMO_PASSWORD`. Defaults are `demo@pharmacy.com` and `DemoAccess123`; production deployments should explicitly set them.
 
