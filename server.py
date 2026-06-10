@@ -13,6 +13,8 @@ import hashlib
 import hmac
 import secrets
 import smtplib
+import json
+import urllib.request
 from contextvars import ContextVar
 from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta, date
@@ -86,6 +88,7 @@ class TenantAwareCollection:
             if not tenant_id:
                 raise HTTPException(status_code=401, detail="Not authenticated")
             result["tenant_id"] = tenant_id
+            result["shop_id"] = tenant_id
         return result
 
     def find(self, query=None, *args, **kwargs):
@@ -111,7 +114,7 @@ class TenantAwareCollection:
         if not _request_active.get() or not isinstance(update, dict) or any(not str(k).startswith("$") for k in update):
             return update
         result = dict(update)
-        result["$setOnInsert"] = {**result.get("$setOnInsert", {}), "tenant_id": _current_tenant.get()}
+        result["$setOnInsert"] = {**result.get("$setOnInsert", {}), "tenant_id": _current_tenant.get(), "shop_id": _current_tenant.get()}
         return result
 
     async def update_one(self, query, update, *args, **kwargs):
@@ -214,6 +217,16 @@ PASSWORD_RESET_ATTEMPTS = 5
 PASSWORD_RESET_TTL_MINUTES = 10
 FORGOT_PASSWORD_RATE_LIMIT = 5
 FORGOT_PASSWORD_WINDOW_MINUTES = 15
+SIGNUP_OTP_TTL_MINUTES = 10
+SIGNUP_OTP_ATTEMPTS = 5
+APP_VERSION = os.environ.get("APP_VERSION", "2.0.0")
+APP_UPDATE_MESSAGE = os.environ.get("APP_UPDATE_MESSAGE", "Backend security, onboarding, analytics, and purchase-order adjustment update")
+APP_RELEASE_NOTES = [
+    "Isolated, restart-safe demo pharmacy tenant",
+    "Verified email or mobile self-signup with pharmacy onboarding",
+    "Tenant-safe report analytics APIs",
+    "Purchase-return credit adjustments for purchase orders",
+]
 
 
 def _password_expired(user: dict, now: Optional[datetime] = None) -> bool:
@@ -474,8 +487,45 @@ class UserCreateByAdmin(UserRegister):
 
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: Optional[EmailStr] = None
+    mobile: Optional[str] = None
+    identifier: Optional[str] = None
     password: str
+
+    @model_validator(mode="after")
+    def require_identifier(self):
+        if not (self.email or self.mobile or self.identifier):
+            raise ValueError("email, mobile, or identifier is required")
+        return self
+
+
+class SignupRequest(BaseModel):
+    email: Optional[EmailStr] = None
+    mobile: Optional[str] = None
+    password: str
+    pharmacy_name: str
+    owner_name: str
+    gst: str = ""
+    contact: str
+    address: str
+    state: str
+    pincode: str
+    method: Optional[Literal["email", "mobile"]] = None
+
+    @model_validator(mode="after")
+    def validate_signup_method(self):
+        method = self.method or ("email" if self.email else "mobile")
+        if method == "email" and not self.email:
+            raise ValueError("email is required for email OTP signup")
+        if method == "mobile" and not self.mobile:
+            raise ValueError("mobile is required for mobile OTP signup")
+        self.method = method
+        return self
+
+
+class SignupVerify(BaseModel):
+    verification_id: str
+    otp: str
 
 
 class ChangePasswordRequest(BaseModel):
@@ -914,12 +964,14 @@ async def _backfill_tenant_data(now_iso: str) -> None:
         {"password_changed_at": {"$exists": False}},
         {"$set": {"password_changed_at": now_iso}},
     )
+    await raw_db.users.update_many({"shop_id": {"$exists": False}}, [{"$set": {"shop_id": "$tenant_id"}}])
     for collection_name in BUSINESS_COLLECTIONS:
         collection = raw_db[collection_name]
         await collection.update_many(
             {"tenant_id": {"$exists": False}},
             {"$set": {"tenant_id": REAL_TENANT_ID}},
         )
+        await collection.update_many({"shop_id": {"$exists": False}}, [{"$set": {"shop_id": "$tenant_id"}}])
         await collection.create_index("tenant_id")
 
 
@@ -929,10 +981,12 @@ async def _seed_demo_data(now_iso: str) -> None:
     await raw_db.users.update_one(
         {"email": demo_email},
         {"$setOnInsert": {
-            "id": "demo-user", "email": demo_email, "password_hash": hash_password(demo_password),
-            "name": "Demo Pharmacist", "role": "admin", "created_at": now_iso,
-            "password_changed_at": now_iso,
-        }, "$set": {"tenant_id": DEMO_TENANT_ID, "is_demo": True}},
+            "id": "demo-user", "email": demo_email, "name": "Demo Pharmacist",
+            "role": "admin", "created_at": now_iso,
+        }, "$set": {
+            "password_hash": hash_password(demo_password), "password_changed_at": now_iso,
+            "tenant_id": DEMO_TENANT_ID, "shop_id": DEMO_TENANT_ID, "is_demo": True, "active": True,
+        }},
         upsert=True,
     )
     demo_documents = {
@@ -952,7 +1006,7 @@ async def _seed_demo_data(now_iso: str) -> None:
     for collection_name, documents in demo_documents.items():
         collection = raw_db[collection_name]
         for document in documents:
-            owned = {**document, "tenant_id": DEMO_TENANT_ID}
+            owned = {**document, "tenant_id": DEMO_TENANT_ID, "shop_id": DEMO_TENANT_ID}
             await collection.replace_one({"id": document["id"], "tenant_id": DEMO_TENANT_ID}, owned, upsert=True)
 
 
@@ -960,21 +1014,29 @@ async def _seed_demo_data(now_iso: str) -> None:
 async def startup():
     now_iso = datetime.now(timezone.utc).isoformat()
     await raw_db.users.create_index("email", unique=True)
+    await raw_db.users.create_index("mobile", unique=True, sparse=True)
     await raw_db.password_reset_requests.create_index("created_at", expireAfterSeconds=FORGOT_PASSWORD_WINDOW_MINUTES * 60)
+    await raw_db.pending_signups.create_index("expires_at", expireAfterSeconds=0)
     await _backfill_tenant_data(now_iso)
     for collection_name, indexes in {
         "medicines": ["name", "barcode"], "invoices": ["created_at"],
-        "purchase_returns": ["return_date", "distributor", "medicine_name", "reason", "ledger_adjusted"],
+        "purchase_returns": ["return_date", "distributor", "medicine_name", "reason", "ledger_adjusted", "po_adjustment_id"],
     }.items():
         for index in indexes:
             await raw_db[collection_name].create_index(index)
+    for collection_name, date_field in {
+        "invoices": "created_at", "purchase_orders": "created_at",
+        "customer_transactions": "created_at", "purchase_returns": "return_date",
+    }.items():
+        await raw_db[collection_name].create_index([("tenant_id", 1), (date_field, -1)])
+    await raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)])
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@pharmacy.com").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await raw_db.users.find_one({"email": admin_email})
     if not existing:
         await raw_db.users.insert_one({
             "id": str(uuid.uuid4()), "email": admin_email, "password_hash": hash_password(admin_password),
-            "name": "Administrator", "role": "admin", "tenant_id": REAL_TENANT_ID, "is_demo": False,
+            "name": "Administrator", "role": "admin", "tenant_id": REAL_TENANT_ID, "shop_id": REAL_TENANT_ID, "is_demo": False,
             "created_at": now_iso, "password_changed_at": now_iso,
         })
         logger.info("Seeded admin user: %s", admin_email)
@@ -999,8 +1061,9 @@ async def _create_user(payload: UserRegister, role: str, tenant_id: Optional[str
         "name": payload.name, "role": role, "tenant_id": tenant_id or f"shop_{uuid.uuid4().hex}",
         "is_demo": False, "created_at": now_iso, "password_changed_at": now_iso,
     }
+    user["shop_id"] = user["tenant_id"]
     await raw_db.users.insert_one(user)
-    return {key: user[key] for key in ("id", "email", "name", "role", "tenant_id", "is_demo")}
+    return {key: user[key] for key in ("id", "email", "name", "role", "tenant_id", "shop_id", "is_demo")}
 
 
 async def _send_password_reset_email(email: str, otp: str) -> bool:
@@ -1029,6 +1092,116 @@ async def _send_password_reset_email(email: str, otp: str) -> bool:
     return True
 
 
+def _signup_identifier(payload: SignupRequest) -> str:
+    return str(payload.email if payload.method == "email" else payload.mobile).strip().lower()
+
+
+async def _send_signup_otp(method: str, identifier: str, otp: str) -> bool:
+    if method == "email":
+        host = os.environ.get("SMTP_HOST")
+        sender = os.environ.get("SMTP_FROM")
+        if not host or not sender:
+            return False
+        message = EmailMessage()
+        message["Subject"] = "Pharmacy Pro signup verification code"
+        message["From"] = sender
+        message["To"] = identifier
+        message.set_content(f"Your Pharmacy Pro signup code expires in 10 minutes: {otp}")
+
+        def send_email():
+            with smtplib.SMTP(host, int(os.environ.get("SMTP_PORT", "587")), timeout=10) as smtp:
+                if os.environ.get("SMTP_STARTTLS", "true").lower() == "true":
+                    smtp.starttls()
+                if os.environ.get("SMTP_USERNAME") and os.environ.get("SMTP_PASSWORD"):
+                    smtp.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
+                smtp.send_message(message)
+
+        await asyncio.to_thread(send_email)
+        return True
+
+    webhook = os.environ.get("SMS_OTP_WEBHOOK_URL")
+    if not webhook:
+        return False
+
+    def send_sms():
+        body = json.dumps({"mobile": identifier, "otp": otp, "purpose": "signup"}).encode()
+        request = urllib.request.Request(webhook, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return 200 <= response.status < 300
+
+    return bool(await asyncio.to_thread(send_sms))
+
+
+@api_router.get("/version")
+async def version():
+    return {"version": APP_VERSION, "message": APP_UPDATE_MESSAGE, "release_notes": APP_RELEASE_NOTES}
+
+
+@api_router.post("/auth/signup/request-otp")
+async def request_signup_otp(payload: SignupRequest):
+    _validate_password_strength(payload.password)
+    identifier = _signup_identifier(payload)
+    existing_query = {"email": identifier} if payload.method == "email" else {"mobile": identifier}
+    if await raw_db.users.find_one(existing_query):
+        raise HTTPException(status_code=400, detail=f"{payload.method.title()} already registered")
+
+    verification_id = str(uuid.uuid4())
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    now = datetime.now(timezone.utc)
+    pending = {
+        "id": verification_id,
+        "method": payload.method,
+        "identifier": identifier,
+        "otp_hash": _otp_hash(identifier, otp),
+        "attempts": 0,
+        "expires_at": now + timedelta(minutes=SIGNUP_OTP_TTL_MINUTES),
+        "created_at": now,
+        "payload": payload.model_dump(mode="json", exclude={"password"}),
+        "password_hash": hash_password(payload.password),
+    }
+    await raw_db.pending_signups.replace_one({"identifier": identifier}, pending, upsert=True)
+    delivered = await _send_signup_otp(payload.method, identifier, otp)
+    response = {"verification_id": verification_id, "method": payload.method, "delivered": delivered, "expires_in_seconds": SIGNUP_OTP_TTL_MINUTES * 60}
+    if not delivered and ENVIRONMENT not in {"production", "prod"}:
+        response["debug_otp"] = otp
+    return response
+
+
+@api_router.post("/auth/signup/verify")
+async def verify_signup_otp(payload: SignupVerify):
+    pending = await raw_db.pending_signups.find_one({"id": payload.verification_id})
+    now = datetime.now(timezone.utc)
+    if not pending or pending.get("attempts", 0) >= SIGNUP_OTP_ATTEMPTS or pending.get("expires_at") < now:
+        raise HTTPException(status_code=400, detail="OTP verification expired or invalid")
+    if not hmac.compare_digest(pending["otp_hash"], _otp_hash(pending["identifier"], payload.otp)):
+        await raw_db.pending_signups.update_one({"id": payload.verification_id}, {"$inc": {"attempts": 1}})
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+
+    signup = pending["payload"]
+    method = pending["method"]
+    tenant_id = f"shop_{uuid.uuid4().hex}"
+    identifier = pending["identifier"]
+    email = identifier if method == "email" else f"mobile-{hashlib.sha256(identifier.encode()).hexdigest()[:20]}@mobile.pharmacy.invalid"
+    if await raw_db.users.find_one({"$or": [{"email": email}, {"mobile": identifier}]}):
+        raise HTTPException(status_code=400, detail="Account already registered")
+    user = {
+        "id": str(uuid.uuid4()), "email": email, "mobile": signup.get("mobile"),
+        "password_hash": pending["password_hash"], "name": signup["owner_name"], "role": "admin",
+        "tenant_id": tenant_id, "shop_id": tenant_id, "is_demo": False, "active": True, "verified_at": now.isoformat(),
+        "created_at": now.isoformat(), "password_changed_at": now.isoformat(),
+    }
+    pharmacy = {
+        "key": "main", "business_name": signup["pharmacy_name"], "owner_name": signup["owner_name"],
+        "business_gstin": signup.get("gst", ""), "business_phone": signup["contact"],
+        "business_address": signup["address"], "state": signup["state"], "pincode": signup["pincode"],
+        "tenant_id": tenant_id, "shop_id": tenant_id, "created_at": now.isoformat(),
+    }
+    await raw_db.users.insert_one(user)
+    await raw_db.settings.insert_one(pharmacy)
+    await raw_db.pending_signups.delete_one({"id": payload.verification_id})
+    return {"id": user["id"], "email": user["email"], "mobile": user.get("mobile"), "name": user["name"], "role": user["role"], "tenant_id": tenant_id, "shop_id": tenant_id, "verified": True}
+
+
 @api_router.post("/auth/register")
 async def register(payload: UserRegister):
     return await _create_user(payload, "cashier")
@@ -1036,15 +1209,15 @@ async def register(payload: UserRegister):
 
 @api_router.post("/auth/login")
 async def login(payload: UserLogin, response: Response):
-    email = payload.email.lower()
-    user = await raw_db.users.find_one({"email": email})
-    if not user or not verify_password(payload.password, user["password_hash"]):
+    identifier = str(payload.email or payload.mobile or payload.identifier or "").strip().lower()
+    user = await raw_db.users.find_one({"$or": [{"email": identifier}, {"mobile": identifier}]})
+    if not user or user.get("active", True) is False or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_access_token(user["id"], user["email"], user["role"])
+    token = create_access_token(user["id"], user.get("email", user.get("mobile", "")), user["role"])
     response.set_cookie("access_token", token, httponly=True, samesite="lax", secure=ENVIRONMENT in {"production", "prod"}, max_age=43200, path="/")
     return {
-        "id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"],
-        "tenant_id": user["tenant_id"], "is_demo": bool(user.get("is_demo")),
+        "id": user["id"], "email": user.get("email"), "mobile": user.get("mobile"), "name": user["name"], "role": user["role"],
+        "tenant_id": user["tenant_id"], "shop_id": user.get("shop_id", user["tenant_id"]), "is_demo": bool(user.get("is_demo")),
         "password_expired": _password_expired(user), "token": token,
     }
 
@@ -5027,6 +5200,95 @@ async def top_medicines(start: str, end: str, user: dict = Depends(get_current_u
     return result[:20]
 
 
+# ---------------- Analytics (compact, tenant-scoped payloads) ----------------
+def _analytics_date(value, fallback: Optional[date] = None) -> Optional[date]:
+    parsed = parse_iso_date(value)
+    return parsed or fallback
+
+
+def _month_key(value) -> Optional[str]:
+    parsed = _analytics_date(value)
+    return parsed.strftime("%Y-%m") if parsed else None
+
+
+async def _analytics_snapshot(months: int = 12, limit: int = 10) -> dict:
+    months = max(1, min(months, 36))
+    limit = max(1, min(limit, 50))
+    cutoff = datetime.now(timezone.utc).date().replace(day=1)
+    for _ in range(months - 1):
+        cutoff = (cutoff - timedelta(days=1)).replace(day=1)
+    cutoff_iso = cutoff.isoformat()
+
+    invoices = await db.invoices.find({"created_at": {"$gte": cutoff_iso}}, {"_id": 0}).to_list(10000)
+    purchase_orders = await db.purchase_orders.find({"created_at": {"$gte": cutoff_iso}}, {"_id": 0}).to_list(10000)
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(10000)
+    customer_txns = await db.customer_transactions.find({"created_at": {"$gte": cutoff_iso}}, {"_id": 0}).to_list(10000)
+
+    sales_by_month = defaultdict(float)
+    purchases_by_month = defaultdict(float)
+    payment_modes = defaultdict(float)
+    medicine_sales = defaultdict(lambda: {"quantity": 0.0, "revenue": 0.0})
+    recovery_by_month = defaultdict(lambda: {"charged": 0.0, "recovered": 0.0})
+
+    for invoice in invoices:
+        month = _month_key(invoice.get("created_at"))
+        total = float(invoice.get("total", invoice.get("grand_total", 0)) or 0)
+        if month:
+            sales_by_month[month] += total
+        payment_modes[str(invoice.get("payment_mode") or "unknown").lower()] += total
+        for item in invoice.get("items", []):
+            name = str(item.get("name") or "Unknown")
+            quantity = float(item.get("units_dispensed", item.get("quantity", 0)) or 0)
+            medicine_sales[name]["quantity"] += quantity
+            medicine_sales[name]["revenue"] += float(item.get("line_total", item.get("price", item.get("mrp", 0)) * quantity) or 0)
+
+    for po in purchase_orders:
+        month = _month_key(po.get("created_at") or po.get("po_date"))
+        if month:
+            purchases_by_month[month] += float(po.get("final_payable_total", po.get("grand_total", 0)) or 0)
+
+    for txn in customer_txns:
+        month = _month_key(txn.get("created_at"))
+        if not month:
+            continue
+        if txn.get("type") == "sale":
+            recovery_by_month[month]["charged"] += float(txn.get("amount", 0) or 0)
+        elif txn.get("type") == "payment":
+            recovery_by_month[month]["recovered"] += float(txn.get("amount", 0) or 0)
+
+    expiry_buckets = {"expired": {"count": 0, "units": 0.0, "cost_value": 0.0}, "within_30_days": {"count": 0, "units": 0.0, "cost_value": 0.0}, "within_90_days": {"count": 0, "units": 0.0, "cost_value": 0.0}, "safe": {"count": 0, "units": 0.0, "cost_value": 0.0}}
+    today = datetime.now(timezone.utc).date()
+    for medicine in medicines:
+        available = max(0.0, float(medicine.get("purchased_units", 0) or 0) - float(medicine.get("sold_units", 0) or 0))
+        expiry = parse_expiry_date(medicine.get("expiry_date"))
+        days = (expiry - today).days if expiry else 999999
+        bucket = "expired" if days < 0 else "within_30_days" if days <= 30 else "within_90_days" if days <= 90 else "safe"
+        expiry_buckets[bucket]["count"] += 1
+        expiry_buckets[bucket]["units"] += available
+        expiry_buckets[bucket]["cost_value"] += available * float(medicine.get("purchase_price", 0) or 0)
+
+    month_keys = sorted(set(sales_by_month) | set(purchases_by_month) | set(recovery_by_month))
+    return {
+        "monthly_sales_trend": [{"month": month, "sales": round(sales_by_month[month], 2)} for month in month_keys],
+        "top_selling_medicines": [{"medicine_name": name, "quantity": round(values["quantity"], 2), "revenue": round(values["revenue"], 2)} for name, values in sorted(medicine_sales.items(), key=lambda item: item[1]["quantity"], reverse=True)[:limit]],
+        "expiry_risk": [{"bucket": bucket, "count": values["count"], "units": round(values["units"], 2), "cost_value": round(values["cost_value"], 2)} for bucket, values in expiry_buckets.items()],
+        "payment_mode_distribution": [{"mode": mode, "amount": round(amount, 2)} for mode, amount in sorted(payment_modes.items())],
+        "purchase_vs_sales": [{"month": month, "purchases": round(purchases_by_month[month], 2), "sales": round(sales_by_month[month], 2)} for month in month_keys],
+        "outstanding_recovery_trends": [{"month": month, "charged": round(recovery_by_month[month]["charged"], 2), "recovered": round(recovery_by_month[month]["recovered"], 2), "net_outstanding_change": round(recovery_by_month[month]["charged"] - recovery_by_month[month]["recovered"], 2)} for month in month_keys],
+    }
+
+
+@api_router.get("/reports/analytics")
+async def report_analytics(months: int = 12, limit: int = 10, user: dict = Depends(get_current_user)):
+    return await _analytics_snapshot(months, limit)
+
+
+@api_router.get("/reports/analytics/{report_name}")
+async def report_analytics_section(report_name: Literal["monthly-sales-trend", "top-selling-medicines", "expiry-risk", "payment-mode-distribution", "purchase-vs-sales", "outstanding-recovery-trends"], months: int = 12, limit: int = 10, user: dict = Depends(get_current_user)):
+    key = report_name.replace("-", "_")
+    return {"data": (await _analytics_snapshot(months, limit))[key]}
+
+
 # ---------------- Backup ----------------
 @api_router.get("/backup/export")
 async def backup_export(user: dict = Depends(require_role("admin"))):
@@ -5090,6 +5352,7 @@ class POCreate(BaseModel):
     total_sgst: float = 0
     round_off: float = 0
     grand_total: float = 0
+    purchase_return_ids: list[str] = Field(default_factory=list)
 
 
 MONEY = Decimal("0.01")
@@ -5178,6 +5441,39 @@ def _calculate_purchase_order_totals(payload: POCreate) -> dict:
     }
 
 
+async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[str] = None) -> tuple[list[dict], float]:
+    return_ids = list(dict.fromkeys(payload.purchase_return_ids))
+    if not return_ids:
+        return [], 0.0
+    returns = await db.purchase_returns.find({"id": {"$in": return_ids}}, {"_id": 0}).to_list(len(return_ids))
+    if len(returns) != len(return_ids):
+        raise HTTPException(status_code=400, detail="One or more selected purchase returns were not found")
+    for item in returns:
+        if item.get("distributor_id") and item.get("distributor_id") != payload.distributor_id:
+            raise HTTPException(status_code=400, detail="Purchase return distributor does not match purchase order distributor")
+        assigned_po = item.get("po_adjustment_id")
+        if assigned_po and assigned_po != allow_po_id:
+            raise HTTPException(status_code=409, detail="Purchase return credit is already assigned to another purchase order")
+    credit = round(sum(float(item.get("return_amount", 0) or 0) for item in returns), 2)
+    return returns, credit
+
+
+def _apply_po_return_credit(po_totals: dict, returns: list[dict], credit: float) -> dict:
+    return {
+        "purchase_return_ids": [item["id"] for item in returns],
+        "purchase_return_adjustment": credit,
+        "purchase_return_details": [{"id": item["id"], "medicine_name": item.get("medicine_name"), "batch_number": item.get("batch_number"), "return_amount": round(float(item.get("return_amount", 0) or 0), 2)} for item in returns],
+        "subtotal_after_purchase_return": round(max(0.0, float(po_totals.get("sub_total", po_totals["grand_total"])) - credit), 2),
+        "final_payable_total": round(max(0.0, float(po_totals["grand_total"]) - credit), 2),
+    }
+
+
+@api_router.get("/purchase-orders/eligible-purchase-returns/{distributor_id}")
+async def eligible_po_purchase_returns(distributor_id: str, user: dict = Depends(get_current_user)):
+    returns = await db.purchase_returns.find({"distributor_id": distributor_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]}, {"_id": 0}).sort("return_date", -1).to_list(1000)
+    return [{"id": item["id"], "medicine_id": item.get("medicine_id"), "medicine_name": item.get("medicine_name"), "batch_number": item.get("batch_number"), "return_quantity": item.get("return_quantity"), "return_amount": item.get("return_amount"), "return_date": item.get("return_date")} for item in returns]
+
+
 @api_router.post("/purchase-orders")
 async def create_po(
     payload: POCreate,
@@ -5199,6 +5495,8 @@ async def create_po(
         return expiry[:5]
 
     po_totals = _calculate_purchase_order_totals(payload)
+    selected_returns, return_credit = await _resolve_po_purchase_returns(payload)
+    return_adjustment = _apply_po_return_credit(po_totals, selected_returns, return_credit)
 
     po = {
     "id": str(uuid.uuid4()),
@@ -5228,6 +5526,7 @@ async def create_po(
     "round_off": po_totals["round_off"],
     "grand_total": po_totals["grand_total"],
     "gst_breakup": po_totals["gst_breakup"],
+    **return_adjustment,
 
     "notes": payload.notes,
     "created_at": datetime.now(timezone.utc).isoformat(),
@@ -5235,8 +5534,9 @@ async def create_po(
 }
 
     await db.purchase_orders.insert_one(po)
+    if return_adjustment["purchase_return_ids"]:
+        await db.purchase_returns.update_many({"id": {"$in": return_adjustment["purchase_return_ids"]}}, {"$set": {"po_adjustment_id": po["id"], "po_adjusted_at": datetime.now(timezone.utc).isoformat()}})
 
-    
     po.pop("_id", None)
     await rebuild_inventory()
     return po
@@ -5280,6 +5580,9 @@ async def delete_po(
                 }
             )
 
+    if po.get("purchase_return_ids"):
+        await db.purchase_returns.update_many({"id": {"$in": po["purchase_return_ids"]}, "po_adjustment_id": po_id}, {"$unset": {"po_adjustment_id": "", "po_adjusted_at": ""}})
+
     await db.purchase_orders.delete_one({
         "id": po_id
     })
@@ -5317,6 +5620,8 @@ async def update_po(
 # ONLY UPDATE PO — DO NOT TOUCH INVENTORY
 
     po_totals = _calculate_purchase_order_totals(payload)
+    selected_returns, return_credit = await _resolve_po_purchase_returns(payload, allow_po_id=po_id)
+    return_adjustment = _apply_po_return_credit(po_totals, selected_returns, return_credit)
 
     await db.purchase_orders.update_one(
         {"id": po_id},
@@ -5366,12 +5671,19 @@ async def update_po(
 
                 "gst_breakup":
                   po_totals["gst_breakup"],
+                **return_adjustment,
             }
         }
     )
+    old_return_ids = set(old_po.get("purchase_return_ids", []))
+    new_return_ids = set(return_adjustment["purchase_return_ids"])
+    if old_return_ids - new_return_ids:
+        await db.purchase_returns.update_many({"id": {"$in": list(old_return_ids - new_return_ids)}, "po_adjustment_id": po_id}, {"$unset": {"po_adjustment_id": "", "po_adjusted_at": ""}})
+    if new_return_ids:
+        await db.purchase_returns.update_many({"id": {"$in": list(new_return_ids)}}, {"$set": {"po_adjustment_id": po_id, "po_adjusted_at": datetime.now(timezone.utc).isoformat()}})
     await rebuild_inventory()
 
-    return {"message": "PO updated"}
+    return {"message": "PO updated", **return_adjustment}
 
 @api_router.get("/purchase-orders")
 async def list_pos(user: dict = Depends(get_current_user)):

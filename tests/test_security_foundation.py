@@ -69,7 +69,7 @@ class TenantIsolationTest(unittest.IsolatedAsyncioTestCase):
         demo = _current_demo.set(False)
         try:
             await scoped.insert_one({"id": "safe"})
-            collection.insert_one.assert_awaited_once_with({"id": "safe", "tenant_id": "real_shop"})
+            collection.insert_one.assert_awaited_once_with({"id": "safe", "tenant_id": "real_shop", "shop_id": "real_shop"})
         finally:
             _current_demo.reset(demo)
             _current_tenant.reset(tenant)
