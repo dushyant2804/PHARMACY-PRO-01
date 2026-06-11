@@ -17,9 +17,19 @@ class InMemoryUsers:
         self.users = [copy.deepcopy(user) for user in users]
         self.delete_queries = []
 
-    @staticmethod
-    def _matches(user, query):
-        return all(user.get(key) == value for key, value in query.items())
+    @classmethod
+    def _matches(cls, user, query):
+        if "$and" in query:
+            return all(cls._matches(user, condition) for condition in query["$and"])
+        if "$or" in query:
+            return any(cls._matches(user, condition) for condition in query["$or"])
+        for key, value in query.items():
+            if isinstance(value, dict) and "$ne" in value:
+                if user.get(key) == value["$ne"]:
+                    return False
+            elif user.get(key) != value:
+                return False
+        return True
 
     async def find_one(self, query, *args, **kwargs):
         return next(
@@ -80,14 +90,7 @@ class UserDeletionTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_real_login_returns_normal_auth_structure(self):
-        class LoginUsers(InMemoryUsers):
-            async def find_one(self, query, *args, **kwargs):
-                if "$or" in query:
-                    identifiers = {condition.get("email") or condition.get("mobile") for condition in query["$or"]}
-                    return next((copy.deepcopy(user) for user in self.users if user.get("email") in identifiers or user.get("mobile") in identifiers), None)
-                return await super().find_one(query, *args, **kwargs)
-
-        collection = LoginUsers([self.admin])
+        collection = InMemoryUsers([self.admin])
         with patch("server.raw_db", SimpleNamespace(users=collection)):
             result = await login(UserLogin(email=self.admin["email"], password=self.password), Response())
 
@@ -96,27 +99,17 @@ class UserDeletionTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["is_demo"])
         self.assertTrue(result["token"])
 
-    async def test_demo_login_uses_normal_login_contract_and_demo_tenant(self):
-        class DemoUsers(InMemoryUsers):
-            async def find_one(self, query, *args, **kwargs):
-                if "$or" in query:
-                    identifiers = {condition.get("email") or condition.get("mobile") for condition in query["$or"]}
-                    return next((copy.deepcopy(user) for user in self.users if user.get("email") in identifiers or user.get("mobile") in identifiers), None)
-                return await super().find_one(query, *args, **kwargs)
-
+    async def test_normal_login_rejects_demo_identity(self):
         demo_user = {
             **self.admin, "id": "demo-user", "email": "demo@pharmacy.com", "tenant_id": "demo_shop",
             "shop_id": "demo_shop", "is_demo": True, "active": True,
         }
-        collection = DemoUsers([demo_user])
+        collection = InMemoryUsers([demo_user])
         with patch("server.raw_db", SimpleNamespace(users=collection)):
-            result = await login(UserLogin(identifier="demo@pharmacy.com", password=self.password), Response())
+            with self.assertRaises(HTTPException) as raised:
+                await login(UserLogin(identifier="demo@pharmacy.com", password=self.password), Response())
 
-        self.assertEqual(result["id"], "demo-user")
-        self.assertEqual(result["tenant_id"], "demo_shop")
-        self.assertEqual(result["shop_id"], "demo_shop")
-        self.assertTrue(result["is_demo"])
-        self.assertTrue(result["token"])
+        self.assertEqual(raised.exception.status_code, 401)
 
     async def test_demo_button_endpoint_returns_normal_auth_structure(self):
         from unittest.mock import AsyncMock
