@@ -232,6 +232,7 @@ if not JWT_SECRET:
 
 logger = logging.getLogger("pharmacy")
 logging.basicConfig(level=logging.INFO)
+_background_tasks = set()
 
 EXPIRY_WARNING_DAYS = 90
 PASSWORD_MAX_AGE_DAYS = 183
@@ -1181,6 +1182,9 @@ async def startup():
         })
         logger.info("Seeded admin user: %s", admin_email)
     await _seed_demo_data(now_iso)
+    task = asyncio.create_task(_run_startup_purchase_return_stock_recalculation())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 @app.on_event("shutdown")
@@ -4368,6 +4372,225 @@ def _purchase_return_ledger_transaction(return_doc: dict) -> dict:
     }
 
 
+def _normalized_stock_match_value(value) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _normalized_stock_expiry(value) -> str:
+    parsed = parse_expiry_date(value)
+    return parsed.isoformat() if parsed else _normalized_stock_match_value(value)
+
+
+def _purchase_return_quantity(return_doc: dict) -> float:
+    return _stock_quantity(
+        return_doc,
+        "return_quantity",
+        "quantity",
+        "returned_quantity",
+        "returned_units",
+        "purchase_return_units",
+    )
+
+
+def _match_purchase_return_medicine(
+    return_doc: dict, medicines: list[dict], tenant_id: Optional[str] = None
+) -> Optional[dict]:
+    """Safely resolve a legacy purchase return to one unambiguous medicine batch."""
+    return_id = return_doc.get("id")
+
+    def unique_match(candidates: list[dict], method: str) -> Optional[dict]:
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            logger.warning(
+                "Purchase return stock repair ambiguous match tenant/shop=%s return_id=%s method=%s candidates=%s",
+                tenant_id, return_id, method, [item.get("id") or item.get("medicine_key") for item in candidates],
+            )
+        return None
+
+    medicine_id = return_doc.get("medicine_id")
+    if medicine_id:
+        id_matches = [medicine for medicine in medicines if medicine.get("id") == medicine_id]
+        match = unique_match(id_matches, "medicine_id")
+        if match:
+            return match
+        if len(id_matches) > 1:
+            return None
+
+    medicine_key = _normalized_stock_match_value(return_doc.get("medicine_key"))
+    if medicine_key:
+        key_matches = [
+            medicine for medicine in medicines
+            if _normalized_stock_match_value(medicine.get("medicine_key")) == medicine_key
+        ]
+        match = unique_match(key_matches, "medicine_key")
+        if match:
+            return match
+        if len(key_matches) > 1:
+            return None
+        matches = list(medicines)
+    else:
+        matches = list(medicines)
+
+    name = _normalized_stock_match_value(return_doc.get("medicine_name") or return_doc.get("name"))
+    batch = _normalized_stock_match_value(return_doc.get("batch_number") or return_doc.get("batch_no"))
+    if not name or not batch:
+        return None
+
+    matches = [
+        medicine for medicine in matches
+        if _normalized_stock_match_value(medicine.get("name") or medicine.get("medicine_name")) == name
+        and _normalized_stock_match_value(medicine.get("batch_no") or medicine.get("batch_number")) == batch
+    ]
+
+    expiry = return_doc.get("expiry_date")
+    if expiry:
+        matches = [
+            medicine for medicine in matches
+            if _normalized_stock_expiry(medicine.get("expiry_date")) == _normalized_stock_expiry(expiry)
+        ]
+
+    distributor_id = return_doc.get("distributor_id")
+    if distributor_id:
+        matches = [medicine for medicine in matches if medicine.get("distributor_id") == distributor_id]
+
+    return unique_match(matches, "name/batch/expiry/distributor")
+
+
+def _inventory_derivatives(medicine: dict, purchase_return_units: float) -> dict:
+    refreshed = {**medicine, "purchase_return_units": purchase_return_units}
+    available = _available_stock(refreshed)
+    status = _return_status(refreshed)
+    return {
+        "purchase_return_units": purchase_return_units,
+        "available_stock": available,
+        "quantity_units": available,
+        "return_status": status,
+        "status": status,
+    }
+
+
+def _rebuild_dashboard_summaries(tenant_id: Optional[str]) -> None:
+    # Dashboard summaries are calculated live from medicines and transactions.
+    # Refreshing medicine derivatives rebuilds the inventory portion immediately.
+    logger.info("Dashboard inventory summaries rebuilt tenant/shop=%s", tenant_id)
+
+
+def _invalidate_inventory_dashboard_cache(tenant_id: Optional[str]) -> None:
+    # There is currently no application cache to clear. Keep this hook for
+    # future inventory/dashboard cache providers.
+    logger.info("Inventory/dashboard cache invalidated tenant/shop=%s (no cache configured)", tenant_id)
+
+
+async def recalculate_purchase_return_stock(tenant_id: Optional[str] = None) -> dict:
+    """Backfill return quantities and refresh inventory/dashboard-derived fields."""
+    tenant_id = tenant_id or _current_tenant.get()
+    logger.info("Purchase return stock recalculation started tenant/shop=%s", tenant_id)
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(None)
+    purchase_returns = await db.purchase_returns.find({}, {"_id": 0}).to_list(None)
+    totals = defaultdict(float)
+    unmatched_return_ids = []
+    matched_returns = 0
+
+    for return_doc in purchase_returns:
+        medicine = _match_purchase_return_medicine(return_doc, medicines, tenant_id)
+        if not medicine:
+            unmatched_return_ids.append(return_doc.get("id"))
+            logger.warning(
+                "Purchase return stock repair medicine skipped tenant/shop=%s return_id=%s",
+                tenant_id, return_doc.get("id"),
+            )
+            continue
+        medicine_identity = medicine.get("id") or medicine.get("medicine_key")
+        if not medicine_identity:
+            unmatched_return_ids.append(return_doc.get("id"))
+            logger.warning(
+                "Purchase return stock repair medicine skipped tenant/shop=%s return_id=%s reason=missing_identity",
+                tenant_id, return_doc.get("id"),
+            )
+            continue
+        identity = ("id" if medicine.get("id") else "medicine_key", medicine_identity)
+        totals[identity] += _purchase_return_quantity(return_doc)
+        matched_returns += 1
+        logger.info(
+            "Purchase return stock repair medicine matched tenant/shop=%s return_id=%s medicine=%s",
+            tenant_id, return_doc.get("id"), medicine_identity,
+        )
+
+    # Refresh only derived inventory fields. Purchase/sale quantities, FIFO,
+    # billing, return documents, and ledger records remain untouched.
+    for medicine in medicines:
+        identity = (
+            "id" if medicine.get("id") else "medicine_key",
+            medicine.get("id") or medicine.get("medicine_key"),
+        )
+        if not identity[1]:
+            logger.warning("Purchase return stock repair medicine skipped tenant/shop=%s reason=missing_identity", tenant_id)
+            continue
+        await db.medicines.update_one(
+            {identity[0]: identity[1]},
+            {"$set": _inventory_derivatives(medicine, totals.get(identity, 0.0))},
+        )
+
+    # Dashboard stock summaries read medicines live, so refreshing every
+    # medicine above rebuilds their source data. No persisted stock summary or
+    # cache exists in this application.
+    _rebuild_dashboard_summaries(tenant_id)
+    _invalidate_inventory_dashboard_cache(tenant_id)
+    logger.info("Purchase return stock recalculation completed tenant/shop=%s", tenant_id)
+    return {
+        "ok": True,
+        "medicines_scanned": len(medicines),
+        "returns_scanned": len(purchase_returns),
+        "medicines_updated": len(totals),
+        "matched_returns": matched_returns,
+        "unmatched_returns": unmatched_return_ids,
+    }
+
+
+async def _run_startup_purchase_return_stock_recalculation() -> None:
+    """Run one isolated stock repair per tenant after startup without failing startup."""
+    try:
+        tenant_ids = set(await raw_db.medicines.distinct("tenant_id"))
+        tenant_ids.update(await raw_db.purchase_returns.distinct("tenant_id"))
+        for tenant_id in sorted(item for item in tenant_ids if item):
+            active_token = _request_active.set(True)
+            tenant_token = _current_tenant.set(tenant_id)
+            demo_token = _current_demo.set(False)
+            try:
+                await recalculate_purchase_return_stock(tenant_id)
+            except Exception:
+                logger.exception(
+                    "Purchase return stock recalculation failed tenant/shop=%s",
+                    tenant_id,
+                )
+            finally:
+                _current_demo.reset(demo_token)
+                _current_tenant.reset(tenant_token)
+                _request_active.reset(active_token)
+        logger.info("Purchase return stock recalculation completed")
+    except Exception:
+        logger.exception("Purchase return stock recalculation failed during startup")
+
+
+@api_router.post("/admin/recalculate-purchase-return-stock")
+async def recalculate_purchase_return_stock_endpoint(
+    user: dict = Depends(require_role("admin")),
+):
+    return await recalculate_purchase_return_stock(user.get("tenant_id") or user.get("shop_id"))
+
+
+@api_router.post("/admin/run-stock-repair")
+async def run_stock_repair(user: dict = Depends(require_role("admin"))):
+    result = await recalculate_purchase_return_stock(user.get("tenant_id") or user.get("shop_id"))
+    return {
+        "success": True,
+        "updated_medicines": result["medicines_updated"],
+        "matched_returns": result["matched_returns"],
+        "unmatched_returns": result["unmatched_returns"],
+    }
+
+
 async def _deduct_purchase_return_stock(medicine_id: str, quantity: float, session=None):
     result = await db.medicines.update_one(
         {
@@ -6561,6 +6784,10 @@ async def rebuild_inventory():
     for m in medicines.values():
 
         await db.medicines.insert_one(m)
+
+    # Rebuild the derived return quantity from the source-of-truth return
+    # collection, including legacy records created before this field existed.
+    await recalculate_purchase_return_stock()
 
 # ---------------- Mount ----------------
 
