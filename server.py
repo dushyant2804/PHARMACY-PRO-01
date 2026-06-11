@@ -45,6 +45,8 @@ raw_db = client[os.environ['DB_NAME']]
 
 REAL_TENANT_ID = os.environ.get("REAL_TENANT_ID", "real_shop")
 DEMO_TENANT_ID = "demo_shop"
+DEMO_USER_ID = "demo-user"
+SAFE_DEMO_EMAIL = "demo@pharmacyos.local"
 BUSINESS_COLLECTIONS = {
     "counters", "customer_transactions", "customers", "daily_sales",
     "daily_summary", "distributor_transactions", "distributors",
@@ -67,10 +69,12 @@ def _tenant_filter(query: Optional[dict], tenant_id: str) -> dict:
 def _canonicalize_user_tenant(user: dict) -> dict:
     """Return an auth-safe user whose demo identity can never inherit another shop."""
     result = dict(user)
-    if result.get("id") == "demo-user" or result.get("is_demo"):
+    if result.get("id") == DEMO_USER_ID or result.get("is_demo") or result.get("tenant_id") == DEMO_TENANT_ID:
+        result["id"] = DEMO_USER_ID
         result["tenant_id"] = DEMO_TENANT_ID
         result["shop_id"] = DEMO_TENANT_ID
         result["is_demo"] = True
+        result["active"] = True
     return result
 
 
@@ -288,11 +292,15 @@ async def tenant_security_context(request: Request, call_next):
         if token:
             try:
                 payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-                user = await raw_db.users.find_one({"id": payload.get("sub")})
+                user_id = payload.get("sub")
+                token_is_demo = bool(payload.get("is_demo")) or user_id == DEMO_USER_ID
+                query = ({"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True}
+                         if token_is_demo else {"id": user_id, "tenant_id": {"$ne": DEMO_TENANT_ID}, "is_demo": {"$ne": True}})
+                user = await raw_db.users.find_one(query)
                 if user:
                     user = _canonicalize_user_tenant(user)
-                    _current_tenant.set(user.get("tenant_id"))
-                    _current_demo.set(bool(user.get("is_demo")))
+                    _current_tenant.set(DEMO_TENANT_ID if token_is_demo else user.get("tenant_id"))
+                    _current_demo.set(token_is_demo or bool(user.get("is_demo")))
             except jwt.InvalidTokenError:
                 pass
         if _current_demo.get() and request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in {"/api/auth/login", "/api/auth/demo-login", "/api/auth/logout"}:
@@ -535,9 +543,9 @@ def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
-def create_access_token(user_id: str, email: str, role: str) -> str:
+def create_access_token(user_id: str, email: str, role: str, tenant_id: Optional[str] = None, is_demo: bool = False) -> str:
     payload = {
-        "sub": user_id, "email": email, "role": role,
+        "sub": user_id, "email": email, "role": role, "tenant_id": tenant_id, "is_demo": is_demo,
         "exp": datetime.now(timezone.utc) + timedelta(hours=12),
         "type": "access",
     }
@@ -554,7 +562,11 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user = await raw_db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0})
+        user_id = payload["sub"]
+        token_is_demo = bool(payload.get("is_demo")) or user_id == DEMO_USER_ID
+        query = ({"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True}
+                 if token_is_demo else {"id": user_id, "tenant_id": {"$ne": DEMO_TENANT_ID}, "is_demo": {"$ne": True}})
+        user = await raw_db.users.find_one(query, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         user = _canonicalize_user_tenant(user)
@@ -1089,6 +1101,10 @@ class PurchaseReturnUpdate(BaseModel):
 # ---------------- Startup ----------------
 async def _backfill_tenant_data(now_iso: str) -> None:
     await raw_db.users.update_many(
+        {"tenant_id": {"$exists": False}, "$or": [{"is_demo": True}, {"id": DEMO_USER_ID}]},
+        {"$set": {"tenant_id": DEMO_TENANT_ID, "shop_id": DEMO_TENANT_ID, "is_demo": True, "password_changed_at": now_iso}},
+    )
+    await raw_db.users.update_many(
         {"tenant_id": {"$exists": False}},
         {"$set": {"tenant_id": REAL_TENANT_ID, "is_demo": False, "password_changed_at": now_iso}},
     )
@@ -1107,19 +1123,51 @@ async def _backfill_tenant_data(now_iso: str) -> None:
         await collection.create_index("tenant_id")
 
 
-async def _seed_demo_data(now_iso: str) -> None:
-    demo_email = os.environ.get("DEMO_EMAIL", "demo@pharmacy.com").strip().lower()
-    demo_password = os.environ.get("DEMO_PASSWORD", "DemoAccess123")
-    await raw_db.users.delete_many({
-        "$or": [
-            {"is_demo": True, "id": {"$ne": "demo-user"}},
-            {"email": demo_email, "id": {"$ne": "demo-user"}},
-        ]
+async def _resolve_demo_email() -> str:
+    """Choose a demo-only email without ever taking an address owned by a real user."""
+    configured = os.environ.get("DEMO_EMAIL", SAFE_DEMO_EMAIL).strip().lower() or SAFE_DEMO_EMAIL
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@pharmacy.com").strip().lower()
+    candidate = SAFE_DEMO_EMAIL if configured == admin_email else configured
+    conflict = await raw_db.users.find_one({
+        "email": candidate,
+        "id": {"$ne": DEMO_USER_ID},
+        "is_demo": {"$ne": True},
+        "tenant_id": {"$ne": DEMO_TENANT_ID},
     })
+    if conflict:
+        candidate = SAFE_DEMO_EMAIL
+    safe_conflict = await raw_db.users.find_one({
+        "email": candidate,
+        "id": {"$ne": DEMO_USER_ID},
+        "is_demo": {"$ne": True},
+        "tenant_id": {"$ne": DEMO_TENANT_ID},
+    })
+    if safe_conflict:
+        raise RuntimeError(f"Safe demo email {candidate} is already owned by a real user")
+    return candidate
+
+
+async def _cleanup_demo_users() -> None:
+    """Remove only explicitly identifiable demo identities from non-demo tenants."""
+    await raw_db.users.delete_many({
+        "tenant_id": {"$ne": DEMO_TENANT_ID},
+        "$or": [{"is_demo": True}, {"id": DEMO_USER_ID}],
+    })
+    await raw_db.users.delete_many({
+        "tenant_id": DEMO_TENANT_ID,
+        "is_demo": True,
+        "id": {"$ne": DEMO_USER_ID},
+    })
+
+
+async def _seed_demo_data(now_iso: str) -> None:
+    demo_email = await _resolve_demo_email()
+    demo_password = os.environ.get("DEMO_PASSWORD", "DemoAccess123")
+    await _cleanup_demo_users()
     await raw_db.users.replace_one(
-        {"id": "demo-user"},
+        {"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True},
         {
-            "id": "demo-user", "email": demo_email, "name": "Demo Pharmacist", "role": "admin",
+            "id": DEMO_USER_ID, "email": demo_email, "name": "Demo Pharmacist", "role": "admin",
             "password_hash": hash_password(demo_password), "password_changed_at": now_iso,
             "tenant_id": DEMO_TENANT_ID, "shop_id": DEMO_TENANT_ID, "is_demo": True, "active": True,
             "created_at": now_iso,
@@ -1144,8 +1192,6 @@ async def _seed_demo_data(now_iso: str) -> None:
     }
     for collection_name, documents in demo_documents.items():
         collection = raw_db[collection_name]
-        demo_ids = [document["id"] for document in documents]
-        await collection.delete_many({"id": {"$in": demo_ids}, "tenant_id": {"$ne": DEMO_TENANT_ID}})
         for document in documents:
             owned = {**document, "tenant_id": DEMO_TENANT_ID, "shop_id": DEMO_TENANT_ID}
             await collection.replace_one({"id": document["id"], "tenant_id": DEMO_TENANT_ID}, owned, upsert=True)
@@ -1154,11 +1200,13 @@ async def _seed_demo_data(now_iso: str) -> None:
 @app.on_event("startup")
 async def startup():
     now_iso = datetime.now(timezone.utc).isoformat()
+    await _backfill_tenant_data(now_iso)
+    # Repair and safely reseed demo identities before unique email indexes are enforced.
+    await _seed_demo_data(now_iso)
     await raw_db.users.create_index("email", unique=True)
     await raw_db.users.create_index("mobile", unique=True, sparse=True)
     await raw_db.password_reset_requests.create_index("created_at", expireAfterSeconds=FORGOT_PASSWORD_WINDOW_MINUTES * 60)
     await raw_db.pending_signups.create_index("expires_at", expireAfterSeconds=0)
-    await _backfill_tenant_data(now_iso)
     for collection_name, indexes in {
         "medicines": ["name", "barcode"], "invoices": ["created_at"],
         "purchase_returns": ["return_date", "distributor", "medicine_name", "reason", "ledger_adjusted", "po_adjustment_id"],
@@ -1181,7 +1229,6 @@ async def startup():
             "created_at": now_iso, "password_changed_at": now_iso,
         })
         logger.info("Seeded admin user: %s", admin_email)
-    await _seed_demo_data(now_iso)
     task = asyncio.create_task(_run_startup_purchase_return_stock_recalculation())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -1354,7 +1401,10 @@ async def register(payload: UserRegister):
 
 def _login_response(user: dict, response: Response) -> dict:
     user = _canonicalize_user_tenant(user)
-    token = create_access_token(user["id"], user.get("email", user.get("mobile", "")), user["role"])
+    token = create_access_token(
+        user["id"], user.get("email", user.get("mobile", "")), user["role"],
+        tenant_id=user["tenant_id"], is_demo=bool(user.get("is_demo")),
+    )
     response.set_cookie("access_token", token, httponly=True, samesite="lax", secure=ENVIRONMENT in {"production", "prod"}, max_age=43200, path="/")
     return {
         "id": user["id"], "email": user.get("email"), "mobile": user.get("mobile"), "name": user["name"], "role": user["role"],
@@ -1366,7 +1416,14 @@ def _login_response(user: dict, response: Response) -> dict:
 @api_router.post("/auth/login")
 async def login(payload: UserLogin, response: Response):
     identifier = str(payload.email or payload.mobile or payload.identifier or "").strip().lower()
-    user = await raw_db.users.find_one({"$or": [{"email": identifier}, {"mobile": identifier}]})
+    user = await raw_db.users.find_one({
+        "$and": [
+            {"$or": [{"email": identifier}, {"mobile": identifier}]},
+            {"id": {"$ne": DEMO_USER_ID}},
+            {"tenant_id": {"$ne": DEMO_TENANT_ID}},
+            {"is_demo": {"$ne": True}},
+        ]
+    })
     if not user or user.get("active", True) is False or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     return _login_response(user, response)
@@ -1376,7 +1433,7 @@ async def login(payload: UserLogin, response: Response):
 async def demo_login(response: Response):
     now_iso = datetime.now(timezone.utc).isoformat()
     await _seed_demo_data(now_iso)
-    user = await raw_db.users.find_one({"id": "demo-user", "tenant_id": DEMO_TENANT_ID, "is_demo": True, "active": True})
+    user = await raw_db.users.find_one({"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True, "active": True})
     if not user:
         raise HTTPException(status_code=503, detail="Demo account is unavailable")
     return _login_response(user, response)
@@ -1395,7 +1452,15 @@ async def me(user: dict = Depends(get_current_user)):
 
 @api_router.get("/auth/users")
 async def list_users(user: dict = Depends(require_role("admin"))):
-    return await raw_db.users.find({"tenant_id": user["tenant_id"]}, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0}).to_list(1000)
+    if user.get("is_demo") or user.get("tenant_id") == DEMO_TENANT_ID:
+        query = {"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True}
+    else:
+        query = {
+            "tenant_id": user["tenant_id"],
+            "id": {"$ne": DEMO_USER_ID},
+            "is_demo": {"$ne": True},
+        }
+    return await raw_db.users.find(query, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0}).to_list(1000)
 
 
 @api_router.post("/auth/users")
