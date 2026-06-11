@@ -21,14 +21,16 @@ class VersionMetadata(TypedDict):
 
 
 VERSION_METADATA: VersionMetadata = {
-    "version": "3.0",
-    "build": "3.0.0",
-    "release_notes": """Centralized PharmacyOS version and build metadata.
-Added update type and update timestamp support for the frontend update flow.
-Version checks are now explicitly protected from stale cached responses.""",
-    "message": "PharmacyOS 3.0 is ready to install.",
-    "updated_at": "2026-06-10T00:00:00Z",
-    "update_type": "major",
+    "version": "3.1.0",
+    "build": "3.1.0",
+    "release_notes": """Fixed legacy purchase-return stock recalculation.
+Returned medicines are now removed from expiry/expired alerts.
+Added automatic post-deployment stock repair.
+Added admin stock repair endpoint.
+Improved dashboard/inventory stock consistency.""",
+    "message": "PharmacyOS 3.1.0 is ready to install.",
+    "updated_at": "2026-06-11T00:00:00Z",
+    "update_type": "minor",
 }
 
 
