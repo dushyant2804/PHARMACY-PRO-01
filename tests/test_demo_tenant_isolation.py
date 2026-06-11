@@ -190,8 +190,11 @@ class DemoTenantIsolationTest(unittest.IsolatedAsyncioTestCase):
             await list_users({"id": "real-admin", "role": "admin", "tenant_id": "real_shop", "is_demo": False})
             await list_users({"id": DEMO_USER_ID, "role": "admin", "tenant_id": DEMO_TENANT_ID, "is_demo": True})
 
-        self.assertEqual(users.find_queries[0], {"tenant_id": "real_shop", "id": {"$ne": DEMO_USER_ID}, "is_demo": {"$ne": True}})
-        self.assertEqual(users.find_queries[1], {"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True})
+        self.assertEqual(users.find_queries[0]["tenant_id"], "real_shop")
+        self.assertEqual(users.find_queries[0]["id"], {"$ne": DEMO_USER_ID})
+        self.assertEqual(users.find_queries[0]["is_demo"], {"$ne": True})
+        self.assertIn("$nor", users.find_queries[0])
+        self.assertEqual(len(users.find_queries), 1)
 
 
 if __name__ == "__main__":
