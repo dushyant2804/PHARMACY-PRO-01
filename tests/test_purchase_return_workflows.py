@@ -13,8 +13,13 @@ from server import (
     POItem,
     POReturnCreditRow,
     PurchaseReturnUpdate,
+    _available_stock,
     _resolve_po_purchase_returns,
+    _return_status,
     delete_purchase_return,
+    rebuild_inventory,
+    recalculate_purchase_return_stock,
+    run_stock_repair,
     update_purchase_return,
 )
 
@@ -22,6 +27,12 @@ from server import (
 class Cursor:
     def __init__(self, rows):
         self.rows = rows
+
+    def __aiter__(self):
+        async def iterate():
+            for row in self.rows:
+                yield dict(row)
+        return iterate()
 
     async def to_list(self, length):
         return [dict(row) for row in self.rows[:length]]
@@ -56,6 +67,16 @@ class Collection:
         for key, amount in update.get("$inc", {}).items():
             target[key] = target.get(key, 0) + amount
         return SimpleNamespace(modified_count=1)
+
+    async def update_many(self, query, update, *args, **kwargs):
+        for row in self.rows:
+            row.update(update.get("$set", {}))
+        return SimpleNamespace(modified_count=len(self.rows))
+
+    async def delete_many(self, query, *args, **kwargs):
+        deleted = len(self.rows)
+        self.rows.clear()
+        return SimpleNamespace(deleted_count=deleted)
 
     async def delete_one(self, query, *args, **kwargs):
         row = await self.find_one(query)
@@ -140,3 +161,96 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as caught:
                 await delete_purchase_return("return-1", {"id": "user"})
         self.assertEqual(caught.exception.status_code, 409)
+
+
+class PurchaseReturnStockBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_returns_recalculate_qutan_and_saltum_stock(self):
+        medicines = [
+            {
+                "id": "qutan-med", "medicine_key": "qutan::Q1", "name": "Qutan",
+                "batch_no": "Q1", "expiry_date": "12/27", "distributor_id": "dist-1",
+                "purchased_units": 5, "sold_units": 3, "purchase_return_units": 0,
+            },
+            {
+                "id": "saltum-med", "medicine_key": "saltum::S1", "name": "Saltum",
+                "batch_no": "S1", "expiry_date": "2027-11-30", "distributor_id": "dist-2",
+                "purchased_units": 4, "sold_units": 2,
+            },
+        ]
+        legacy_returns = [
+            {
+                "id": "return-qutan", "medicine_name": "Qutan", "batch_number": "Q1",
+                "expiry_date": "2027-12-31", "distributor_id": "dist-1", "return_quantity": 2,
+            },
+            {
+                "id": "return-saltum", "medicine_id": "saltum-med", "medicine_name": "Saltum",
+                "batch_number": "S1", "return_quantity": 2,
+            },
+        ]
+        fake_db = SimpleNamespace(
+            purchase_returns=Collection(legacy_returns),
+            medicines=Collection(medicines),
+        )
+
+        with patch("server.db", fake_db):
+            result = await recalculate_purchase_return_stock()
+
+        self.assertEqual(result["returns_scanned"], 2)
+        self.assertEqual(result["unmatched_returns"], [])
+        self.assertEqual(result["matched_returns"], 2)
+        self.assertEqual(len(fake_db.purchase_returns.rows), 2)
+        for medicine in fake_db.medicines.rows:
+            self.assertEqual(medicine["purchase_return_units"], 2)
+            self.assertEqual(medicine["available_stock"], 0)
+            self.assertEqual(medicine["status"], "Returned")
+            self.assertEqual(_available_stock(medicine), 0)
+            self.assertEqual(_return_status(medicine), "Returned")
+        self.assertEqual(fake_db.medicines.rows[0]["purchased_units"], 5)
+        self.assertEqual(fake_db.medicines.rows[0]["sold_units"], 3)
+        self.assertEqual(fake_db.medicines.rows[1]["purchased_units"], 4)
+        self.assertEqual(fake_db.medicines.rows[1]["sold_units"], 2)
+
+    async def test_manual_stock_repair_endpoint_refreshes_legacy_return_status(self):
+        fake_db = SimpleNamespace(
+            purchase_returns=Collection([{
+                "id": "legacy-return", "medicine_name": "Qutan",
+                "batch_number": "Q1", "return_quantity": 2,
+            }]),
+            medicines=Collection([{
+                "id": "qutan-med", "name": "Qutan", "batch_no": "Q1",
+                "purchased_units": 5, "sold_units": 3,
+            }]),
+        )
+
+        with patch("server.db", fake_db):
+            response = await run_stock_repair({"role": "admin", "tenant_id": "shop-1"})
+
+        medicine = fake_db.medicines.rows[0]
+        self.assertEqual(response, {
+            "success": True,
+            "updated_medicines": 1,
+            "matched_returns": 1,
+            "unmatched_returns": [],
+        })
+        self.assertEqual(medicine["available_stock"], 0)
+        self.assertEqual(medicine["status"], "Returned")
+
+    async def test_inventory_rebuild_always_recalculates_purchase_returns(self):
+        purchase_orders = Collection([{
+            "distributor_id": "dist-1",
+            "items": [{"medicine_key": "qutan::Q1", "name": "Qutan", "batch_no": "Q1", "quantity": 5}],
+        }])
+        fake_db = SimpleNamespace(
+            purchase_orders=purchase_orders,
+            medicines=Collection([{
+                "id": "qutan-med", "medicine_key": "qutan::Q1", "name": "Qutan",
+                "batch_no": "Q1", "purchased_units": 5, "sold_units": 3,
+            }]),
+        )
+
+        with patch("server.db", fake_db), patch(
+            "server.recalculate_purchase_return_stock", new=AsyncMock()
+        ) as recalculate:
+            await rebuild_inventory()
+
+        recalculate.assert_awaited_once_with()
