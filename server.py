@@ -344,7 +344,7 @@ def _purchased_stock(medicine: dict) -> float:
     if "purchased_units" in medicine and medicine.get("purchased_units") is not None:
         return float(medicine.get("purchased_units") or 0)
     return _stock_quantity(medicine, "purchased_quantity", "quantity") + _stock_quantity(
-        medicine, "free_quantity", "free_units"
+        medicine, "free_quantity", "free_qty", "free_units"
     )
 
 
@@ -367,22 +367,49 @@ def _available_stock(medicine: dict) -> float:
     )
 
 
+def _mongo_first_stock_value(*field_names: str) -> dict:
+    expression = 0
+    for field_name in reversed(field_names):
+        expression = {"$ifNull": [f"${field_name}", expression]}
+    return expression
+
+
+def _mongo_available_stock_expression() -> dict:
+    """Mongo expression equivalent of _available_stock for atomic stock writes."""
+    purchased = {
+        "$ifNull": [
+            "$purchased_units",
+            {
+                "$add": [
+                    _mongo_first_stock_value("purchased_quantity", "quantity"),
+                    _mongo_first_stock_value("free_quantity", "free_qty", "free_units"),
+                ]
+            },
+        ]
+    }
+    sold = _mongo_first_stock_value("sold_units", "sold_quantity")
+    returned = _mongo_first_stock_value(
+        "purchase_return_units", "purchase_return_quantity", "returned_quantity", "returned_units"
+    )
+    return {"$subtract": [{"$subtract": [purchased, sold]}, returned]}
+
+
 def _return_status(medicine: dict) -> str:
     purchased = _purchased_stock(medicine)
     sold = _stock_quantity(medicine, "sold_units", "sold_quantity")
     returned = _purchase_return_stock(medicine)
     available = _available_stock(medicine)
 
-    # A pure full purchase return is reported as Returned. In every mixed case,
-    # exhausted usable stock takes priority over the partial-return label.
-    if returned > 0 and returned >= purchased and sold <= 0:
-        return "Returned"
-    if available <= 0:
-        return "Sold Out"
-    if returned >= purchased and returned > 0:
+    # A purchase return takes priority over sold-out.  Compare it with stock
+    # that was not already sold so mixed sold/returned batches are classified
+    # as Returned rather than Sold Out.
+    remaining_non_sold = max(0.0, purchased - sold)
+    if returned > 0 and returned >= remaining_non_sold:
         return "Returned"
     if returned > 0:
         return "Partially Returned"
+    if available <= 0:
+        return "Sold Out"
     return "Not Returned"
 
 
@@ -1028,6 +1055,35 @@ class PurchaseReturnCreate(BaseModel):
         if value <= 0:
             raise ValueError("purchase_rate must be greater than zero")
         return value
+
+
+class PurchaseReturnUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    return_date: Optional[str] = None
+    reason: Optional[Literal["Expired", "Damaged", "Wrong Item", "Other"]] = None
+    return_quantity: Optional[float] = None
+    notes: Optional[str] = None
+    adjust_distributor_ledger: Optional[bool] = None
+
+    @field_validator("return_date")
+    @classmethod
+    def validate_return_date(cls, value):
+        if value is not None and not parse_iso_date(value):
+            raise ValueError("return_date must be a valid ISO date")
+        return value
+
+    @field_validator("return_quantity")
+    @classmethod
+    def validate_return_quantity(cls, value):
+        if value is not None and value <= 0:
+            raise ValueError("return_quantity must be greater than zero")
+        return value
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def normalize_notes(cls, value):
+        return value.strip() if isinstance(value, str) else value
     
 # ---------------- Startup ----------------
 async def _backfill_tenant_data(now_iso: str) -> None:
@@ -2454,22 +2510,7 @@ async def _apply_fifo_stock_plan(
         result = await db.medicines.update_one(
             {
                 "id": step["medicine_id"],
-                "$expr": {
-                    "$gte": [
-                        {
-                            "$subtract": [
-                                {
-                                    "$subtract": [
-                                        {"$ifNull": ["$purchased_units", 0]},
-                                        {"$ifNull": ["$sold_units", 0]},
-                                    ]
-                                },
-                                {"$ifNull": ["$purchase_return_units", 0]},
-                            ]
-                        },
-                        step["deduct"],
-                    ]
-                }
+                "$expr": {"$gte": [_mongo_available_stock_expression(), step["deduct"]]}
             },
             {
                 "$inc": {
@@ -4331,36 +4372,13 @@ async def _deduct_purchase_return_stock(medicine_id: str, quantity: float, sessi
     result = await db.medicines.update_one(
         {
             "id": medicine_id,
-            "$expr": {
-                "$gte": [
-                    {
-                        "$subtract": [
-                            {
-                                "$subtract": [
-                                    {"$ifNull": ["$purchased_units", 0]},
-                                    {"$ifNull": ["$sold_units", 0]},
-                                ]
-                            },
-                            {"$ifNull": ["$purchase_return_units", 0]},
-                        ]
-                    },
-                    quantity,
-                ]
-            },
+            "$expr": {"$gte": [_mongo_available_stock_expression(), quantity]},
         },
-        {
-            "$inc": {
-                "purchase_return_units": quantity,
-            }
-        },
+        {"$inc": {"purchase_return_units": quantity}},
         session=session,
     )
-
     if result.modified_count != 1:
-        raise HTTPException(
-            status_code=409,
-            detail="Return quantity exceeds available stock for this batch",
-        )
+        raise HTTPException(status_code=409, detail="Return quantity exceeds available stock for this batch")
 
 
 @api_router.post("/purchase-returns")
@@ -4415,6 +4433,7 @@ async def create_purchase_return(
         "expiry_date": payload.expiry_date,
         "return_quantity": payload.return_quantity,
         "purchase_rate": payload.purchase_rate,
+        "gst_rate": medicine.get("gst_rate"),
         "return_amount": return_amount,
         "reason": payload.reason,
         "notes": payload.notes,
@@ -4476,6 +4495,125 @@ async def create_purchase_return(
         transaction_operation,
         fallback_operation,
     )
+
+
+async def _set_purchase_return_stock_delta(medicine_id: str, delta: float, session=None):
+    """Apply a physical return delta; positive removes stock, negative restores it."""
+    if delta > 0:
+        return await _deduct_purchase_return_stock(medicine_id, delta, session=session)
+    result = await db.medicines.update_one(
+        {"id": medicine_id},
+        {"$inc": {"purchase_return_units": delta}},
+        session=session,
+    )
+    if result.modified_count != 1:
+        raise HTTPException(status_code=404, detail="Medicine batch not found")
+
+
+async def _sync_purchase_return_ledger(old: dict, updated: dict, session=None):
+    existing_id = old.get("ledger_transaction_id")
+    should_adjust = bool(updated.get("adjust_distributor_ledger"))
+    if should_adjust and not updated.get("distributor_id"):
+        raise HTTPException(status_code=400, detail="Distributor ledger adjustment requires a matched distributor")
+
+    if not should_adjust:
+        if existing_id:
+            await db.distributor_transactions.delete_one({"id": existing_id, "return_id": old["id"]}, session=session)
+        return None
+
+    transaction = _purchase_return_ledger_transaction(updated)
+    if existing_id:
+        transaction["id"] = existing_id
+        await db.distributor_transactions.update_one(
+            {"id": existing_id, "return_id": old["id"]},
+            {"$set": transaction},
+            session=session,
+        )
+        return existing_id
+    await db.distributor_transactions.insert_one(transaction, session=session)
+    return transaction["id"]
+
+
+@api_router.put("/purchase-returns/{return_id}")
+async def update_purchase_return(
+    return_id: str,
+    payload: PurchaseReturnUpdate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    current = await db.purchase_returns.find_one({"id": return_id})
+    if not current:
+        raise HTTPException(status_code=404, detail="Purchase return not found")
+    if current.get("po_adjustment_id"):
+        raise HTTPException(status_code=409, detail="Purchase return is applied to a purchase order; release it before editing")
+
+    changes = payload.model_dump(exclude_unset=True)
+    updated = {**current, **changes}
+    updated["ledger_adjusted"] = bool(updated.get("adjust_distributor_ledger"))
+    updated["return_amount"] = round(float(updated["return_quantity"]) * float(updated["purchase_rate"]), 2)
+    updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+    delta = float(updated["return_quantity"]) - float(current.get("return_quantity", 0) or 0)
+
+    async def write(session=None):
+        if delta:
+            await _set_purchase_return_stock_delta(current["medicine_id"], delta, session=session)
+        ledger_id = await _sync_purchase_return_ledger(current, updated, session=session)
+        updated["ledger_transaction_id"] = ledger_id
+        result = await db.purchase_returns.update_one(
+            {"id": return_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]},
+            {"$set": {key: value for key, value in updated.items() if key != "_id"}},
+            session=session,
+        )
+        if result.modified_count != 1:
+            raise HTTPException(status_code=409, detail="Purchase return changed or was applied to a purchase order")
+        return _return_public(updated)
+
+    async def transaction_operation(session):
+        return await write(session=session)
+
+    async def fallback_operation():
+        try:
+            return await write()
+        except Exception:
+            if delta:
+                await db.medicines.update_one({"id": current["medicine_id"]}, {"$inc": {"purchase_return_units": -delta}})
+            raise
+
+    return await _run_with_transaction(transaction_operation, fallback_operation)
+
+
+@api_router.delete("/purchase-returns/{return_id}")
+async def delete_purchase_return(
+    return_id: str,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    current = await db.purchase_returns.find_one({"id": return_id})
+    if not current:
+        raise HTTPException(status_code=404, detail="Purchase return not found")
+    if current.get("po_adjustment_id"):
+        raise HTTPException(status_code=409, detail="Purchase return is applied to a purchase order; release it before deleting")
+
+    quantity = float(current.get("return_quantity", 0) or 0)
+
+    async def write(session=None):
+        if current.get("ledger_transaction_id"):
+            await db.distributor_transactions.delete_one(
+                {"id": current["ledger_transaction_id"], "return_id": return_id}, session=session
+            )
+        await _set_purchase_return_stock_delta(current["medicine_id"], -quantity, session=session)
+        result = await db.purchase_returns.delete_one({
+            "id": return_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]
+        }, session=session)
+        if result.deleted_count != 1:
+            raise HTTPException(status_code=409, detail="Purchase return changed or was applied to a purchase order")
+        return {"message": "Purchase return deleted", "id": return_id}
+
+    async def transaction_operation(session):
+        return await write(session=session)
+
+    async def fallback_operation():
+        return await write()
+
+    return await _run_with_transaction(transaction_operation, fallback_operation)
 
 
 @api_router.get("/purchase-returns")
@@ -5480,6 +5618,38 @@ class POItem(BaseModel):
     expiry_date: str | None = None
     gst_rate: float = 5
 
+class POReturnCreditRow(BaseModel):
+    id: Optional[str] = None
+    medicine_name: str = ""
+    medicine_key: str = ""
+    medicine_id: str = ""
+    batch_number: str = ""
+    expiry_date: str = ""
+    return_quantity: float = 0
+    purchase_rate: float = 0
+    gst_rate: Optional[float] = None
+    reason: Optional[str] = None
+    notes: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, data):
+        if not isinstance(data, dict):
+            return data
+        result = dict(data)
+        for field, aliases in {
+            "medicine_name": ("name",), "batch_number": ("batch", "batch_no"),
+            "expiry_date": ("expiry",), "return_quantity": ("quantity",),
+            "purchase_rate": ("rate", "purchase_price"), "gst_rate": ("gst",),
+        }.items():
+            if result.get(field) in (None, ""):
+                for alias in aliases:
+                    if result.get(alias) not in (None, ""):
+                        result[field] = result[alias]
+                        break
+        return result
+
+
 class POCreate(BaseModel):
     distributor_id: str
     distributor_name: str
@@ -5498,6 +5668,20 @@ class POCreate(BaseModel):
     round_off: float = 0
     grand_total: float = 0
     purchase_return_ids: list[str] = Field(default_factory=list)
+    purchase_returns: list[POReturnCreditRow] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_purchase_return_rows(cls, data):
+        if not isinstance(data, dict):
+            return data
+        result = dict(data)
+        if not result.get("purchase_returns"):
+            for alias in ("purchase_return_rows", "return_rows", "return_items"):
+                if result.get(alias):
+                    result["purchase_returns"] = result[alias]
+                    break
+        return result
 
 
 MONEY = Decimal("0.01")
@@ -5591,19 +5775,101 @@ def _purchase_return_credit(item: dict) -> float:
 
 
 async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[str] = None) -> tuple[list[dict], float]:
+    """Resolve selected IDs and inline PO credit rows to one physical return each."""
     return_ids = list(dict.fromkeys(payload.purchase_return_ids))
-    if not return_ids:
-        return [], 0.0
-    returns = await db.purchase_returns.find({"id": {"$in": return_ids}}, {"_id": 0}).to_list(len(return_ids))
-    if len(returns) != len(return_ids):
-        raise HTTPException(status_code=400, detail="One or more selected purchase returns were not found")
+    returns = []
+    if return_ids:
+        returns = await db.purchase_returns.find({"id": {"$in": return_ids}}, {"_id": 0}).to_list(len(return_ids))
+        if len(returns) != len(return_ids):
+            raise HTTPException(status_code=400, detail="One or more selected purchase returns were not found")
+
+    def normalized(value):
+        return str(value or "").strip().casefold()
+
+    def same_number(left, right):
+        return abs(float(left or 0) - float(right or 0)) < 0.000001
+
+    def matches(row: POReturnCreditRow, item: dict) -> bool:
+        if item.get("distributor_id") and item.get("distributor_id") != payload.distributor_id:
+            return False
+        if normalized(item.get("medicine_key")) and normalized(row.medicine_key):
+            medicine_matches = normalized(item.get("medicine_key")) == normalized(row.medicine_key)
+        else:
+            medicine_matches = normalized(item.get("medicine_name")) == normalized(row.medicine_name)
+        required = (
+            medicine_matches
+            and normalized(item.get("batch_number")) == normalized(row.batch_number)
+            and normalized(item.get("expiry_date")) == normalized(row.expiry_date)
+            and same_number(item.get("return_quantity"), row.return_quantity)
+            and same_number(item.get("purchase_rate"), row.purchase_rate)
+        )
+        if not required:
+            return False
+        if row.gst_rate is not None and item.get("gst_rate") is not None and not same_number(item.get("gst_rate"), row.gst_rate):
+            return False
+        if row.reason and item.get("reason") and normalized(item.get("reason")) != normalized(row.reason):
+            return False
+        return True
+
+    candidates = await db.purchase_returns.find(
+        {"distributor_id": payload.distributor_id}, {"_id": 0}
+    ).to_list(10000) if payload.purchase_returns else []
+
+    known_ids = {item["id"] for item in returns}
+    for row in payload.purchase_returns:
+        if row.id:
+            if row.id not in known_ids:
+                selected = next((item for item in candidates if item.get("id") == row.id), None)
+                if not selected:
+                    raise HTTPException(status_code=400, detail="Selected purchase return was not found")
+                returns.append(selected)
+                known_ids.add(row.id)
+            continue
+        if row.return_quantity <= 0 or row.purchase_rate <= 0 or not row.medicine_name or not row.batch_number or not row.expiry_date:
+            raise HTTPException(status_code=400, detail="PO return row requires medicine, batch, expiry, quantity, and purchase rate")
+
+        match = next((item for item in candidates if item.get("id") not in known_ids and matches(row, item)), None)
+        if match:
+            returns.append(match)
+            known_ids.add(match["id"])
+            continue
+
+        medicine_filters = [{"name": row.medicine_name, "batch_no": row.batch_number}]
+        if row.medicine_key:
+            medicine_filters.append({"medicine_key": row.medicine_key, "batch_no": row.batch_number})
+        if row.medicine_id:
+            medicine_filters.append({"id": row.medicine_id})
+        medicine = await db.medicines.find_one({"$or": medicine_filters})
+        if not medicine:
+            raise HTTPException(status_code=400, detail="Medicine batch for PO return row was not found")
+        await _set_purchase_return_stock_delta(medicine["id"], row.return_quantity)
+        now = datetime.now(timezone.utc).isoformat()
+        created = {
+            "id": str(uuid.uuid4()), "return_date": payload.po_date or now[:10],
+            "distributor": payload.distributor_name, "distributor_id": payload.distributor_id,
+            "medicine_id": medicine.get("id"), "medicine_key": medicine.get("medicine_key") or row.medicine_key,
+            "medicine_name": row.medicine_name, "batch_number": row.batch_number, "expiry_date": row.expiry_date,
+            "return_quantity": row.return_quantity, "purchase_rate": row.purchase_rate,
+            "gst_rate": row.gst_rate if row.gst_rate is not None else medicine.get("gst_rate"),
+            "return_amount": _purchase_return_credit(row.model_dump()), "reason": row.reason or "Other", "notes": row.notes,
+            "adjust_distributor_ledger": False, "ledger_adjusted": False, "ledger_transaction_id": None,
+            "created_at": now, "created_by": "PO return credit", "auto_created_from_po_credit": True,
+        }
+        try:
+            await db.purchase_returns.insert_one(created)
+        except Exception:
+            await _set_purchase_return_stock_delta(medicine["id"], -row.return_quantity)
+            raise
+        candidates.append(created)
+        returns.append(created)
+        known_ids.add(created["id"])
+
     for item in returns:
         if item.get("distributor_id") and item.get("distributor_id") != payload.distributor_id:
             raise HTTPException(status_code=400, detail="Purchase return distributor does not match purchase order distributor")
         assigned_po = item.get("po_adjustment_id")
         if assigned_po and assigned_po != allow_po_id:
             raise HTTPException(status_code=409, detail="Purchase return credit is already assigned to another purchase order")
-    for item in returns:
         item["return_amount"] = _purchase_return_credit(item)
     credit = round(sum(item["return_amount"] for item in returns), 2)
     return returns, credit

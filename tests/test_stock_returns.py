@@ -18,8 +18,11 @@ class PurchaseReturnStockRegressionTest(unittest.TestCase):
         self.assertEqual(_available_stock(medicine), stock)
         self.assertEqual(_return_status(medicine), status)
 
-    def test_sold_and_returned_stock_is_sold_out(self):
-        self.assert_stock_and_status(5, 3, 2, 0, "Sold Out")
+    def test_qutan_sold_and_returned_stock_is_returned(self):
+        self.assert_stock_and_status(5, 3, 2, 0, "Returned")
+
+    def test_saltum_sold_and_returned_stock_is_returned(self):
+        self.assert_stock_and_status(4, 2, 2, 0, "Returned")
 
     def test_fully_returned_unsold_stock_is_returned(self):
         self.assert_stock_and_status(5, 0, 5, 0, "Returned")
@@ -33,7 +36,7 @@ class PurchaseReturnStockRegressionTest(unittest.TestCase):
     def test_free_and_legacy_return_quantity_fields_are_supported(self):
         medicine = {
             "purchased_quantity": 5,
-            "free_quantity": 2,
+            "free_qty": 2,
             "sold_quantity": 3,
             "purchase_return_quantity": 2,
         }
