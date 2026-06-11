@@ -47,6 +47,12 @@ REAL_TENANT_ID = os.environ.get("REAL_TENANT_ID", "real_shop")
 DEMO_TENANT_ID = "demo_shop"
 DEMO_USER_ID = "demo-user"
 SAFE_DEMO_EMAIL = "demo@pharmacyos.local"
+UNSAFE_DEFAULT_EMAILS = {"admin@gmail.com", "admin@pharmacy.com"}
+UNSAFE_DEFAULT_PASSWORDS = {"admin@123", "admin123"}
+SYSTEM_ACCOUNT_MARKERS = (
+    "is_demo", "system_seeded", "is_system_seeded", "protected", "is_protected",
+    "is_default", "default_account",
+)
 BUSINESS_COLLECTIONS = {
     "counters", "customer_transactions", "customers", "daily_sales",
     "daily_summary", "distributor_transactions", "distributors",
@@ -1126,8 +1132,8 @@ async def _backfill_tenant_data(now_iso: str) -> None:
 async def _resolve_demo_email() -> str:
     """Choose a demo-only email without ever taking an address owned by a real user."""
     configured = os.environ.get("DEMO_EMAIL", SAFE_DEMO_EMAIL).strip().lower() or SAFE_DEMO_EMAIL
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@pharmacy.com").strip().lower()
-    candidate = SAFE_DEMO_EMAIL if configured == admin_email else configured
+    admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+    candidate = SAFE_DEMO_EMAIL if admin_email and configured == admin_email else configured
     conflict = await raw_db.users.find_one({
         "email": candidate,
         "id": {"$ne": DEMO_USER_ID},
@@ -1145,6 +1151,64 @@ async def _resolve_demo_email() -> str:
     if safe_conflict:
         raise RuntimeError(f"Safe demo email {candidate} is already owned by a real user")
     return candidate
+
+
+def _system_account_marker_query() -> list[dict]:
+    return [{marker: True} for marker in SYSTEM_ACCOUNT_MARKERS] + [
+        {"id": DEMO_USER_ID},
+        {"name": "Administrator", "role": "admin"},
+        {"name": {"$in": ["Demo Administrator", "Demo Pharmacist"]}},
+    ]
+
+
+def _unsafe_seeded_user_query(tenant_id: str) -> dict:
+    return {
+        "tenant_id": tenant_id,
+        "email": {"$in": sorted(UNSAFE_DEFAULT_EMAILS)},
+        "$or": _system_account_marker_query(),
+    }
+
+
+async def _cleanup_unsafe_real_users() -> None:
+    """Remove clearly seeded unsafe defaults from the real tenant, preserving its last admin."""
+    candidates = await raw_db.users.find(_unsafe_seeded_user_query(REAL_TENANT_ID)).to_list(1000)
+    admin_count = await raw_db.users.count_documents({"tenant_id": REAL_TENANT_ID, "role": "admin"})
+    for candidate in candidates:
+        if candidate.get("role") == "admin" and admin_count <= 1:
+            logger.warning("Preserving the only real-tenant admin despite unsafe seeded markers: %s", candidate.get("email"))
+            continue
+        result = await raw_db.users.delete_one({"id": candidate["id"], "tenant_id": REAL_TENANT_ID})
+        if result.deleted_count and candidate.get("role") == "admin":
+            admin_count -= 1
+
+
+async def _seed_admin_if_enabled(now_iso: str) -> None:
+    if os.environ.get("SEED_ADMIN", "").strip().lower() != "true":
+        return
+
+    admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+    admin_password = os.environ.get("ADMIN_PASSWORD", "")
+    if not admin_email or not admin_password:
+        raise RuntimeError("SEED_ADMIN=true requires explicit ADMIN_EMAIL and ADMIN_PASSWORD")
+    if admin_email in UNSAFE_DEFAULT_EMAILS or admin_password in UNSAFE_DEFAULT_PASSWORDS:
+        raise RuntimeError("Refusing to seed an unsafe default admin credential")
+    try:
+        _validate_password_strength(admin_password)
+    except HTTPException as exc:
+        raise RuntimeError(f"ADMIN_PASSWORD does not meet password strength requirements: {exc.detail}") from exc
+
+    existing = await raw_db.users.find_one({"email": admin_email})
+    if existing:
+        if existing.get("tenant_id") != REAL_TENANT_ID:
+            raise RuntimeError("ADMIN_EMAIL is already assigned outside REAL_TENANT_ID")
+        return
+    await raw_db.users.insert_one({
+        "id": str(uuid.uuid4()), "email": admin_email, "password_hash": hash_password(admin_password),
+        "name": "Administrator", "role": "admin", "tenant_id": REAL_TENANT_ID, "shop_id": REAL_TENANT_ID,
+        "is_demo": False, "system_seeded": True, "active": True,
+        "created_at": now_iso, "password_changed_at": now_iso,
+    })
+    logger.info("Seeded explicitly configured admin user: %s", admin_email)
 
 
 async def _cleanup_demo_users() -> None:
@@ -1201,6 +1265,7 @@ async def _seed_demo_data(now_iso: str) -> None:
 async def startup():
     now_iso = datetime.now(timezone.utc).isoformat()
     await _backfill_tenant_data(now_iso)
+    await _cleanup_unsafe_real_users()
     # Repair and safely reseed demo identities before unique email indexes are enforced.
     await _seed_demo_data(now_iso)
     await raw_db.users.create_index("email", unique=True)
@@ -1219,16 +1284,7 @@ async def startup():
     }.items():
         await raw_db[collection_name].create_index([("tenant_id", 1), (date_field, -1)])
     await raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)])
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@pharmacy.com").lower()
-    admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await raw_db.users.find_one({"email": admin_email})
-    if not existing:
-        await raw_db.users.insert_one({
-            "id": str(uuid.uuid4()), "email": admin_email, "password_hash": hash_password(admin_password),
-            "name": "Administrator", "role": "admin", "tenant_id": REAL_TENANT_ID, "shop_id": REAL_TENANT_ID, "is_demo": False,
-            "created_at": now_iso, "password_changed_at": now_iso,
-        })
-        logger.info("Seeded admin user: %s", admin_email)
+    await _seed_admin_if_enabled(now_iso)
     task = asyncio.create_task(_run_startup_purchase_return_stock_recalculation())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -1453,13 +1509,13 @@ async def me(user: dict = Depends(get_current_user)):
 @api_router.get("/auth/users")
 async def list_users(user: dict = Depends(require_role("admin"))):
     if user.get("is_demo") or user.get("tenant_id") == DEMO_TENANT_ID:
-        query = {"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True}
-    else:
-        query = {
-            "tenant_id": user["tenant_id"],
-            "id": {"$ne": DEMO_USER_ID},
-            "is_demo": {"$ne": True},
-        }
+        return []
+    query = {
+        "tenant_id": user["tenant_id"],
+        "id": {"$ne": DEMO_USER_ID},
+        "is_demo": {"$ne": True},
+        "$nor": [_unsafe_seeded_user_query(user["tenant_id"])],
+    }
     return await raw_db.users.find(query, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0}).to_list(1000)
 
 
