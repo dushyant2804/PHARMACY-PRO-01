@@ -7,6 +7,7 @@ import os
 import uuid
 import logging
 import math
+import re
 import bcrypt
 import jwt
 import asyncio
@@ -1347,7 +1348,7 @@ async def startup():
     await raw_db.password_reset_requests.create_index("created_at", expireAfterSeconds=FORGOT_PASSWORD_WINDOW_MINUTES * 60)
     await raw_db.pending_signups.create_index("expires_at", expireAfterSeconds=0)
     for collection_name, indexes in {
-        "medicines": ["name", "barcode"], "invoices": ["created_at"],
+        "medicines": ["name", "batch_no", "manufacturer", "barcode"], "invoices": ["created_at"],
         "purchase_returns": ["return_date", "distributor", "medicine_name", "reason", "ledger_adjusted", "po_adjustment_id"],
     }.items():
         for index in indexes:
@@ -1692,6 +1693,105 @@ def _medicine_identity_filter(medicine_id: str) -> dict:
     }
 
 
+def _fifo_expiry_key(batch: dict) -> tuple:
+    """Sort valid expiry dates first and keep malformed dates deterministic."""
+    expiry = parse_expiry_date(batch.get("expiry_date"))
+    return (
+        expiry is None,
+        expiry or date.max,
+        str(batch.get("id") or batch.get("medicine_key") or ""),
+    )
+
+
+def _compact_billing_stock_summary(batches: list[dict]) -> dict:
+    """Return the live, compact medicine stock shape used by quick billing."""
+    ordered = sorted(batches, key=_fifo_expiry_key)
+    sellable = [batch for batch in ordered if _available_stock(batch) > 0]
+    representative = (sellable or ordered)[0]
+    thresholds = [
+        int(batch.get("low_stock_threshold"))
+        for batch in batches
+        if batch.get("low_stock_threshold") is not None
+    ]
+
+    return {
+        "medicine_id": representative.get("id") or representative.get("medicine_key"),
+        "name": representative.get("name"),
+        "available_qty": round_qty(sum(_available_stock(batch) for batch in batches)),
+        "nearest_expiry": representative.get("expiry_date"),
+        "low_stock_threshold": max(thresholds, default=10),
+        "batch_count": len(sellable),
+        "mrp": representative.get("mrp"),
+        "gst": representative.get("gst_rate"),
+    }
+
+
+@api_router.get("/medicines/search")
+async def search_medicines_for_billing(
+    q: str = "",
+    limit: int = 20,
+    user: dict = Depends(get_current_user),
+):
+    """Fast autocomplete with a compact, live stock summary for billing."""
+    limit = min(max(limit, 1), 100)
+    term = q.strip()
+    query = {}
+    if term:
+        prefix = f"^{re.escape(term)}"
+        query = {
+            "$or": [
+                {"name": {"$regex": prefix, "$options": "i"}},
+                {"batch_no": {"$regex": prefix, "$options": "i"}},
+                {"manufacturer": {"$regex": prefix, "$options": "i"}},
+                {"barcode": {"$regex": prefix, "$options": "i"}},
+            ]
+        }
+
+    matches = await db.medicines.find(
+        query,
+        {"_id": 0, "name": 1},
+    ).sort("name", 1).to_list(limit * 10)
+    names = list(dict.fromkeys(row.get("name") for row in matches if row.get("name")))[:limit]
+    if not names:
+        return []
+
+    batches = await db.medicines.find(
+        {"name": {"$in": names}},
+        {
+            "_id": 0,
+            "id": 1,
+            "medicine_key": 1,
+            "name": 1,
+            "expiry_date": 1,
+            "purchased_units": 1,
+            "purchased_quantity": 1,
+            "quantity": 1,
+            "free_quantity": 1,
+            "free_qty": 1,
+            "free_units": 1,
+            "sold_units": 1,
+            "sold_quantity": 1,
+            "purchase_return_units": 1,
+            "purchase_return_quantity": 1,
+            "returned_quantity": 1,
+            "returned_units": 1,
+            "low_stock_threshold": 1,
+            "mrp": 1,
+            "gst_rate": 1,
+        },
+    ).to_list(5000)
+
+    grouped = defaultdict(list)
+    for batch in batches:
+        grouped[batch.get("name")].append(batch)
+
+    return [
+        _compact_billing_stock_summary(grouped[name])
+        for name in names
+        if grouped[name]
+    ]
+
+
 @api_router.get("/medicines")
 async def list_medicines(
     search: Optional[str] = None,
@@ -1712,10 +1812,11 @@ async def list_medicines(
     q = {}
 
     if search:
-        q["name"] = {
-            "$regex": search,
-            "$options": "i"
-        }
+        search_pattern = re.escape(search.strip())
+        q["$or"] = [
+            {field: {"$regex": search_pattern, "$options": "i"}}
+            for field in ("name", "batch_no", "manufacturer", "barcode")
+        ]
 
     if category:
         q["category"] = category
@@ -2754,6 +2855,12 @@ async def _build_fifo_stock_plan(
 ):
 
     qty = round_qty(qty)
+    if qty <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested quantity for {medicine_name} must be greater than zero",
+        )
+
     batches = await db.medicines.find(
         {
             "name": medicine_name
@@ -2762,10 +2869,18 @@ async def _build_fifo_stock_plan(
             "_id": 0
         },
         session=session
-    ).sort(
-        "expiry_date",
-        1
-    ).to_list(100)
+    ).to_list(5000)
+    batches.sort(key=_fifo_expiry_key)
+
+    available_qty = round_qty(sum(_available_stock(batch) for batch in batches))
+    if qty > available_qty:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Requested quantity ({qty:g}) for {medicine_name} exceeds "
+                f"available stock ({available_qty:g})"
+            ),
+        )
 
     remaining = qty
     plan = []
@@ -2795,10 +2910,13 @@ async def _build_fifo_stock_plan(
             break
 
     if remaining > 0:
-
+        # Defensive guard for malformed stock rows; normal overselling is rejected above.
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient stock for {medicine_name}"
+            detail=(
+                f"Requested quantity ({qty:g}) for {medicine_name} exceeds "
+                f"available stock ({available_qty:g})"
+            ),
         )
 
     return plan
