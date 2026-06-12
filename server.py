@@ -56,7 +56,7 @@ SYSTEM_ACCOUNT_MARKERS = (
     "is_default", "default_account",
 )
 BUSINESS_COLLECTIONS = {
-    "counters", "customer_transactions", "customers", "daily_sales",
+    "counters", "customer_transactions", "customers", "daily_closings", "daily_sales",
     "daily_summary", "distributor_transactions", "distributors",
     "doctor_history", "expenses", "historical_sales", "invoices",
     "medicines", "purchase_orders", "purchase_returns", "stock_adjustments",
@@ -1076,6 +1076,81 @@ class ExpenseCreate(BaseModel):
     notes: Optional[str] = None
 
 
+DAILY_CLOSING_AMOUNT_FIELDS = (
+    "cash_sales",
+    "upi_sales",
+    "card_sales",
+    "credit_sales",
+    "expenses",
+    "expected_total",
+    "counted_cash",
+)
+
+
+class DailyClosingCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    closing_date: str
+    cash_sales: float = 0
+    upi_sales: float = 0
+    card_sales: float = 0
+    credit_sales: float = 0
+    expenses: float = 0
+    expected_total: float
+    counted_cash: float
+    notes: str = ""
+    locked: bool = False
+
+    @field_validator("closing_date")
+    @classmethod
+    def require_valid_closing_date(cls, value):
+        if not parse_iso_date(value):
+            raise ValueError("closing_date must be a valid ISO date")
+        return value
+
+    @field_validator(*DAILY_CLOSING_AMOUNT_FIELDS)
+    @classmethod
+    def require_valid_amounts(cls, value, info):
+        if not math.isfinite(value):
+            raise ValueError(f"{info.field_name} must be finite")
+        if info.field_name not in {"expected_total"} and value < 0:
+            raise ValueError(f"{info.field_name} cannot be negative")
+        return value
+
+
+class DailyClosingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    closing_date: Optional[str] = None
+    cash_sales: Optional[float] = None
+    upi_sales: Optional[float] = None
+    card_sales: Optional[float] = None
+    credit_sales: Optional[float] = None
+    expenses: Optional[float] = None
+    expected_total: Optional[float] = None
+    counted_cash: Optional[float] = None
+    notes: Optional[str] = None
+    locked: Optional[bool] = None
+
+    @field_validator("closing_date")
+    @classmethod
+    def require_valid_closing_date(cls, value):
+        if value is not None and not parse_iso_date(value):
+            raise ValueError("closing_date must be a valid ISO date")
+        return value
+
+    @field_validator(*DAILY_CLOSING_AMOUNT_FIELDS)
+    @classmethod
+    def require_valid_amounts(cls, value, info):
+        if value is None:
+            return value
+        if not math.isfinite(value):
+            raise ValueError(f"{info.field_name} must be finite")
+        if info.field_name not in {"expected_total"} and value < 0:
+            raise ValueError(f"{info.field_name} cannot be negative")
+        return value
+
+
 class PurchaseReturnCreate(BaseModel):
     return_date: str
     distributor: str
@@ -1408,6 +1483,7 @@ async def startup():
     }.items():
         await raw_db[collection_name].create_index([("tenant_id", 1), (date_field, -1)])
     await raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)])
+    await raw_db.daily_closings.create_index([("tenant_id", 1), ("closing_date", 1)], unique=True)
     await _seed_admin_if_enabled(now_iso)
     task = asyncio.create_task(_run_startup_purchase_return_stock_recalculation())
     _background_tasks.add(task)
@@ -7128,6 +7204,93 @@ async def create_daily_sale(
         for key, value in entry.items()
         if key not in {"_id", "stock_deductions"}
     }
+
+def _daily_closing_money(value: float) -> float:
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _prepare_daily_closing(closing: dict) -> dict:
+    prepared = dict(closing)
+    for field in DAILY_CLOSING_AMOUNT_FIELDS:
+        prepared[field] = _daily_closing_money(prepared.get(field, 0))
+    prepared["mismatch_amount"] = _daily_closing_money(
+        prepared["counted_cash"] - prepared["expected_total"]
+    )
+    return prepared
+
+
+def _daily_closing_public(closing: dict) -> dict:
+    return {
+        key: value
+        for key, value in closing.items()
+        if key not in {"_id", "tenant_id", "shop_id"}
+    }
+
+
+@api_router.post("/daily-closings", status_code=201)
+async def create_daily_closing(
+    payload: DailyClosingCreate,
+    user: dict = Depends(get_current_user),
+):
+    if await db.daily_closings.find_one({"closing_date": payload.closing_date}):
+        raise HTTPException(status_code=409, detail="A closing already exists for this date")
+
+    closing = _prepare_daily_closing({
+        **payload.model_dump(),
+        "id": str(uuid.uuid4()),
+        "created_by": user.get("name") or user.get("id", ""),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await db.daily_closings.insert_one(closing)
+    return _daily_closing_public(closing)
+
+
+@api_router.get("/daily-closings")
+async def list_daily_closings(user: dict = Depends(get_current_user)):
+    closings = await db.daily_closings.find({}, {"_id": 0}).sort(
+        "closing_date", -1
+    ).to_list(2000)
+    return [_daily_closing_public(closing) for closing in closings]
+
+
+@api_router.get("/daily-closings/{closing_date}")
+async def get_daily_closing(
+    closing_date: str,
+    user: dict = Depends(get_current_user),
+):
+    if not parse_iso_date(closing_date):
+        raise HTTPException(status_code=422, detail="closing_date must be a valid ISO date")
+    closing = await db.daily_closings.find_one({"closing_date": closing_date}, {"_id": 0})
+    if not closing:
+        raise HTTPException(status_code=404, detail="Daily closing not found")
+    return _daily_closing_public(closing)
+
+
+@api_router.put("/daily-closings/{closing_id}")
+async def update_daily_closing(
+    closing_id: str,
+    payload: DailyClosingUpdate,
+    user: dict = Depends(get_current_user),
+):
+    existing = await db.daily_closings.find_one({"id": closing_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Daily closing not found")
+    if existing.get("locked") and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only an admin can edit a locked closing")
+
+    changes = payload.model_dump(exclude_unset=True)
+    target_date = changes.get("closing_date")
+    if target_date and target_date != existing.get("closing_date"):
+        duplicate = await db.daily_closings.find_one({"closing_date": target_date}, {"_id": 0})
+        if duplicate:
+            raise HTTPException(status_code=409, detail="A closing already exists for this date")
+
+    updated = _prepare_daily_closing({**existing, **changes})
+    mutable_fields = {*DAILY_CLOSING_AMOUNT_FIELDS, "closing_date", "notes", "locked", "mismatch_amount"}
+    update_values = {key: updated[key] for key in mutable_fields if key in updated}
+    await db.daily_closings.update_one({"id": closing_id}, {"$set": update_values})
+    return _daily_closing_public({**existing, **update_values})
+
 
 @api_router.get("/daily-sales")
 async def list_daily_sales(
