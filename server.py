@@ -348,20 +348,46 @@ def parse_expiry_date(expiry):
         return None
 
 
+STOCK_QUANTITY_FIELDS = {
+    "purchased_units", "purchased_quantity", "quantity_units",
+    "sold_units", "sold_quantity", "free_quantity", "free_qty", "free_units",
+    "purchase_return_units", "purchase_return_quantity", "returned_quantity", "returned_units",
+    "available_stock", "current_stock", "total_stock",
+}
+
+
+def round_qty(value) -> float:
+    """Normalize medicine quantities to one decimal and eliminate negative zero."""
+    rounded = round(float(value or 0), 1)
+    return 0.0 if abs(rounded) < 0.05 else rounded
+
+
+def _normalize_inventory_quantities(value):
+    """Round stock quantity fields before returning inventory data through APIs."""
+    if isinstance(value, list):
+        return [_normalize_inventory_quantities(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: (round_qty(item) if key in STOCK_QUANTITY_FIELDS else _normalize_inventory_quantities(item))
+        for key, item in value.items()
+    }
+
+
 def _stock_quantity(medicine: dict, canonical_key: str, *fallback_keys: str) -> float:
     """Read a stock quantity while supporting older/imported field names."""
     for key in (canonical_key, *fallback_keys):
         if key in medicine and medicine.get(key) is not None:
-            return float(medicine.get(key) or 0)
+            return round_qty(medicine.get(key))
     return 0.0
 
 
 def _purchased_stock(medicine: dict) -> float:
     if "purchased_units" in medicine and medicine.get("purchased_units") is not None:
-        return float(medicine.get("purchased_units") or 0)
-    return _stock_quantity(medicine, "purchased_quantity", "quantity") + _stock_quantity(
+        return round_qty(medicine.get("purchased_units"))
+    return round_qty(_stock_quantity(medicine, "purchased_quantity", "quantity") + _stock_quantity(
         medicine, "free_quantity", "free_qty", "free_units"
-    )
+    ))
 
 
 def _purchase_return_stock(medicine: dict) -> float:
@@ -375,12 +401,12 @@ def _purchase_return_stock(medicine: dict) -> float:
 
 
 def _available_stock(medicine: dict) -> float:
-    return max(
+    return round_qty(max(
         0.0,
         _purchased_stock(medicine)
         - _stock_quantity(medicine, "sold_units", "sold_quantity")
         - _purchase_return_stock(medicine),
-    )
+    ))
 
 
 def _mongo_first_stock_value(*field_names: str) -> dict:
@@ -408,6 +434,53 @@ def _mongo_available_stock_expression() -> dict:
         "purchase_return_units", "purchase_return_quantity", "returned_quantity", "returned_units"
     )
     return {"$subtract": [{"$subtract": [purchased, sold]}, returned]}
+
+
+async def _set_rounded_stock_delta(
+    medicine_id: str, field: str, delta: float, session=None, require_available: bool = False
+):
+    """Atomically replace a stock quantity with its one-decimal calculated value."""
+    medicine = await db.medicines.find_one({"id": medicine_id}, {"_id": 0}, session=session)
+    if not medicine:
+        return None
+
+    fallback_fields = {
+        "purchased_units": ("purchased_quantity", "quantity"),
+        "sold_units": ("sold_quantity",),
+        "purchase_return_units": ("purchase_return_quantity", "returned_quantity", "returned_units"),
+    }.get(field, ())
+    current = _stock_quantity(medicine, field, *fallback_fields)
+    raw_current = next(
+        (float(medicine.get(key) or 0) for key in (field, *fallback_fields) if medicine.get(key) is not None),
+        0.0,
+    )
+    delta = round_qty(delta)
+    updated_value = round_qty(current + delta)
+    refreshed = {**medicine, field: updated_value}
+    available = _available_stock(refreshed)
+    status = _return_status(refreshed)
+    query = {
+        "id": medicine_id,
+        "$expr": {"$eq": [_mongo_first_stock_value(field, *fallback_fields), raw_current]},
+    }
+    if require_available:
+        query["$expr"] = {
+            "$and": [
+                query["$expr"],
+                {"$gte": [_mongo_available_stock_expression(), delta]},
+            ]
+        }
+    return await db.medicines.update_one(
+        query,
+        {"$set": {
+            field: updated_value,
+            "available_stock": available,
+            "quantity_units": available,
+            "return_status": status,
+            "status": status,
+        }},
+        session=session,
+    )
 
 
 def _return_status(medicine: dict) -> str:
@@ -2015,7 +2088,7 @@ async def list_medicines(
         )
     )
 
-    return result
+    return _normalize_inventory_quantities(result)
     
 @api_router.put("/medicines/{medicine_id}/threshold")
 async def update_threshold(
@@ -2050,7 +2123,7 @@ async def update_threshold(
 def _manual_sold_capacity(batch: dict) -> float:
     purchased = max(0.0, _purchased_stock(batch))
     returned = max(0.0, _purchase_return_stock(batch))
-    return max(0.0, purchased - returned)
+    return round_qty(max(0.0, purchased - returned))
 
 
 def _manual_sold_allocations(batches: list[dict], requested_sold: float) -> list[tuple[dict, float]]:
@@ -2074,7 +2147,8 @@ def _manual_sold_allocations(batches: list[dict], requested_sold: float) -> list
         )
 
     ordered = sorted(batches, key=fifo_key)
-    total_capacity = sum(_manual_sold_capacity(batch) for batch in ordered)
+    requested_sold = round_qty(requested_sold)
+    total_capacity = round_qty(sum(_manual_sold_capacity(batch) for batch in ordered))
     if requested_sold > total_capacity + 1e-9:
         raise HTTPException(
             status_code=400,
@@ -2085,14 +2159,15 @@ def _manual_sold_allocations(batches: list[dict], requested_sold: float) -> list
     allocations = []
     for batch in ordered:
         capacity = _manual_sold_capacity(batch)
-        sold = min(capacity, remaining)
+        sold = round_qty(min(capacity, remaining))
         allocations.append((batch, sold))
-        remaining = max(0.0, remaining - sold)
+        remaining = round_qty(max(0.0, remaining - sold))
 
     return allocations
 
 
 def _manual_sold_derivatives(batch: dict, sold_units: float, today: date) -> dict:
+    sold_units = round_qty(sold_units)
     refreshed = {**batch, "sold_units": sold_units}
     available = _available_stock(refreshed)
     status = _return_status(refreshed)
@@ -2157,16 +2232,17 @@ async def update_sold_units(
 
     updated_batches = await _run_with_transaction(transaction_operation, fallback_operation)
 
-    total_available = sum(_available_stock(batch) for batch in updated_batches)
-    total_purchased = sum(_purchased_stock(batch) for batch in updated_batches)
-    total_returned = sum(_purchase_return_stock(batch) for batch in updated_batches)
+    requested_sold = round_qty(requested_sold)
+    total_available = round_qty(sum(_available_stock(batch) for batch in updated_batches))
+    total_purchased = round_qty(sum(_purchased_stock(batch) for batch in updated_batches))
+    total_returned = round_qty(sum(_purchase_return_stock(batch) for batch in updated_batches))
     aggregate_status = _return_status({
         "purchased_units": total_purchased,
         "sold_units": requested_sold,
         "purchase_return_units": total_returned,
     })
 
-    return {
+    return _normalize_inventory_quantities({
         "message": "sold qty updated",
         "sold_units": requested_sold,
         "available_stock": total_available,
@@ -2174,7 +2250,7 @@ async def update_sold_units(
         "return_status": aggregate_status,
         "status": aggregate_status,
         "batches": updated_batches,
-    }
+    })
 
 
 @api_router.post("/historical-sales")
@@ -2289,18 +2365,19 @@ async def create_medicine(
 
     med = Medicine(
         **data,
-        purchased_units=data.get("purchased_units", 0),
+        purchased_units=round_qty(data.get("purchased_units", 0)),
     )
 
-    await db.medicines.insert_one(med.model_dump())
-    return med.model_dump()
+    medicine = _normalize_inventory_quantities(med.model_dump())
+    await db.medicines.insert_one(medicine)
+    return medicine
 
 @api_router.get("/medicines/lookup/{barcode}")
 async def lookup_barcode(barcode: str, user: dict = Depends(get_current_user)):
     med = await db.medicines.find_one({"barcode": barcode}, {"_id": 0})
     if not med:
         raise HTTPException(status_code=404, detail="Not found")
-    return med
+    return _normalize_inventory_quantities(med)
 
 
 @api_router.post("/patients")
@@ -2417,6 +2494,7 @@ async def update_medicine(
 ):
     data = payload.model_dump()
     data.pop("auto_ledger", None)
+    data["purchased_units"] = round_qty(data.get("purchased_units", 0))
 
     res = await db.medicines.update_one(
         {"id": med_id},
@@ -2426,7 +2504,7 @@ async def update_medicine(
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Medicine not found")
 
-    return await db.medicines.find_one({"id": med_id}, {"_id": 0})
+    return _normalize_inventory_quantities(await db.medicines.find_one({"id": med_id}, {"_id": 0}))
 
 
 @api_router.delete("/medicines/{med_id}")
@@ -2671,10 +2749,11 @@ async def _run_with_transaction(operation, fallback):
 
 async def _build_fifo_stock_plan(
     medicine_name: str,
-    qty: int,
+    qty: float,
     session=None
 ):
 
+    qty = round_qty(qty)
     batches = await db.medicines.find(
         {
             "name": medicine_name
@@ -2706,10 +2785,11 @@ async def _build_fifo_stock_plan(
         plan.append({
             "medicine_id": batch["id"],
             "medicine_name": medicine_name,
-            "deduct": deduct,
+            "deduct": round_qty(deduct),
+            "sold_units_before": _stock_quantity(batch, "sold_units", "sold_quantity"),
         })
 
-        remaining -= deduct
+        remaining = round_qty(remaining - deduct)
 
         if remaining <= 0:
             break
@@ -2733,20 +2813,12 @@ async def _apply_fifo_stock_plan(
 
     for step in plan:
 
-        result = await db.medicines.update_one(
-            {
-                "id": step["medicine_id"],
-                "$expr": {"$gte": [_mongo_available_stock_expression(), step["deduct"]]}
-            },
-            {
-                "$inc": {
-                    "sold_units": step["deduct"]
-                }
-            },
-            session=session
+        result = await _set_rounded_stock_delta(
+            step["medicine_id"], "sold_units", step["deduct"],
+            session=session, require_available=True,
         )
 
-        if result.modified_count != 1:
+        if not result or result.modified_count != 1:
             raise HTTPException(
                 status_code=409,
                 detail=f"Stock changed while processing {step['medicine_name']}. Please retry."
@@ -2760,7 +2832,7 @@ async def _apply_fifo_stock_plan(
 
 
 async def _apply_fifo_stock_requests(
-    stock_requests: dict[str, int],
+    stock_requests: dict[str, float],
     session=None,
     applied=None
 ):
@@ -2785,24 +2857,11 @@ async def _apply_fifo_stock_requests(
 
 async def _restore_fifo_stock(applied: list[dict]):
     for step in reversed(applied):
-        result = await db.medicines.update_one(
-            {
-                "id": step["medicine_id"],
-                "$expr": {
-                    "$gte": [
-                        {"$ifNull": ["$sold_units", 0]},
-                        step["deduct"],
-                    ]
-                }
-            },
-            {
-                "$inc": {
-                    "sold_units": -step["deduct"]
-                }
-            }
+        result = await _set_rounded_stock_delta(
+            step["medicine_id"], "sold_units", -step["deduct"]
         )
 
-        if result.modified_count != 1:
+        if not result or result.modified_count != 1:
             logger.error(
                 "Could not automatically restore %s units for medicine %s without "
                 "making sold_units negative; manual stock reconciliation may be needed",
@@ -2816,10 +2875,10 @@ def _stock_deductions_from_steps(steps: list[dict]) -> list[dict]:
         {
             "medicine_id": step["medicine_id"],
             "medicine_name": step.get("medicine_name", ""),
-            "deduct": int(step.get("deduct", 0)),
+            "deduct": round_qty(step.get("deduct", 0)),
         }
         for step in steps
-        if int(step.get("deduct", 0)) > 0
+        if round_qty(step.get("deduct", 0)) > 0
     ]
 
 
@@ -2832,7 +2891,7 @@ def _stock_deductions_from_daily_sale(sale: dict) -> list[dict]:
         {
             "medicine_id": sale["medicine_id"],
             "medicine_name": sale.get("medicine_name", ""),
-            "deduct": int(
+            "deduct": round_qty(
                 sale.get(
                     "units_dispensed",
                     sale.get("quantity", 0)
@@ -2849,29 +2908,15 @@ async def _restore_daily_sale_stock(
     restored=None
 ):
     for step in reversed(deductions):
-        deduct = int(step.get("deduct", 0))
+        deduct = round_qty(step.get("deduct", 0))
         if deduct <= 0:
             continue
 
-        result = await db.medicines.update_one(
-            {
-                "id": step["medicine_id"],
-                "$expr": {
-                    "$gte": [
-                        {"$ifNull": ["$sold_units", 0]},
-                        deduct,
-                    ]
-                }
-            },
-            {
-                "$inc": {
-                    "sold_units": -deduct
-                }
-            },
-            session=session,
+        result = await _set_rounded_stock_delta(
+            step["medicine_id"], "sold_units", -deduct, session=session
         )
 
-        if result.modified_count != 1:
+        if not result or result.modified_count != 1:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -2887,25 +2932,18 @@ async def _restore_daily_sale_stock(
 
 async def _reapply_daily_sale_stock(restored: list[dict]):
     for step in reversed(restored):
-        deduct = int(step.get("deduct", 0))
+        deduct = round_qty(step.get("deduct", 0))
         if deduct <= 0:
             continue
 
-        await db.medicines.update_one(
-            {
-                "id": step["medicine_id"]
-            },
-            {
-                "$inc": {
-                    "sold_units": deduct
-                }
-            }
+        await _set_rounded_stock_delta(
+            step["medicine_id"], "sold_units", deduct, require_available=True
         )
 
 
 async def reduce_fifo_stock(
     medicine_name: str,
-    qty: int,
+    qty: float,
     session=None
 ):
     plan = await _build_fifo_stock_plan(
@@ -2929,7 +2967,7 @@ async def create_invoice(
     gst_total = 0.0
     items_out = []
     line_total_raw = 0.0
-    stock_requests = defaultdict(int)
+    stock_requests = defaultdict(float)
 
     for item in payload.items:
 
@@ -2952,11 +2990,11 @@ async def create_invoice(
             1
         )
 
-        units_needed = item.quantity * (
+        units_needed = round_qty(item.quantity * (
             upb if item.unit_type == "box" else 1
-        )
+        ))
 
-        stock_requests[item.name] += units_needed
+        stock_requests[item.name] = round_qty(stock_requests[item.name] + units_needed)
 
         unit_price = item.mrp * (
             upb if item.unit_type == "box" else 1
@@ -4680,6 +4718,7 @@ def _match_purchase_return_medicine(
 
 
 def _inventory_derivatives(medicine: dict, purchase_return_units: float) -> dict:
+    purchase_return_units = round_qty(purchase_return_units)
     refreshed = {**medicine, "purchase_return_units": purchase_return_units}
     available = _available_stock(refreshed)
     status = _return_status(refreshed)
@@ -4814,15 +4853,11 @@ async def run_stock_repair(user: dict = Depends(require_role("admin"))):
 
 
 async def _deduct_purchase_return_stock(medicine_id: str, quantity: float, session=None):
-    result = await db.medicines.update_one(
-        {
-            "id": medicine_id,
-            "$expr": {"$gte": [_mongo_available_stock_expression(), quantity]},
-        },
-        {"$inc": {"purchase_return_units": quantity}},
-        session=session,
+    result = await _set_rounded_stock_delta(
+        medicine_id, "purchase_return_units", quantity,
+        session=session, require_available=True,
     )
-    if result.modified_count != 1:
+    if not result or result.modified_count != 1:
         raise HTTPException(status_code=409, detail="Return quantity exceeds available stock for this batch")
 
 
@@ -4928,9 +4963,8 @@ async def create_purchase_return(
                 await db.distributor_transactions.insert_one(ledger_txn)
         except Exception:
             if stock_deducted:
-                await db.medicines.update_one(
-                    {"id": medicine.get("id")},
-                    {"$inc": {"purchase_return_units": -payload.return_quantity}},
+                await _set_rounded_stock_delta(
+                    medicine.get("id"), "purchase_return_units", -payload.return_quantity
                 )
             raise
 
@@ -4946,12 +4980,10 @@ async def _set_purchase_return_stock_delta(medicine_id: str, delta: float, sessi
     """Apply a physical return delta; positive removes stock, negative restores it."""
     if delta > 0:
         return await _deduct_purchase_return_stock(medicine_id, delta, session=session)
-    result = await db.medicines.update_one(
-        {"id": medicine_id},
-        {"$inc": {"purchase_return_units": delta}},
-        session=session,
+    result = await _set_rounded_stock_delta(
+        medicine_id, "purchase_return_units", delta, session=session
     )
-    if result.modified_count != 1:
+    if not result or result.modified_count != 1:
         raise HTTPException(status_code=404, detail="Medicine batch not found")
 
 
@@ -5008,7 +5040,7 @@ async def update_purchase_return(
             {"$set": {key: value for key, value in updated.items() if key != "_id"}},
             session=session,
         )
-        if result.modified_count != 1:
+        if not result or result.modified_count != 1:
             raise HTTPException(status_code=409, detail="Purchase return changed or was applied to a purchase order")
         return _return_public(updated)
 
@@ -5020,7 +5052,7 @@ async def update_purchase_return(
             return await write()
         except Exception:
             if delta:
-                await db.medicines.update_one({"id": current["medicine_id"]}, {"$inc": {"purchase_return_units": -delta}})
+                await _set_rounded_stock_delta(current["medicine_id"], "purchase_return_units", -delta)
             raise
 
     return await _run_with_transaction(transaction_operation, fallback_operation)
@@ -6039,6 +6071,8 @@ async def backup_import(payload: dict, user: dict = Depends(require_role("admin"
     counts = {}
     for c in collections:
         items = payload.get(c, [])
+        if c == "medicines":
+            items = [_normalize_inventory_quantities(item) for item in items]
         if items:
             await db[c].delete_many({})
             await db[c].insert_many(items)
@@ -6393,6 +6427,8 @@ async def create_po(
     "items": [
         {
             **i.model_dump(),
+            "quantity": round_qty(i.quantity),
+            "free_quantity": round_qty(i.free_quantity),
             "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
             "expiry_date": normalize_expiry(i.expiry_date),
         }
@@ -6443,9 +6479,8 @@ async def delete_po(
 
     for i in po.get("items", []):
 
-        qty = (
-            float(i.get("quantity", 0)) +
-            float(i.get("free_quantity", 0))
+        qty = round_qty(
+            round_qty(i.get("quantity", 0)) + round_qty(i.get("free_quantity", 0))
         )
 
         medicine = await db.medicines.find_one({
@@ -6455,13 +6490,8 @@ async def delete_po(
 
         if medicine:
 
-            await db.medicines.update_one(
-                {"_id": medicine["_id"]},
-                {
-                    "$inc": {
-                        "purchased_units": -qty
-                    }
-                }
+            await _set_rounded_stock_delta(
+                medicine["id"], "purchased_units", -qty
             )
 
     if po.get("purchase_return_ids"):
@@ -6519,6 +6549,8 @@ async def update_po(
                 "items": [
                    {
                      **i.model_dump(),
+                     "quantity": round_qty(i.quantity),
+                     "free_quantity": round_qty(i.free_quantity),
                      "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
                      "expiry_date": normalize_expiry(i.expiry_date),
                    }
@@ -6924,9 +6956,9 @@ async def rebuild_inventory():
                 continue
 
             qty = (
-                float(i.get("quantity", 0))
+                round_qty(i.get("quantity", 0))
                 +
-                float(i.get("free_quantity", 0))
+                round_qty(i.get("free_quantity", 0))
             )
 
             existing = existing_medicines.get(key)
@@ -6979,7 +7011,7 @@ async def rebuild_inventory():
 
                     # MANUAL SOLD QTY PRESERVED
                     "sold_units":
-                        existing.get("sold_units", 0)
+                        round_qty(existing.get("sold_units", 0))
                         if existing else 0,
 
                     # PURCHASE RETURNS PRESERVED
@@ -6998,7 +7030,7 @@ async def rebuild_inventory():
                        else str(uuid.uuid4()),
                 }
 
-            medicines[key]["purchased_units"] += qty
+            medicines[key]["purchased_units"] = round_qty(medicines[key]["purchased_units"] + qty)
 
     # FULL REBUILD
     await db.medicines.delete_many({})
