@@ -59,7 +59,7 @@ BUSINESS_COLLECTIONS = {
     "counters", "customer_transactions", "customers", "daily_sales",
     "daily_summary", "distributor_transactions", "distributors",
     "doctor_history", "expenses", "historical_sales", "invoices",
-    "medicines", "purchase_orders", "purchase_returns",
+    "medicines", "purchase_orders", "purchase_returns", "stock_adjustments",
     "regular_patients", "settings",
 }
 _request_active = ContextVar("request_active", default=False)
@@ -353,7 +353,7 @@ STOCK_QUANTITY_FIELDS = {
     "purchased_units", "purchased_quantity", "quantity_units",
     "sold_units", "sold_quantity", "free_quantity", "free_qty", "free_units",
     "purchase_return_units", "purchase_return_quantity", "returned_quantity", "returned_units",
-    "available_stock", "current_stock", "total_stock",
+    "available_stock", "current_stock", "total_stock", "stock_adjustment_units",
 }
 
 
@@ -391,6 +391,10 @@ def _purchased_stock(medicine: dict) -> float:
     ))
 
 
+def _stock_adjustment_stock(medicine: dict) -> float:
+    return _stock_quantity(medicine, "stock_adjustment_units")
+
+
 def _purchase_return_stock(medicine: dict) -> float:
     return _stock_quantity(
         medicine,
@@ -405,6 +409,7 @@ def _available_stock(medicine: dict) -> float:
     return round_qty(max(
         0.0,
         _purchased_stock(medicine)
+        + _stock_adjustment_stock(medicine)
         - _stock_quantity(medicine, "sold_units", "sold_quantity")
         - _purchase_return_stock(medicine),
     ))
@@ -434,7 +439,8 @@ def _mongo_available_stock_expression() -> dict:
     returned = _mongo_first_stock_value(
         "purchase_return_units", "purchase_return_quantity", "returned_quantity", "returned_units"
     )
-    return {"$subtract": [{"$subtract": [purchased, sold]}, returned]}
+    adjustment = _mongo_first_stock_value("stock_adjustment_units")
+    return {"$subtract": [{"$subtract": [{"$add": [purchased, adjustment]}, sold]}, returned]}
 
 
 async def _set_rounded_stock_delta(
@@ -485,7 +491,7 @@ async def _set_rounded_stock_delta(
 
 
 def _return_status(medicine: dict) -> str:
-    purchased = _purchased_stock(medicine)
+    purchased = round_qty(_purchased_stock(medicine) + _stock_adjustment_stock(medicine))
     sold = _stock_quantity(medicine, "sold_units", "sold_quantity")
     returned = _purchase_return_stock(medicine)
     available = _available_stock(medicine)
@@ -784,6 +790,49 @@ class MedicineCreate(BaseModel):
 
     auto_ledger: bool = True
     
+STOCK_ADJUSTMENT_TYPES = Literal[
+    "Damaged",
+    "Expired",
+    "Broken Strip",
+    "Sample Given",
+    "Physical Count Mismatch",
+    "Theft/Loss",
+    "Manual Correction",
+    "Other",
+]
+
+
+class StockAdjustmentCreate(BaseModel):
+    adjustment_date: str
+    medicine_id: str
+    medicine_name: Optional[str] = None
+    batch_no: Optional[str] = None
+    adjustment_type: STOCK_ADJUSTMENT_TYPES
+    quantity: float
+    notes: str = ""
+    reference_number: str = ""
+
+    @field_validator("adjustment_date")
+    @classmethod
+    def require_valid_adjustment_date(cls, value):
+        if not parse_iso_date(value):
+            raise ValueError("adjustment_date must be a valid ISO date")
+        return value
+
+    @field_validator("medicine_id", "medicine_name", "batch_no", "notes", "reference_number", mode="before")
+    @classmethod
+    def trim_adjustment_strings(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("quantity")
+    @classmethod
+    def require_nonzero_finite_quantity(cls, value):
+        value = round_qty(value)
+        if not math.isfinite(value) or value == 0:
+            raise ValueError("quantity must be a non-zero finite number")
+        return value
+
+
 class RegularPatient(BaseModel):
     name: str
     age: int
@@ -1772,6 +1821,7 @@ async def search_medicines_for_billing(
             "sold_units": 1,
             "sold_quantity": 1,
             "purchase_return_units": 1,
+            "stock_adjustment_units": 1,
             "purchase_return_quantity": 1,
             "returned_quantity": 1,
             "returned_units": 1,
@@ -2000,6 +2050,9 @@ async def list_medicines(
                 "purchase_return_units":
                     0,
 
+                "stock_adjustment_units":
+                    0,
+
                 "return_status":
                     return_status,
 
@@ -2033,8 +2086,10 @@ async def list_medicines(
 
         grouped[name]["total_stock"] += qty
         grouped[name]["purchase_return_units"] += returned
+        grouped[name]["stock_adjustment_units"] += _stock_adjustment_stock(m)
         grouped[name]["return_status"] = _return_status({
             "purchased_units": grouped[name].get("purchased_units", 0) + purchased,
+            "stock_adjustment_units": grouped[name]["stock_adjustment_units"],
             "sold_units": grouped[name].get("sold_units", 0) + sold,
             "purchase_return_units": grouped[name]["purchase_return_units"],
         })
@@ -2153,6 +2208,9 @@ async def list_medicines(
             "purchase_return_units":
                 returned,
 
+            "stock_adjustment_units":
+                _stock_adjustment_stock(m),
+
             "return_status":
                 return_status,
 
@@ -2222,7 +2280,7 @@ async def update_threshold(
     }
 
 def _manual_sold_capacity(batch: dict) -> float:
-    purchased = max(0.0, _purchased_stock(batch))
+    purchased = max(0.0, _purchased_stock(batch) + _stock_adjustment_stock(batch))
     returned = max(0.0, _purchase_return_stock(batch))
     return round_qty(max(0.0, purchased - returned))
 
@@ -2352,6 +2410,191 @@ async def update_sold_units(
         "status": aggregate_status,
         "batches": updated_batches,
     })
+
+
+def _stock_adjustment_derivatives(medicine: dict, adjustment_units: float, today: date) -> dict:
+    adjustment_units = round_qty(adjustment_units)
+    refreshed = {**medicine, "stock_adjustment_units": adjustment_units}
+    available = _available_stock(refreshed)
+    status = _return_status(refreshed)
+    threshold = refreshed.get("low_stock_threshold")
+    is_low_stock = threshold is not None and available <= float(threshold)
+    return {
+        "stock_adjustment_units": adjustment_units,
+        "available_stock": available,
+        "quantity_units": available,
+        "is_low_stock": is_low_stock,
+        "low_stock": is_low_stock,
+        "return_status": status,
+        "status": status,
+        **expiry_details(refreshed.get("expiry_date"), today),
+    }
+
+
+async def _apply_stock_adjustment_delta(medicine: dict, delta: float, session=None) -> dict:
+    delta = round_qty(delta)
+    available = _available_stock(medicine)
+    if delta < 0 and abs(delta) > available + 1e-9:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Adjustment cannot reduce stock below zero; available stock is {available:g}",
+        )
+
+    current_adjustment = _stock_adjustment_stock(medicine)
+    derivatives = _stock_adjustment_derivatives(
+        medicine,
+        round_qty(current_adjustment + delta),
+        datetime.now(timezone.utc).date(),
+    )
+    query = _medicine_identity_filter(medicine.get("id") or medicine.get("medicine_key"))
+    query["$expr"] = {
+        "$and": [
+            {"$eq": [_mongo_first_stock_value("stock_adjustment_units"), current_adjustment]},
+            {"$eq": [_mongo_available_stock_expression(), available]},
+        ]
+    }
+    result = await db.medicines.update_one(query, {"$set": derivatives}, session=session)
+    if not result or result.modified_count != 1:
+        raise HTTPException(status_code=409, detail="Medicine stock changed; retry the adjustment")
+    return {**medicine, **derivatives}
+
+
+def _stock_adjustment_public(adjustment: dict) -> dict:
+    return {key: value for key, value in adjustment.items() if key not in {"_id", "tenant_id", "shop_id"}}
+
+
+def _stock_adjustment_query(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    adjustment_type: Optional[str] = None,
+    medicine_id: Optional[str] = None,
+    search: Optional[str] = None,
+) -> dict:
+    query = {}
+    if start or end:
+        query["adjustment_date"] = {}
+        if start:
+            query["adjustment_date"]["$gte"] = start
+        if end:
+            query["adjustment_date"]["$lte"] = end
+    if adjustment_type:
+        query["adjustment_type"] = adjustment_type
+    if medicine_id:
+        query["medicine_id"] = medicine_id
+    if search:
+        pattern = re.escape(search.strip())
+        query["$or"] = [
+            {field: {"$regex": pattern, "$options": "i"}}
+            for field in ("medicine_name", "batch_no", "reference_number", "notes")
+        ]
+    return query
+
+
+@api_router.post("/stock-adjustments")
+async def create_stock_adjustment(
+    payload: StockAdjustmentCreate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    medicine = await db.medicines.find_one(_medicine_identity_filter(payload.medicine_id), {"_id": 0})
+    if not medicine:
+        raise HTTPException(status_code=404, detail="Medicine batch not found")
+    if payload.medicine_name and payload.medicine_name.casefold() != str(medicine.get("name") or "").casefold():
+        raise HTTPException(status_code=400, detail="medicine_name does not match the selected batch")
+    if payload.batch_no and payload.batch_no.casefold() != str(medicine.get("batch_no") or "").casefold():
+        raise HTTPException(status_code=400, detail="batch_no does not match the selected batch")
+
+    adjustment = {
+        "id": str(uuid.uuid4()),
+        "adjustment_date": payload.adjustment_date,
+        "medicine_id": medicine.get("id") or payload.medicine_id,
+        "medicine_name": medicine.get("name") or payload.medicine_name or "",
+        "batch_no": medicine.get("batch_no") or payload.batch_no or "",
+        "adjustment_type": payload.adjustment_type,
+        "quantity": round_qty(payload.quantity),
+        "notes": payload.notes,
+        "reference_number": payload.reference_number,
+        "created_by": user.get("name") or user.get("email") or user.get("id") or "Unknown",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    async def write(session=None):
+        await _apply_stock_adjustment_delta(medicine, adjustment["quantity"], session=session)
+        await db.stock_adjustments.insert_one(adjustment, session=session)
+        return _stock_adjustment_public(adjustment)
+
+    async def transaction_operation(session):
+        return await write(session=session)
+
+    async def fallback_operation():
+        try:
+            return await write()
+        except Exception:
+            refreshed = await db.medicines.find_one(_medicine_identity_filter(payload.medicine_id), {"_id": 0})
+            if refreshed and _stock_adjustment_stock(refreshed) == round_qty(
+                _stock_adjustment_stock(medicine) + adjustment["quantity"]
+            ):
+                await _apply_stock_adjustment_delta(refreshed, -adjustment["quantity"])
+            raise
+
+    return await _run_with_transaction(transaction_operation, fallback_operation)
+
+
+@api_router.get("/stock-adjustments/summary")
+async def stock_adjustment_summary(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    adjustment_type: Optional[str] = None,
+    medicine_id: Optional[str] = None,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    items = await db.stock_adjustments.find(
+        _stock_adjustment_query(start, end, adjustment_type, medicine_id),
+        {"_id": 0, "adjustment_type": 1, "quantity": 1},
+    ).to_list(100000)
+    by_type = defaultdict(lambda: {"count": 0, "net_quantity": 0.0})
+    positive = negative = 0.0
+    for item in items:
+        quantity = round_qty(item.get("quantity"))
+        bucket = by_type[item.get("adjustment_type") or "Other"]
+        bucket["count"] += 1
+        bucket["net_quantity"] = round_qty(bucket["net_quantity"] + quantity)
+        if quantity > 0:
+            positive = round_qty(positive + quantity)
+        else:
+            negative = round_qty(negative + quantity)
+    return {
+        "total_adjustments": len(items),
+        "net_quantity": round_qty(positive + negative),
+        "positive_quantity": positive,
+        "negative_quantity": negative,
+        "by_type": dict(by_type),
+    }
+
+
+@api_router.get("/stock-adjustments")
+async def list_stock_adjustments(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    adjustment_type: Optional[str] = None,
+    medicine_id: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 25,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
+    query = _stock_adjustment_query(start, end, adjustment_type, medicine_id, search)
+    total = await db.stock_adjustments.count_documents(query)
+    items = await db.stock_adjustments.find(query, {"_id": 0}).sort(
+        [("adjustment_date", -1), ("created_at", -1)]
+    ).skip((page - 1) * page_size).limit(page_size).to_list(page_size)
+    return {
+        "items": [_stock_adjustment_public(item) for item in items],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @api_router.post("/historical-sales")
@@ -7135,6 +7378,11 @@ async def rebuild_inventory():
                     # PURCHASE RETURNS PRESERVED
                     "purchase_return_units":
                         _purchase_return_stock(existing)
+                        if existing else 0,
+
+                    # AUDITED STOCK ADJUSTMENTS PRESERVED
+                    "stock_adjustment_units":
+                        _stock_adjustment_stock(existing)
                         if existing else 0,
 
                     # MANUAL THRESHOLD PRESERVED
