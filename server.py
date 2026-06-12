@@ -6,6 +6,7 @@ load_dotenv(ROOT_DIR / '.env')
 import os
 import uuid
 import logging
+import math
 import bcrypt
 import jwt
 import asyncio
@@ -2046,33 +2047,133 @@ async def update_threshold(
         "low_stock_threshold": updated.get("low_stock_threshold")
     }
 
+def _manual_sold_capacity(batch: dict) -> float:
+    purchased = max(0.0, _purchased_stock(batch))
+    returned = max(0.0, _purchase_return_stock(batch))
+    return max(0.0, purchased - returned)
+
+
+def _manual_sold_allocations(batches: list[dict], requested_sold: float) -> list[tuple[dict, float]]:
+    """Return a canonical FIFO sold allocation for one medicine's batches.
+
+    Rebuilding the complete allocation (rather than applying the delta to one
+    batch) also makes reductions naturally unwind from the newest FIFO batches
+    first. Purchase-returned units are excluded from each batch's sellable
+    capacity.
+    """
+    if not math.isfinite(requested_sold) or requested_sold < 0:
+        raise HTTPException(status_code=400, detail="Sold quantity must be a non-negative number")
+
+    def fifo_key(batch: dict):
+        expiry = parse_expiry_date(batch.get("expiry_date"))
+        return (
+            expiry is None,
+            expiry or date.max,
+            str(batch.get("created_at") or ""),
+            str(batch.get("id") or batch.get("medicine_key") or ""),
+        )
+
+    ordered = sorted(batches, key=fifo_key)
+    total_capacity = sum(_manual_sold_capacity(batch) for batch in ordered)
+    if requested_sold > total_capacity + 1e-9:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sold quantity cannot exceed sellable stock ({total_capacity:g})",
+        )
+
+    remaining = requested_sold
+    allocations = []
+    for batch in ordered:
+        capacity = _manual_sold_capacity(batch)
+        sold = min(capacity, remaining)
+        allocations.append((batch, sold))
+        remaining = max(0.0, remaining - sold)
+
+    return allocations
+
+
+def _manual_sold_derivatives(batch: dict, sold_units: float, today: date) -> dict:
+    refreshed = {**batch, "sold_units": sold_units}
+    available = _available_stock(refreshed)
+    status = _return_status(refreshed)
+    return {
+        "sold_units": sold_units,
+        "available_stock": available,
+        "quantity_units": available,
+        "return_status": status,
+        "status": status,
+        **expiry_details(refreshed.get("expiry_date"), today),
+    }
+
+
+async def _set_manual_sold_allocations(allocations: list[tuple[dict, float]], session=None) -> list[dict]:
+    today = datetime.now(timezone.utc).date()
+    updated_batches = []
+    for batch, sold_units in allocations:
+        derivatives = _manual_sold_derivatives(batch, sold_units, today)
+        await db.medicines.update_one(
+            _medicine_identity_filter(batch.get("id") or batch.get("medicine_key")),
+            {"$set": derivatives},
+            session=session,
+        )
+        updated_batches.append({**batch, **derivatives})
+    return updated_batches
+
+
 @api_router.put("/medicines/{medicine_id}/sold")
 async def update_sold_units(
     medicine_id: str,
     payload: dict,
     user: dict = Depends(require_role("admin", "pharmacist"))
 ):
-
-    medicine_filter = _medicine_identity_filter(medicine_id)
-
-    result = await db.medicines.update_one(
-        medicine_filter,
-        {
-            "$set": {
-                "sold_units":
-                    float(payload["sold_units"])
-            }
-        }
-    )
-
-    if result.matched_count == 0:
+    medicine = await db.medicines.find_one(_medicine_identity_filter(medicine_id), {"_id": 0})
+    if not medicine:
         raise HTTPException(404, "Medicine not found")
 
-    updated = await db.medicines.find_one(medicine_filter)
+    try:
+        requested_sold = float(payload["sold_units"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Sold quantity must be a non-negative number")
+
+    batches = await db.medicines.find(
+        {"name": medicine.get("name")},
+        {"_id": 0},
+    ).to_list(5000)
+    allocations = _manual_sold_allocations(batches, requested_sold)
+
+    async def transaction_operation(session):
+        return await _set_manual_sold_allocations(allocations, session=session)
+
+    async def fallback_operation():
+        try:
+            return await _set_manual_sold_allocations(allocations)
+        except Exception:
+            original_allocations = [
+                (batch, _stock_quantity(batch, "sold_units", "sold_quantity"))
+                for batch, _ in allocations
+            ]
+            await _set_manual_sold_allocations(original_allocations)
+            raise
+
+    updated_batches = await _run_with_transaction(transaction_operation, fallback_operation)
+
+    total_available = sum(_available_stock(batch) for batch in updated_batches)
+    total_purchased = sum(_purchased_stock(batch) for batch in updated_batches)
+    total_returned = sum(_purchase_return_stock(batch) for batch in updated_batches)
+    aggregate_status = _return_status({
+        "purchased_units": total_purchased,
+        "sold_units": requested_sold,
+        "purchase_return_units": total_returned,
+    })
 
     return {
         "message": "sold qty updated",
-        "sold_units": updated.get("sold_units")
+        "sold_units": requested_sold,
+        "available_stock": total_available,
+        "quantity_units": total_available,
+        "return_status": aggregate_status,
+        "status": aggregate_status,
+        "batches": updated_batches,
     }
 
 
