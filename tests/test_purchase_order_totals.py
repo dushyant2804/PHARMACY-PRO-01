@@ -4,10 +4,28 @@ import unittest
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "test_pharmacy")
 
-from server import POCreate, POItem, _calculate_purchase_order_totals
+from server import POCreate, POItem, _calculate_purchase_order_totals, _purchase_return_credit, _round_ledger_money
 
 
 class PurchaseOrderTotalsTest(unittest.TestCase):
+    def test_money_uses_decimal_half_up_rounding(self):
+        payload = POCreate(
+            distributor_id="dist-1",
+            distributor_name="Distributor",
+            invoice_ref="INV-precision",
+            scheme_discount=0.005,
+            cash_discount=0.004,
+            items=[POItem(name="item", batch_no="b1", quantity=1, purchase_price=10.005, mrp=0, gst_rate=5)],
+        )
+
+        totals = _calculate_purchase_order_totals(payload)
+
+        self.assertEqual(totals["sub_total"], 10.01)
+        self.assertEqual(totals["scheme_discount"], 0.01)
+        self.assertEqual(totals["cash_discount"], 0.0)
+        self.assertEqual(_purchase_return_credit({"return_quantity": 1, "purchase_rate": 2.675}), 2.68)
+        self.assertEqual(_round_ledger_money(2.675), 2.68)
+
     def test_discount_is_distributed_by_gst_slab_before_tax(self):
         payload = POCreate(
             distributor_id="dist-1",

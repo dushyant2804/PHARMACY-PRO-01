@@ -112,6 +112,39 @@ class PurchaseOrderReturnMergeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_db.purchase_returns.rows), 1)
         stock_delta.assert_not_awaited()
 
+    async def test_inline_po_return_matches_without_expiry_and_preserves_history(self):
+        existing = {
+            "id": "return-1", "distributor_id": "dist-1", "medicine_name": "Qutan 50",
+            "batch_number": "B1", "return_quantity": 2, "purchase_rate": 10,
+            "reason": "Expired", "ledger_adjusted": False,
+        }
+        fake_db = SimpleNamespace(purchase_returns=Collection([existing]), medicines=Collection([]))
+        row = POReturnCreditRow(
+            medicine_name="Qutan 50", batch_number="B1", expiry_date="12/27",
+            return_quantity=2, purchase_rate=10, reason="Expired",
+        )
+        with patch("server.db", fake_db), patch("server._set_purchase_return_stock_delta", new=AsyncMock()) as stock_delta:
+            returns, credit = await _resolve_po_purchase_returns(self.payload([row]))
+        self.assertEqual(returns[0]["id"], "return-1")
+        self.assertEqual(credit, 20.0)
+        self.assertEqual(fake_db.purchase_returns.rows, [existing])
+        stock_delta.assert_not_awaited()
+
+    async def test_ledger_adjusted_return_is_not_consumed_or_duplicated(self):
+        existing = {
+            "id": "return-1", "distributor_id": "dist-1", "medicine_name": "Qutan 50",
+            "batch_number": "B1", "expiry_date": "12/27", "return_quantity": 2,
+            "purchase_rate": 10, "ledger_adjusted": True,
+        }
+        fake_db = SimpleNamespace(purchase_returns=Collection([existing]), medicines=Collection([]))
+        row = POReturnCreditRow(id="return-1", medicine_name="Qutan 50", batch_number="B1", return_quantity=2, purchase_rate=10)
+        with patch("server.db", fake_db), patch("server._set_purchase_return_stock_delta", new=AsyncMock()) as stock_delta:
+            with self.assertRaises(HTTPException) as caught:
+                await _resolve_po_purchase_returns(self.payload([row]))
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(len(fake_db.purchase_returns.rows), 1)
+        stock_delta.assert_not_awaited()
+
     async def test_inline_po_return_without_match_creates_once_without_ledger(self):
         medicine = {"id": "med-1", "name": "Saltum DS", "batch_no": "B2", "medicine_key": "saltum ds::B2", "gst_rate": 5}
         fake_db = SimpleNamespace(purchase_returns=Collection([]), medicines=Collection([medicine]))
