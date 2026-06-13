@@ -837,15 +837,16 @@ class MedicineCreate(BaseModel):
 
     auto_ledger: bool = True
     
+# Keep migration-only types separate so they can be removed from the normal
+# workflow without changing the permanent adjustment types. Existing records
+# may contain legacy labels and remain readable through the history endpoints.
+PERMANENT_STOCK_ADJUSTMENT_TYPES = ("damaged", "expired", "correction")
+MIGRATION_ONLY_STOCK_ADJUSTMENT_TYPES = ("opening_reconciliation",)
 STOCK_ADJUSTMENT_TYPES = Literal[
-    "Damaged",
-    "Expired",
-    "Broken Strip",
-    "Sample Given",
-    "Physical Count Mismatch",
-    "Theft/Loss",
-    "Manual Correction",
-    "Other",
+    "damaged",
+    "expired",
+    "correction",
+    "opening_reconciliation",
 ]
 
 
@@ -2666,6 +2667,8 @@ async def create_stock_adjustment(
     if payload.batch_no and payload.batch_no.casefold() != str(medicine.get("batch_no") or "").casefold():
         raise HTTPException(status_code=400, detail="batch_no does not match the selected batch")
 
+    current_stock = _available_stock(medicine)
+    adjustment_quantity = round_qty(payload.quantity)
     adjustment = {
         "id": str(uuid.uuid4()),
         "adjustment_date": payload.adjustment_date,
@@ -2673,7 +2676,9 @@ async def create_stock_adjustment(
         "medicine_name": medicine.get("name") or payload.medicine_name or "",
         "batch_no": medicine.get("batch_no") or payload.batch_no or "",
         "adjustment_type": payload.adjustment_type,
-        "quantity": round_qty(payload.quantity),
+        # Quantity is intentionally signed: positive adds stock, negative
+        # removes stock.
+        "quantity": adjustment_quantity,
         "notes": payload.notes,
         "reference_number": payload.reference_number,
         "created_by": user.get("name") or user.get("email") or user.get("id") or "Unknown",
@@ -2683,7 +2688,12 @@ async def create_stock_adjustment(
     async def write(session=None):
         await _apply_stock_adjustment_delta(medicine, adjustment["quantity"], session=session)
         await db.stock_adjustments.insert_one(adjustment, session=session)
-        return _stock_adjustment_public(adjustment)
+        return {
+            **_stock_adjustment_public(adjustment),
+            "current_stock": current_stock,
+            "adjustment_quantity": adjustment_quantity,
+            "resulting_stock": round_qty(current_stock + adjustment_quantity),
+        }
 
     async def transaction_operation(session):
         return await write(session=session)
