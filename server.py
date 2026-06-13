@@ -990,7 +990,7 @@ class InvoiceCreate(BaseModel):
     customer_gstin: str = ""
     referring_doctor: str = ""
     items: List[InvoiceItem]
-    payment_mode: Literal["cash", "upi", "card", "credit"] = "cash"
+    payment_mode: Literal["cash", "upi", "card", "credit", "mixed"] = "cash"
     paid_amount: float = 0.0
     bill_discount_amount: float = 0.0
     bill_discount_pct: float = 0.0
@@ -3475,6 +3475,41 @@ async def _reapply_daily_sale_stock(restored: list[dict]):
         )
 
 
+INVOICE_PAYMENT_MODES = {"cash", "upi", "card", "credit", "mixed"}
+INTERNAL_INVOICE_FIELDS = {"purchase_cost", "estimated_profit", "margin_percentage"}
+
+def _round_invoice_money(value) -> float:
+    return float(Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+def _invoice_paid_amount(payment_mode: str, submitted_paid, total) -> float:
+    if payment_mode in {"credit", "mixed"}:
+        return _round_invoice_money(submitted_paid)
+    return _round_invoice_money(submitted_paid or total)
+
+def _normalize_invoice(invoice: dict, include_internal: bool = False) -> dict:
+    """Normalize legacy combined customer/payment invoices without breaking stored data."""
+    result = dict(invoice)
+    mode = str(result.get("payment_mode") or "").strip().lower()
+    customer = str(result.get("customer_name") or "").strip()
+    if mode not in INVOICE_PAYMENT_MODES:
+        legacy = mode or str(result.get("payment") or "").strip().lower()
+        mode = legacy if legacy in INVOICE_PAYMENT_MODES else "cash"
+    if customer.lower() in INVOICE_PAYMENT_MODES:
+        # Older invoices sometimes put the mode in customer_name. Preserve identity separately.
+        customer = str(result.get("customer") or "Walk-in").strip() or "Walk-in"
+    result["payment_mode"] = mode
+    result["customer_name"] = customer or "Walk-in"
+    for field in ("subtotal", "gst_total", "bill_discount", "total", "paid_amount", "due_amount", "purchase_cost", "estimated_profit", "margin_percentage"):
+        if field in result:
+            result[field] = _round_invoice_money(result[field])
+    result["items"] = [{**item, **{field: _round_invoice_money(item[field]) for field in ("line_total", "gst_amount", "net_amount", "purchase_cost", "estimated_profit", "margin_percentage") if field in item}} for item in result.get("items", [])]
+    if not include_internal:
+        for field in INTERNAL_INVOICE_FIELDS:
+            result.pop(field, None)
+        result["items"] = [{key: value for key, value in item.items() if key not in INTERNAL_INVOICE_FIELDS} for item in result["items"]]
+    return result
+
+
 async def reduce_fifo_stock(
     medicine_name: str,
     qty: float,
@@ -3549,7 +3584,8 @@ async def create_invoice(
             **item.model_dump(),
             "units_per_box": upb,
             "units_dispensed": units_needed,
-            "line_total": round(taxable, 2),
+            "line_total": _round_invoice_money(taxable),
+            "purchase_cost": _round_invoice_money(float(med.get("purchase_price", 0) or 0) * units_needed),
         })
 
     bill_disc = float(
@@ -3610,7 +3646,9 @@ async def create_invoice(
         final_items.append({
             **it,
             "gst_amount": round(gst_amount, 2),
-            "net_amount": round(net, 2),
+            "net_amount": _round_invoice_money(net),
+            "estimated_profit": _round_invoice_money(item_after - it["purchase_cost"]),
+            "margin_percentage": _round_invoice_money(((item_after - it["purchase_cost"]) / item_after * 100) if item_after else 0),
         })
 
     total = round(
@@ -3618,13 +3656,7 @@ async def create_invoice(
         2
     )
 
-    paid = float(
-        payload.paid_amount
-        if payload.payment_mode != "cash"
-        else (
-            payload.paid_amount or total
-        )
-    )
+    paid = _invoice_paid_amount(payload.payment_mode, payload.paid_amount, total)
 
     invoice = {
 
@@ -3658,12 +3690,18 @@ async def create_invoice(
 
         "payment_mode": payload.payment_mode,
 
-        "paid_amount": paid,
+        "paid_amount": _round_invoice_money(paid),
 
         "due_amount": round(
             total - paid,
             2
         ),
+
+        "purchase_cost": _round_invoice_money(sum(item["purchase_cost"] for item in final_items)),
+
+        "estimated_profit": _round_invoice_money(total - sum(item["purchase_cost"] for item in final_items)),
+
+        "margin_percentage": _round_invoice_money(((total - sum(item["purchase_cost"] for item in final_items)) / total * 100) if total else 0),
 
         "notes": payload.notes,
 
@@ -3813,10 +3851,11 @@ async def create_invoice(
 
         return invoice
 
-    return await _run_with_transaction(
+    created = await _run_with_transaction(
         transaction_operation,
         fallback_operation
     )
+    return _normalize_invoice(created, include_internal=user.get("role") == "admin")
     
 @api_router.get("/invoices")
 async def list_invoices(
@@ -3832,7 +3871,7 @@ async def list_invoices(
         if end:
             q["created_at"]["$lte"] = end
     invoices = await db.invoices.find(q, {"_id": 0}).sort("created_at", -1).to_list(2000)
-    return invoices
+    return [_normalize_invoice(inv, include_internal=user.get("role") == "admin") for inv in invoices]
 
 
 @api_router.get("/invoices/{inv_id}")
@@ -3840,7 +3879,7 @@ async def get_invoice(inv_id: str, user: dict = Depends(get_current_user)):
     inv = await db.invoices.find_one({"id": inv_id}, {"_id": 0})
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    return inv
+    return _normalize_invoice(inv, include_internal=user.get("role") == "admin")
 
 
 # ---------------- Ledgers ----------------
@@ -7247,10 +7286,6 @@ async def create_daily_sale(
         upb if payload.unit_type == "box" else 1
     )
 
-    stock_requests = {
-        med["name"]: units_needed
-    }
-
     sale_date = (
         payload.sale_date
         or datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -7287,46 +7322,7 @@ async def create_daily_sale(
         "created_by": user.get("name", ""),
     }
 
-    async def write_daily_sale(session=None):
-        await db.daily_sales.insert_one(
-            entry,
-            session=session
-        )
-
-    async def transaction_operation(session):
-        applied_steps = await _apply_fifo_stock_requests(
-            stock_requests,
-            session=session
-        )
-        entry["stock_deductions"] = _stock_deductions_from_steps(
-            applied_steps
-        )
-        await write_daily_sale(session=session)
-        return entry
-
-    async def fallback_operation():
-        applied = []
-
-        try:
-            await _apply_fifo_stock_requests(
-                stock_requests,
-                applied=applied
-            )
-            entry["stock_deductions"] = _stock_deductions_from_steps(
-                applied
-            )
-            await write_daily_sale()
-        except Exception:
-            if applied:
-                await _restore_fifo_stock(applied)
-            raise
-
-        return entry
-
-    await _run_with_transaction(
-        transaction_operation,
-        fallback_operation
-    )
+    await db.daily_sales.insert_one(entry)
 
     return {
         key: value
@@ -7516,56 +7512,10 @@ async def delete_daily_sale(
             detail="Entry not found"
         )
 
-    stock_deductions = _stock_deductions_from_daily_sale(sale)
-
-    async def transaction_operation(session):
-        await _restore_daily_sale_stock(
-            stock_deductions,
-            session=session
-        )
-        result = await db.daily_sales.delete_one(
-            {
-                "id": sale_id
-            },
-            session=session
-        )
-
-        if result.deleted_count != 1:
-            raise HTTPException(
-                status_code=404,
-                detail="Entry not found"
-            )
-
-        return {"ok": True}
-
-    async def fallback_operation():
-        restored = []
-
-        try:
-            await _restore_daily_sale_stock(
-                stock_deductions,
-                restored=restored
-            )
-            result = await db.daily_sales.delete_one({
-                "id": sale_id
-            })
-
-            if result.deleted_count != 1:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Entry not found"
-                )
-        except Exception:
-            if restored:
-                await _reapply_daily_sale_stock(restored)
-            raise
-
-        return {"ok": True}
-
-    return await _run_with_transaction(
-        transaction_operation,
-        fallback_operation
-    )
+    result = await db.daily_sales.delete_one({"id": sale_id})
+    if result.deleted_count != 1:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return {"ok": True}
 
 
 async def rebuild_inventory():
