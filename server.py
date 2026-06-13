@@ -6044,7 +6044,8 @@ async def purchase_return_report(
     return {
         "start": start,
         "end": end,
-        "total_returned_quantity": round(total_quantity, 2),
+        "total_returned_quantity": round_qty(total_quantity),
+        "returned_quantity": round_qty(total_quantity),
         "total_return_value": round(total_value, 2),
         "settled_return_value": _money_float(_to_decimal(settled_value)),
         "unsettled_return_value": _money_float(_to_decimal(total_value) - _to_decimal(settled_value)),
@@ -6538,195 +6539,122 @@ async def dashboard_summary(
     }
     
 @api_router.get("/reports/sales")
-async def sales_report(
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    user: dict = Depends(get_current_user)
-):
+async def sales_report(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
     q = {}
-
     if start or end:
         q["created_at"] = {}
-
         if start:
             q["created_at"]["$gte"] = start
-
         if end:
             q["created_at"]["$lte"] = end + "T23:59:59"
-
     invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
-
-    total_sales = 0.0
-    total_gst = 0.0
-    total_discount = 0.0
-
-    daily = {}
-
-    # SALES + DAILY
-    for inv in invoices:
-        total_sales += float(inv.get("total", 0))
-        total_gst += float(inv.get("gst_total", 0))
-        total_discount += float(inv.get("bill_discount", 0))
-
-        day = inv.get("created_at", "")[:10]
+    medicine_ids = {item.get("medicine_id") for invoice in invoices for item in invoice.get("items", []) if item.get("medicine_id")}
+    medicines = await db.medicines.find({"id": {"$in": list(medicine_ids)}}, {"_id": 0, "id": 1, "purchase_price": 1}).to_list(len(medicine_ids) or 1)
+    costs = {medicine.get("id"): _safe_float(medicine.get("purchase_price")) for medicine in medicines}
+    total_sales = total_gst = total_discount = profit = 0.0
+    daily, monthly = defaultdict(float), defaultdict(float)
+    for invoice in invoices:
+        invoice_total = _safe_float(invoice.get("total", invoice.get("grand_total", 0)))
+        total_sales += invoice_total
+        total_gst += _safe_float(invoice.get("gst_total", invoice.get("total_gst", 0)))
+        total_discount += _safe_float(invoice.get("bill_discount", invoice.get("discount", 0)))
+        day = str(invoice.get("created_at") or "")[:10]
         if day:
-            daily[day] = daily.get(day, 0) + float(inv.get("total", 0))
-
-    # PROFIT (safe + async optimized)
-    profit = 0.0
-
-    for inv in invoices:
-        for it in inv.get("items", []):
-            med = await db.medicines.find_one(
-                {"id": it.get("medicine_id")},
-                {"purchase_price": 1}
-            )
-
-            if med:
-                profit += (
-                    float(it.get("mrp", 0)) -
-                    float(med.get("purchase_price", 0))
-                ) * float(it.get("quantity", 0))
-
-    # Convert daily → frontend-friendly array
-    daily_list = [
-        {"date": k, "total": v}
-        for k, v in sorted(daily.items())
-    ]
-
+            daily[day] += invoice_total
+            monthly[day[:7]] += invoice_total
+        for item in invoice.get("items", []):
+            quantity = _safe_float(item.get("units_dispensed", item.get("quantity", 0)))
+            revenue = _safe_float(item.get("line_total", item.get("net_amount", item.get("mrp", 0) * quantity)))
+            # Current invoices persist the batch-aware purchase cost; legacy rows fall back to batch medicine cost.
+            cost = _safe_float(item.get("purchase_cost"), -1)
+            if cost < 0:
+                unit_cost = _safe_float(item.get("purchase_rate", item.get("purchase_price", costs.get(item.get("medicine_id"), 0))))
+                cost = unit_cost * quantity
+            profit += revenue - cost
     return {
-        "total_sales": round(total_sales, 2),
-        "total_gst": round(total_gst, 2),
-        "total_discount": round(total_discount, 2),
-        "estimated_profit": round(profit, 2),
-
-        # IMPORTANT: for your Recharts line chart
-        "daily": daily_list,
-
-        "invoice_count": len(invoices)
+        "total_sales": _round_ledger_money(total_sales), "total_gst": _round_ledger_money(total_gst),
+        "total_discount": _round_ledger_money(total_discount), "estimated_profit": _round_ledger_money(profit),
+        "daily": [{"date": key, "total": _round_ledger_money(value)} for key, value in sorted(daily.items())],
+        "monthly_sales_trend": [{"month": key, "sales": _round_ledger_money(value)} for key, value in sorted(monthly.items())],
+        "invoice_count": len(invoices),
     }
+
 
 @api_router.get("/reports/stock-valuation")
-async def stock_valuation(
-    user: dict = Depends(get_current_user)
-):
-    medicines = await db.medicines.find(
-        {},
-        {"_id": 0}
-    ).to_list(5000)
+async def stock_valuation(user: dict = Depends(get_current_user)):
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
+    cost_value = mrp_value = total_units = 0.0
+    risk = {"expired": {"count": 0, "value_at_risk": 0.0}, "near_expiry": {"count": 0, "value_at_risk": 0.0}}
+    today = datetime.now(timezone.utc).date()
+    for medicine in medicines:
+        available = _available_stock(medicine)
+        cost = available * _safe_float(medicine.get("purchase_price"))
+        total_units += available; cost_value += cost; mrp_value += available * _safe_float(medicine.get("mrp"))
+        details = expiry_details(medicine.get("expiry_date"), today)
+        key = "expired" if details["expiry_status"] == "expired" else "near_expiry" if details["expiry_status"] == "warning" else None
+        if key and available > 0:
+            risk[key]["count"] += 1; risk[key]["value_at_risk"] += cost
+    return {"total_items": len(medicines), "total_units": round_qty(total_units), "cost_value": _round_ledger_money(cost_value),
+            "mrp_value": _round_ledger_money(mrp_value), "potential_profit": _round_ledger_money(mrp_value-cost_value),
+            "expiry_risk_counts": {key: value["count"] for key, value in risk.items()},
+            "expiry_value_at_risk": {key: _round_ledger_money(value["value_at_risk"]) for key, value in risk.items()},
+            "total_expiry_value_at_risk": _round_ledger_money(sum(value["value_at_risk"] for value in risk.values()))}
 
-    cost_value = 0
-    mrp_value = 0
-    total_units = 0
 
-    for m in medicines:
-
-        available = _available_stock(m)
-
-        total_units += available
-
-        cost_value += (
-            available *
-            float(m.get("purchase_price", 0))
-        )
-
-        mrp_value += (
-            available *
-            float(m.get("mrp", 0))
-        )
-
-    return {
-        "total_items": len(medicines),
-
-        "total_units": total_units,
-
-        "cost_value": round(cost_value, 2),
-
-        "mrp_value": round(mrp_value, 2),
-
-        "potential_profit": round(
-            mrp_value - cost_value,
-            2
-        ),
-    }
+def _outstanding_aging(transactions: list[dict], charge_types: set[str], credit_types: set[str]) -> dict:
+    today = datetime.now(timezone.utc).date()
+    charges = []
+    credits = 0.0
+    for txn in sorted(transactions, key=_distributor_fifo_sort_key):
+        amount = max(0.0, _safe_float(txn.get("amount")))
+        txn_type = str(txn.get("type") or "").lower()
+        if txn_type in charge_types:
+            charges.append([_analytics_date(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"), today), amount])
+        elif txn_type in credit_types:
+            credits += amount
+    for charge in charges:
+        applied = min(charge[1], credits); charge[1] -= applied; credits -= applied
+    buckets = {"0-30": 0.0, "31-60": 0.0, "61-90": 0.0, "90+": 0.0}
+    oldest = 0
+    for charged_on, amount in charges:
+        if amount <= 0: continue
+        age = max(0, (today - charged_on).days); oldest = max(oldest, age)
+        bucket = "0-30" if age <= 30 else "31-60" if age <= 60 else "61-90" if age <= 90 else "90+"
+        buckets[bucket] += amount
+    return {"buckets": {key: _round_ledger_money(value) for key, value in buckets.items()}, "oldest_due_days": oldest,
+            "urgency": "critical" if oldest > 90 else "high" if oldest > 60 else "medium" if oldest > 30 else "normal"}
 
 
 @api_router.get("/reports/outstanding")
-async def outstanding_report(
-    user: dict = Depends(get_current_user)
-):
-    # ---------------- CUSTOMER OUTSTANDING ----------------
-
-    customers = await db.customers.find(
-        {},
-        {"_id": 0}
-    ).to_list(1000)
-
-    cust_out = []
-    customer_total = 0
-
-    for c in customers:
-        txns = await db.customer_transactions.find(
-            {"customer_id": c["id"]}
-        ).to_list(1000)
-
-        bal = 0.0
-
-        for t in txns:
-            if t.get("type") == "sale":
-                bal += float(t.get("amount", 0))
-
-            elif t.get("type") == "payment":
-                bal -= float(t.get("amount", 0))
-
-        if bal > 0:
-            bal = round(bal, 2)
-
-            customer_total += bal
-
-            cust_out.append({
-                "id": c["id"],
-                "name": c["name"],
-                "phone": c.get("phone", ""),
-                "balance": bal,
-            })
-
-    # ---------------- DISTRIBUTOR OUTSTANDING ----------------
-
-    distributors = await db.distributors.find(
-        {},
-        {"_id": 0}
-    ).to_list(1000)
-
-    dist_out = []
-    distributor_total = 0
-
-    for d in distributors:
-        txns = await db.distributor_transactions.find(
-            {"distributor_id": d["id"]}
-        ).to_list(1000)
-
-        bal = _current_distributor_balance(d, txns)
-
-        if bal > 0:
-            bal = round(bal, 2)
-
-            distributor_total += bal
-
-            dist_out.append({
-                "id": d["id"],
-                "name": d["name"],
-                "balance": bal,
-            })
-
-    return {
-        "customers": cust_out,
-        "distributors": dist_out,
-
-        "customer_total": round(customer_total, 2),
-
-        "distributor_total": round(distributor_total, 2),
-    }
+async def outstanding_report(user: dict = Depends(get_current_user)):
+    customers = await db.customers.find({}, {"_id": 0}).to_list(1000)
+    distributors = await db.distributors.find({}, {"_id": 0}).to_list(1000)
+    customer_txns = await db.customer_transactions.find({}, {"_id": 0}).to_list(10000)
+    distributor_txns = await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000)
+    customer_grouped, distributor_grouped = defaultdict(list), defaultdict(list)
+    for txn in customer_txns: customer_grouped[txn.get("customer_id")].append(txn)
+    for txn in distributor_txns: distributor_grouped[txn.get("distributor_id")].append(txn)
+    cust_out, dist_out = [], []
+    customer_aging = {key: 0.0 for key in ("0-30", "31-60", "61-90", "90+")}; distributor_aging = dict(customer_aging)
+    for customer in customers:
+        aging = _outstanding_aging(customer_grouped[customer.get("id")], {"sale"}, {"payment", "credit", "credit_adjustment"})
+        balance = sum(aging["buckets"].values())
+        if balance > 0:
+            cust_out.append({"id": customer["id"], "name": customer["name"], "phone": customer.get("phone", ""), "balance": _round_ledger_money(balance), **aging})
+            for key, value in aging["buckets"].items(): customer_aging[key] += value
+    for distributor in distributors:
+        txns = distributor_grouped[distributor.get("id")]
+        aging = _outstanding_aging(txns, {"purchase", "sale", "opening_balance"}, {"payment", "purchase_return", "credit", "credit_adjustment"})
+        balance = max(0.0, _current_distributor_balance(distributor, txns))
+        if balance > 0:
+            # Legacy opening balances may not have a transaction; retain them in the current bucket.
+            gap = max(0.0, balance - sum(aging["buckets"].values())); aging["buckets"]["0-30"] = _round_ledger_money(aging["buckets"]["0-30"] + gap)
+            dist_out.append({"id": distributor["id"], "name": distributor["name"], "balance": _round_ledger_money(balance), **aging})
+            for key, value in aging["buckets"].items(): distributor_aging[key] += value
+    customer_total = sum(row["balance"] for row in cust_out); distributor_total = sum(row["balance"] for row in dist_out)
+    return {"customers": cust_out, "distributors": dist_out, "customer_total": _round_ledger_money(customer_total), "distributor_total": _round_ledger_money(distributor_total),
+            "customer_receivables": _round_ledger_money(customer_total), "distributor_payables": _round_ledger_money(distributor_total),
+            "customer_aging": {key: _round_ledger_money(value) for key, value in customer_aging.items()}, "distributor_aging": {key: _round_ledger_money(value) for key, value in distributor_aging.items()}}
 
 
 @api_router.post("/daily-summary")
@@ -6760,8 +6688,12 @@ async def expiry_report(user: dict = Depends(get_current_user)):
             today
         )
 
+        available = _available_stock(m)
         item = {
             **m,
+            "available_units": round_qty(available),
+            "cost_value_at_risk": _round_ledger_money(available * _safe_float(m.get("purchase_price"))),
+            "mrp_value_at_risk": _round_ledger_money(available * _safe_float(m.get("mrp"))),
             "expiry_status": details["expiry_status"],
             "days_to_expiry": details["days_to_expiry"],
             "days_expired": details["days_expired"],
@@ -6783,6 +6715,11 @@ async def expiry_report(user: dict = Depends(get_current_user)):
             near,
             key=lambda x: x.get("days_to_expiry") or 0
         ),
+        "expired_count": len(expired),
+        "near_expiry_count": len(near),
+        "expired_value_at_risk": _round_ledger_money(sum(item["cost_value_at_risk"] for item in expired)),
+        "near_expiry_value_at_risk": _round_ledger_money(sum(item["cost_value_at_risk"] for item in near)),
+        "total_value_at_risk": _round_ledger_money(sum(item["cost_value_at_risk"] for item in expired + near)),
     }
 
 
