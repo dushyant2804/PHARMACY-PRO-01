@@ -3482,6 +3482,10 @@ async def _reapply_daily_sale_stock(restored: list[dict]):
 
 INVOICE_PAYMENT_MODES = {"cash", "upi", "card", "credit", "mixed"}
 INTERNAL_INVOICE_FIELDS = {"purchase_cost", "estimated_profit", "margin_percentage"}
+INVOICE_MONEY_FIELDS = {
+    "subtotal", "gst_total", "gst", "bill_discount", "discount", "grand_total",
+    "total", "paid_amount", "paid", "due_amount", "due", *INTERNAL_INVOICE_FIELDS,
+}
 
 def _round_invoice_money(value) -> float:
     return float(Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
@@ -3490,6 +3494,24 @@ def _invoice_paid_amount(payment_mode: str, submitted_paid, total) -> float:
     if payment_mode in {"credit", "mixed"}:
         return _round_invoice_money(submitted_paid)
     return _round_invoice_money(submitted_paid or total)
+
+def _invoice_user_can_view_internal(user: Optional[dict]) -> bool:
+    """Keep profit intelligence admin-only until an explicit role permission exists."""
+    return bool(user and str(user.get("role", "")).lower() == "admin")
+
+
+def _strip_internal_invoice_fields(value):
+    """Recursively sanitize anything used for customer, print, PDF, or share output."""
+    if isinstance(value, dict):
+        return {
+            key: _strip_internal_invoice_fields(item)
+            for key, item in value.items()
+            if key not in INTERNAL_INVOICE_FIELDS
+        }
+    if isinstance(value, list):
+        return [_strip_internal_invoice_fields(item) for item in value]
+    return value
+
 
 def _normalize_invoice(invoice: dict, include_internal: bool = False) -> dict:
     """Normalize legacy combined customer/payment invoices without breaking stored data."""
@@ -3504,14 +3526,12 @@ def _normalize_invoice(invoice: dict, include_internal: bool = False) -> dict:
         customer = str(result.get("customer") or "Walk-in").strip() or "Walk-in"
     result["payment_mode"] = mode
     result["customer_name"] = customer or "Walk-in"
-    for field in ("subtotal", "gst_total", "bill_discount", "total", "paid_amount", "due_amount", "purchase_cost", "estimated_profit", "margin_percentage"):
+    for field in INVOICE_MONEY_FIELDS:
         if field in result:
             result[field] = _round_invoice_money(result[field])
     result["items"] = [{**item, **{field: _round_invoice_money(item[field]) for field in ("line_total", "gst_amount", "net_amount", "purchase_cost", "estimated_profit", "margin_percentage") if field in item}} for item in result.get("items", [])]
     if not include_internal:
-        for field in INTERNAL_INVOICE_FIELDS:
-            result.pop(field, None)
-        result["items"] = [{key: value for key, value in item.items() if key not in INTERNAL_INVOICE_FIELDS} for item in result["items"]]
+        result = _strip_internal_invoice_fields(result)
     return result
 
 
@@ -3860,14 +3880,21 @@ async def create_invoice(
         transaction_operation,
         fallback_operation
     )
-    return _normalize_invoice(created, include_internal=user.get("role") == "admin")
+    return _normalize_invoice(created, include_internal=_invoice_user_can_view_internal(user))
     
 @api_router.get("/invoices")
 async def list_invoices(
     start: Optional[str] = None,
     end: Optional[str] = None,
+    search: Optional[str] = None,
+    invoice_number: Optional[str] = None,
+    customer_name: Optional[str] = None,
+    phone: Optional[str] = None,
+    payment_mode: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
+    import re
+
     q = {}
     if start or end:
         q["created_at"] = {}
@@ -3875,8 +3902,22 @@ async def list_invoices(
             q["created_at"]["$gte"] = start
         if end:
             q["created_at"]["$lte"] = end
+    filters = []
+    if search:
+        term = {"$regex": re.escape(search.strip()), "$options": "i"}
+        filters.append({"$or": [{"invoice_no": term}, {"invoice_number": term}, {"customer_name": term}, {"customer_phone": term}]})
+    if invoice_number:
+        term = {"$regex": re.escape(invoice_number.strip()), "$options": "i"}
+        filters.append({"$or": [{"invoice_no": term}, {"invoice_number": term}]})
+    for field, value in (("customer_name", customer_name), ("customer_phone", phone)):
+        if value:
+            filters.append({field: {"$regex": re.escape(value.strip()), "$options": "i"}})
+    if payment_mode:
+        filters.append({"payment_mode": payment_mode.strip().lower()})
+    if filters:
+        q = {"$and": [q, *filters]} if q else (filters[0] if len(filters) == 1 else {"$and": filters})
     invoices = await db.invoices.find(q, {"_id": 0}).sort("created_at", -1).to_list(2000)
-    return [_normalize_invoice(inv, include_internal=user.get("role") == "admin") for inv in invoices]
+    return [_normalize_invoice(inv, include_internal=_invoice_user_can_view_internal(user)) for inv in invoices]
 
 
 @api_router.get("/invoices/{inv_id}")
@@ -3884,7 +3925,7 @@ async def get_invoice(inv_id: str, user: dict = Depends(get_current_user)):
     inv = await db.invoices.find_one({"id": inv_id}, {"_id": 0})
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    return _normalize_invoice(inv, include_internal=user.get("role") == "admin")
+    return _normalize_invoice(inv, include_internal=_invoice_user_can_view_internal(user))
 
 
 # ---------------- Ledgers ----------------
