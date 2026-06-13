@@ -85,6 +85,7 @@ class QuantityPrecisionTests(unittest.IsolatedAsyncioTestCase):
         medicines = Collection([{
             "id": "med-1", "name": "Precision", "batch_no": "B1", "expiry_date": "2028-01-01",
             "purchased_units": 7.0000000001, "sold_units": 0.5000000003, "purchase_return_units": 0.0,
+            "category": "nrx", "low_stock_threshold": 10, "purchase_price": 1.999, "mrp": 3.456,
         }])
         fake_db = SimpleNamespace(medicines=medicines, purchase_orders=Collection([]), distributors=Collection([]))
         with patch("server.db", fake_db):
@@ -92,6 +93,10 @@ class QuantityPrecisionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response[0]["total_stock"], 6.5)
         self.assertEqual(response[0]["batches"][0]["available_stock"], 6.5)
+        self.assertEqual(response[0]["category_code"], "NRx")
+        self.assertEqual(response[0]["stock_status"], "low_stock")
+        self.assertEqual(response[0]["purchase_price"], 2.0)
+        self.assertEqual(response[0]["mrp_value"], 22.46)
         self.assertNotIn("499999", json.dumps(response))
         self.assertNotIn("0000000", json.dumps(response))
 
