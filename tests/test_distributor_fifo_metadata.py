@@ -94,6 +94,21 @@ def test_ledger_transaction_amount_and_opening_balance_guards_handle_bad_values(
     assert safe["amount"] == 0.0
 
 
+def test_json_safe_ledger_transaction_is_compact_and_rounds_money():
+    safe = _json_safe_ledger_transaction({
+        "id": "purchase-1",
+        "amount": Decimal("12.345"),
+        "running_balance": 20.126,
+        "due_amount": "7.781",
+        "items": [{"name": "must not be embedded"}],
+    })
+
+    assert safe["amount"] == 12.35
+    assert safe["running_balance"] == 20.13
+    assert safe["due_amount"] == 7.78
+    assert "items" not in safe
+
+
 def test_fifo_metadata_clears_bills_in_stable_chronological_order():
     transactions = [
         {

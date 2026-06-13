@@ -1033,6 +1033,7 @@ class Distributor(BaseModel):
     opening_balance_bill_number: Optional[str] = None
     opening_balance_reference_number: Optional[str] = None
     opening_balance_notes: Optional[str] = None
+    distributor_status: Literal["active", "inactive", "return_heavy"] = "active"
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -3124,7 +3125,11 @@ async def delete_medicine(med_id: str, user: dict = Depends(require_role("admin"
 
 # ---------------- Distributors ----------------
 @api_router.get("/distributors")
-async def list_distributors(user: dict = Depends(get_current_user)):
+async def list_distributors(
+    search: Optional[str] = None,
+    status: Optional[Literal["active", "inactive", "return_heavy"]] = None,
+    user: dict = Depends(get_current_user),
+):
     distributors = await db.distributors.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
     distributor_ids = [d.get("id") for d in distributors if d.get("id")]
     transactions_by_distributor = defaultdict(list)
@@ -3148,7 +3153,32 @@ async def list_distributors(user: dict = Depends(get_current_user)):
         )
         distributor["current_balance"] = current_balance
         distributor["outstanding_balance"] = current_balance
+        distributor["distributor_status"] = distributor.get("distributor_status") or "active"
+        purchases = [
+            txn for txn in transactions_by_distributor.get(distributor.get("id"), [])
+            if txn.get("type") in {"purchase", "sale"}
+        ]
+        distributor["total_purchases"] = _round_ledger_money(sum(_safe_float(txn.get("amount")) for txn in purchases))
+        distributor["total_paid"] = _round_ledger_money(sum(
+            _safe_float(txn.get("amount"))
+            for txn in transactions_by_distributor.get(distributor.get("id"), [])
+            if txn.get("type") == "payment"
+        ))
+        purchase_dates = [
+            _distributor_transaction_date(txn).isoformat()
+            for txn in purchases
+            if _distributor_transaction_date(txn)
+        ]
+        distributor["last_purchase_date"] = max(purchase_dates, default=None)
 
+    if search:
+        needle = search.strip().lower()
+        distributors = [
+            distributor for distributor in distributors
+            if any(needle in str(distributor.get(field, "")).lower() for field in ("name", "phone", "gstin"))
+        ]
+    if status:
+        distributors = [d for d in distributors if d["distributor_status"] == status]
     return distributors
 
 
@@ -4574,6 +4604,10 @@ def _json_safe_ledger_value(value):
 
 def _json_safe_ledger_transaction(txn: dict) -> dict:
     safe_txn = _json_safe_ledger_value(txn if isinstance(txn, dict) else {})
+    safe_txn.pop("items", None)
+    for money_field in ("amount", "running_balance", "bill_amount", "paid_amount", "due_amount"):
+        if money_field in safe_txn:
+            safe_txn[money_field] = _round_ledger_money(safe_txn[money_field])
     for id_field in ("id", "distributor_id", "purchase_order_id", "sale_id"):
         if safe_txn.get(id_field) not in (None, ""):
             safe_txn[id_field] = str(safe_txn[id_field])
@@ -4857,6 +4891,14 @@ def _current_distributor_balance(distributor: dict, transactions: list[dict]) ->
 async def distributor_ledger(
     did: str,
     financial_year: Optional[str] = None,
+    search: Optional[str] = None,
+    invoice_number: Optional[str] = None,
+    reference_number: Optional[str] = None,
+    payment_mode: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    amount: Optional[float] = None,
     user: dict = Depends(get_current_user),
 ):
     dist = await db.distributors.find_one({"id": did}, {"_id": 0})
@@ -4927,11 +4969,34 @@ async def distributor_ledger(
             **(txn if isinstance(txn, dict) else {}),
             **fifo_metadata_by_id.get(txn_id, {}),
             "running_balance": round(balance, 2),
+            "settlement_status": (
+                "settled" if fifo_metadata_by_id.get(txn_id, {}).get("due_amount") == 0
+                else "partially_settled" if _safe_float(fifo_metadata_by_id.get(txn_id, {}).get("paid_amount")) > 0
+                else "unpaid"
+            ) if bucket == "purchase" else None,
         }))
 
+    def matches_filters(txn: dict) -> bool:
+        txn_date = _distributor_transaction_date(txn)
+        searchable = " ".join(str(txn.get(field, "")) for field in (
+            "invoice_number", "invoice_no", "bill_number", "bill_no",
+            "reference_number", "reference_no", "reference", "payment_mode", "mode", "type",
+        )).lower()
+        return (
+            (not search or search.strip().lower() in searchable)
+            and (not invoice_number or invoice_number.lower() in " ".join(str(txn.get(f, "")).lower() for f in ("invoice_number", "invoice_no", "bill_number", "bill_no")))
+            and (not reference_number or reference_number.lower() in " ".join(str(txn.get(f, "")).lower() for f in ("reference_number", "reference_no", "reference")))
+            and (not payment_mode or payment_mode.lower() == str(txn.get("payment_mode") or txn.get("mode") or "").lower())
+            and (not transaction_type or transaction_type.lower() == str(txn.get("type") or "").lower())
+            and (not date_from or (txn_date is not None and txn_date >= date_from))
+            and (not date_to or (txn_date is not None and txn_date <= date_to))
+            and (amount is None or _round_ledger_money(txn.get("amount")) == _round_ledger_money(amount))
+        )
+
+    filtered_running = [txn for txn in running if matches_filters(txn)]
     return {
         "distributor": dist,
-        "transactions": running,
+        "transactions": filtered_running,
         "balance": round(balance, 2),
         "total_purchases": round(total_purchases, 2),
         "total_paid": round(total_paid, 2),
