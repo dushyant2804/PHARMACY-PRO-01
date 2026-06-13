@@ -1044,6 +1044,7 @@ class Customer(BaseModel):
     email: str = ""
     gstin: str = ""
     address: str = ""
+    customer_type: Literal["walk_in", "regular", "clinic", "hospital", "staff", "other"] = "regular"
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -3246,8 +3247,38 @@ async def delete_distributor(did: str, user: dict = Depends(require_role("admin"
 
 # ---------------- Customers ----------------
 @api_router.get("/customers")
-async def list_customers(user: dict = Depends(get_current_user)):
-    return await db.customers.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
+async def list_customers(search: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = {}
+    if search and search.strip():
+        term = {"$regex": re.escape(search.strip()), "$options": "i"}
+        query = {"$or": [{field: term} for field in ("name", "phone", "email", "gstin")]}
+    customers = await db.customers.find(query, {"_id": 0}).sort("name", 1).to_list(1000)
+    customer_ids = [customer["id"] for customer in customers]
+    txns = await db.customer_transactions.find(
+        {"customer_id": {"$in": customer_ids}}, {"_id": 0}
+    ).to_list(10000) if customer_ids else []
+    invoices = await db.invoices.find(
+        {"customer_id": {"$in": customer_ids}}, {"_id": 0, "customer_id": 1, "total": 1, "paid_amount": 1, "created_at": 1}
+    ).to_list(10000) if customer_ids else []
+    by_customer = defaultdict(list)
+    invoice_by_customer = defaultdict(list)
+    for txn in txns:
+        by_customer[txn.get("customer_id")].append(txn)
+    for invoice in invoices:
+        invoice_by_customer[invoice.get("customer_id")].append(invoice)
+    results = []
+    for customer in customers:
+        own_txns = by_customer[customer["id"]]
+        balance = round(sum((1 if t.get("type") == "sale" else -1) * float(t.get("amount", 0) or 0) for t in own_txns), 2)
+        own_invoices = invoice_by_customer[customer["id"]]
+        total_sales = round(sum(float(i.get("total", 0) or 0) for i in own_invoices), 2)
+        total_paid = round(sum(float(i.get("paid_amount", 0) or 0) for i in own_invoices) + sum(float(t.get("amount", 0) or 0) for t in own_txns if t.get("type") == "payment"), 2)
+        status = "cleared" if balance <= 0 else ("partial" if total_paid > 0 else "due")
+        results.append({**customer, "customer_type": customer.get("customer_type") or "regular",
+            "current_balance": balance, "receivable_balance": balance, "total_sales": total_sales,
+            "total_paid": total_paid, "last_sale_date": max((i.get("created_at") for i in own_invoices if i.get("created_at")), default=None),
+            "payment_status": status})
+    return results
 
 
 @api_router.post("/customers")
@@ -3906,6 +3937,10 @@ async def create_invoice(
                 "amount": invoice["due_amount"],
 
                 "reference": invoice["invoice_no"],
+                "reference_number": invoice["invoice_no"],
+                "invoice_number": invoice["invoice_no"],
+                "invoice_id": invoice["id"],
+                "payment_mode": invoice["payment_mode"],
 
                 "notes": "Credit sale",
 
@@ -6135,7 +6170,10 @@ async def distributor_ledger_monthly_summary(
 
 
 @api_router.get("/ledger/customer/{cid}")
-async def customer_ledger(cid: str, user: dict = Depends(get_current_user)):
+async def customer_ledger(cid: str, search: Optional[str] = None, invoice_number: Optional[str] = None,
+    reference_number: Optional[str] = None, payment_mode: Optional[str] = None,
+    transaction_type: Optional[str] = None, start: Optional[str] = None, end: Optional[str] = None,
+    amount: Optional[float] = None, user: dict = Depends(get_current_user)):
     cust = await db.customers.find_one({"id": cid}, {"_id": 0})
     if not cust:
         raise HTTPException(status_code=404, detail="Customer not found")
@@ -6143,11 +6181,18 @@ async def customer_ledger(cid: str, user: dict = Depends(get_current_user)):
     balance = 0.0
     running = []
     for t in txns:
-        if t["type"] == "sale":
-            balance += t["amount"]
+        if t.get("type") == "sale":
+            balance += float(t.get("amount", 0) or 0)
         else:
-            balance -= t["amount"]
-        running.append({**t, "running_balance": round(balance, 2)})
+            balance -= float(t.get("amount", 0) or 0)
+        balance = round(balance, 2)
+        if t.get("running_balance") != balance:
+            await db.customer_transactions.update_one({"id": t["id"]}, {"$set": {"running_balance": balance, "amount": round(float(t.get("amount", 0) or 0), 2)}})
+        running.append({**t, "amount": round(float(t.get("amount", 0) or 0), 2), "running_balance": balance})
+    def matches(t):
+        text = " ".join(str(t.get(k, "")) for k in ("invoice_number", "reference_number", "reference", "payment_mode", "mode", "type"))
+        return (not search or search.lower() in text.lower()) and (not invoice_number or invoice_number.lower() in str(t.get("invoice_number") or t.get("reference") or "").lower()) and (not reference_number or reference_number.lower() in str(t.get("reference_number") or t.get("reference") or "").lower()) and (not payment_mode or payment_mode.lower() == str(t.get("payment_mode") or t.get("mode") or "").lower()) and (not transaction_type or transaction_type.lower() == str(t.get("type") or "").lower()) and (not start or str(t.get("created_at", "")) >= start) and (not end or str(t.get("created_at", "")) <= end) and (amount is None or round(float(t.get("amount", 0) or 0), 2) == round(amount, 2))
+    running = [t for t in running if matches(t)]
     return {"customer": cust, "transactions": running, "balance": round(balance, 2)}
 
 
@@ -6178,8 +6223,11 @@ async def add_cust_payment(
         "id": str(uuid.uuid4()),
         "customer_id": cid,
         "type": "payment",
-        "amount": p.amount,
+        "amount": round(p.amount, 2),
         "mode": p.mode,
+        "payment_mode": _transaction_payment_mode(p),
+        "invoice_number": p.invoice_number,
+        "reference_number": p.reference_number or p.receipt_number,
         "notes": p.notes,
         "created_at": p.date or datetime.now(timezone.utc).isoformat(),
     }
@@ -6201,8 +6249,11 @@ async def add_customer_sale(
         "id": str(uuid.uuid4()),
         "customer_id": cid,
         "type": "sale",
-        "amount": p.amount,
+        "amount": round(p.amount, 2),
         "mode": p.mode,
+        "payment_mode": _transaction_payment_mode(p),
+        "invoice_number": p.invoice_number,
+        "reference_number": p.reference_number,
         "notes": p.notes,
         "created_at": p.date or datetime.now(timezone.utc).isoformat(),
     }
