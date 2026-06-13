@@ -456,6 +456,25 @@ def _available_stock(medicine: dict) -> float:
     ))
 
 
+def _safe_legacy_sold_stock(medicine: dict) -> float:
+    """Retain legacy/manual sold stock only when it agrees with a stored stock snapshot."""
+    sold = _stock_quantity(medicine, "sold_units", "sold_quantity")
+    if sold <= 0:
+        return 0.0
+    snapshot = next(
+        (medicine.get(key) for key in ("current_stock", "available_qty", "available_stock", "quantity_units")
+         if medicine.get(key) is not None),
+        None,
+    )
+    if snapshot is None:
+        return sold
+    expected = round_qty(
+        _purchased_stock(medicine) + _stock_adjustment_stock(medicine)
+        - sold - _purchase_return_stock(medicine)
+    )
+    return sold if round_qty(snapshot) == expected else 0.0
+
+
 def _mongo_first_stock_value(*field_names: str) -> dict:
     expression = 0
     for field_name in reversed(field_names):
@@ -3157,9 +3176,13 @@ async def list_distributors(
         distributor["distributor_status"] = distributor.get("distributor_status") or "active"
         purchases = [
             txn for txn in transactions_by_distributor.get(distributor.get("id"), [])
-            if txn.get("type") in {"purchase", "sale"}
+            if txn.get("type") in {"purchase", "sale", "opening_balance"}
         ]
-        distributor["total_purchases"] = _round_ledger_money(sum(_safe_float(txn.get("amount")) for txn in purchases))
+        opening_in_txns = any(_is_opening_balance_transaction(txn, distributor.get("id")) for txn in purchases)
+        opening = 0 if opening_in_txns else _safe_float(distributor.get("opening_balance"))
+        distributor["total_purchases"] = _round_ledger_money(
+            opening + sum(_safe_float(txn.get("amount")) for txn in purchases)
+        )
         distributor["total_paid"] = _round_ledger_money(sum(
             _safe_float(txn.get("amount"))
             for txn in transactions_by_distributor.get(distributor.get("id"), [])
@@ -3269,10 +3292,22 @@ async def list_customers(search: Optional[str] = None, user: dict = Depends(get_
     results = []
     for customer in customers:
         own_txns = by_customer[customer["id"]]
-        balance = round(sum((1 if t.get("type") == "sale" else -1) * float(t.get("amount", 0) or 0) for t in own_txns), 2)
         own_invoices = invoice_by_customer[customer["id"]]
-        total_sales = round(sum(float(i.get("total", 0) or 0) for i in own_invoices), 2)
+        linked_refs = {
+            str(value) for invoice in own_invoices
+            for value in (invoice.get("id"), invoice.get("invoice_no"), invoice.get("invoice_number"))
+            if value
+        }
+        invoice_sales = sum(_safe_float(i.get("total", i.get("grand_total", 0))) for i in own_invoices)
+        unlinked_ledger_sales = sum(
+            _safe_float(t.get("amount")) for t in own_txns
+            if t.get("type") == "sale"
+            and str(t.get("invoice_id") or t.get("invoice_number") or t.get("reference") or "") not in linked_refs
+        )
+        total_sales = _round_ledger_money(invoice_sales + unlinked_ledger_sales)
         total_paid = round(sum(float(i.get("paid_amount", 0) or 0) for i in own_invoices) + sum(float(t.get("amount", 0) or 0) for t in own_txns if t.get("type") == "payment"), 2)
+        opening_balance = _safe_float(customer.get("opening_balance", customer.get("legacy_balance", 0)))
+        balance = _round_ledger_money(total_sales - total_paid + opening_balance)
         status = "cleared" if balance <= 0 else ("partial" if total_paid > 0 else "due")
         results.append({**customer, "customer_type": customer.get("customer_type") or "regular",
             "current_balance": balance, "receivable_balance": balance, "total_sales": total_sales,
@@ -6050,6 +6085,8 @@ async def purchase_return_report(
         "settled_return_value": _money_float(_to_decimal(settled_value)),
         "unsettled_return_value": _money_float(_to_decimal(total_value) - _to_decimal(settled_value)),
         "return_count": len(returns),
+        "returns": [_normalized_purchase_return_money(item) for item in returns],
+        "purchase_returns": [_normalized_purchase_return_money(item) for item in returns],
         "returns_by_distributor": finalize_summary(by_distributor),
         "returns_by_medicine": finalize_summary(by_medicine),
         "returns_by_reason": finalize_summary(by_reason),
@@ -6359,6 +6396,7 @@ async def dashboard_summary(
     expiring_soon_items = []
     expired_items = []
 
+    low_stock_by_name = {}
     for m in medicines:
 
         available = _available_stock(m)
@@ -6367,18 +6405,15 @@ async def dashboard_summary(
 
         threshold = m.get("low_stock_threshold")
 
-        if (
-           threshold is not None
-           and
-           available <= threshold
-        ):
-            low_stock_items.append({
-                "id": m.get("id"),
-                "name": m.get("name"),
-                "qty": available,
-                "threshold": threshold,
-                "status": _low_stock_status(m),
-            })
+        name_key = str(m.get("name") or "").strip().upper()
+        item = low_stock_by_name.setdefault(name_key, {
+            "id": m.get("id"), "name": m.get("name"), "qty": 0,
+            "current_stock": 0, "available_qty": 0, "threshold": threshold,
+            "status": _low_stock_status(m),
+        })
+        if threshold is not None:
+            item["threshold"] = max(item["threshold"] or 0, threshold)
+        item["qty"] = item["current_stock"] = item["available_qty"] = round_qty(item["qty"] + available)
 
         if available <= 0:
             continue
@@ -6407,6 +6442,11 @@ async def dashboard_summary(
             expired_items.append(expiry_item)
         elif expiry_info["expiry_status"] == "warning":
             expiring_soon_items.append(expiry_item)
+
+    low_stock_items = [
+        item for item in low_stock_by_name.values()
+        if item["threshold"] is not None and item["available_qty"] <= item["threshold"]
+    ]
 
     # CUSTOMER OUTSTANDING
     customer_txns = await db.customer_transactions.find({}, {"_id": 0}).to_list(5000)
@@ -6654,7 +6694,9 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
     customer_total = sum(row["balance"] for row in cust_out); distributor_total = sum(row["balance"] for row in dist_out)
     return {"customers": cust_out, "distributors": dist_out, "customer_total": _round_ledger_money(customer_total), "distributor_total": _round_ledger_money(distributor_total),
             "customer_receivables": _round_ledger_money(customer_total), "distributor_payables": _round_ledger_money(distributor_total),
-            "customer_aging": {key: _round_ledger_money(value) for key, value in customer_aging.items()}, "distributor_aging": {key: _round_ledger_money(value) for key, value in distributor_aging.items()}}
+            "customer_aging": {key: _round_ledger_money(value) for key, value in customer_aging.items()}, "distributor_aging": {key: _round_ledger_money(value) for key, value in distributor_aging.items()},
+            "aging_buckets": {"customers": customer_aging, "distributors": distributor_aging},
+            "outstanding_movement": {"customer_transactions": customer_txns, "distributor_transactions": distributor_txns}}
 
 
 @api_router.post("/daily-summary")
@@ -8021,7 +8063,7 @@ async def rebuild_inventory():
                             if existing and existing.get("id") in invoice_sold_by_id
                             else invoice_sold_by_key.get(key)
                             if key in invoice_sold_by_key
-                            else existing.get("sold_units", 0)
+                            else _safe_legacy_sold_stock(existing)
                             if existing else 0
                         ),
 
