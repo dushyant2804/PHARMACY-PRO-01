@@ -27,7 +27,8 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         response = await version(http_response)
         self.assertEqual(
             set(response),
-            {"version", "build", "release_notes", "message", "updated_at", "update_type"},
+            {"version", "build", "build_id", "release_notes", "whats_new", "version_history",
+             "message", "updated_at", "update_type"},
         )
         self.assertEqual(response["version"], APP_VERSION)
         self.assertTrue(response["build"])
@@ -36,6 +37,10 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(response["release_notes"].splitlines()), 2)
         self.assertIn(response["update_type"], ("patch", "minor", "major"))
         self.assertTrue(response["updated_at"].endswith("Z"))
+        self.assertRegex(response["version"], r"^\d+\.\d+\.\d+$")
+        self.assertTrue(response["build_id"])
+        self.assertTrue(response["whats_new"])
+        self.assertTrue(response["version_history"])
         self.assertEqual(http_response.headers["cache-control"], "no-store")
 
     def test_version_config_supports_expected_update_types_and_returns_a_copy(self):
@@ -45,6 +50,23 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         metadata = get_version_metadata()
         metadata["message"] = "changed by caller"
         self.assertNotEqual(metadata["message"], VERSION_METADATA["message"])
+
+    def test_old_and_new_business_settings_are_normalized_without_data_loss(self):
+        from server import normalize_settings
+
+        old = normalize_settings({"key": "main", "business_name": "Legacy Pharmacy", "signature_b64": "sig"})
+        self.assertEqual(old["business_name"], "Legacy Pharmacy")
+        self.assertEqual(old["signature_b64"], "sig")
+        self.assertEqual(old["dl_number_1"], "")
+        self.assertIsNone(old["pharmacy_logo"])
+
+        new = normalize_settings({
+            "key": "main", "dl_number_1": "DL-ONE", "dl_number_2": "DL-TWO",
+            "pharmacy_logo": {"path": "/branding/logo.png", "content_type": "image/png"},
+        })
+        self.assertEqual(new["dl_number_1"], "DL-ONE")
+        self.assertEqual(new["dl_number_2"], "DL-TWO")
+        self.assertEqual(new["pharmacy_logo"]["path"], "/branding/logo.png")
 
     def test_signup_accepts_email_or_mobile_and_requires_matching_method(self):
         email_signup = SignupRequest(

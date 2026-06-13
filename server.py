@@ -7562,20 +7562,35 @@ async def list_doctors(user: dict = Depends(get_current_user)):
     return docs
 
 
-# ---------------- Settings (signature, business info) ----------------
+# ---------------- Settings (signature, branding, business info) ----------------
+SETTINGS_DEFAULTS = {
+    "key": "main",
+    "business_name": "MedStock Pharmacy",
+    "business_address": "",
+    "business_phone": "",
+    "business_gstin": "",
+    "signature_b64": "",
+    "dl_number_1": "",
+    "dl_number_2": "",
+    # May contain a storage path/URL plus optional name, content_type, and size.
+    "pharmacy_logo": None,
+    # Reserved, backward-compatible structures for incremental settings features.
+    "activity_logs": [],
+    "role_permissions": {},
+    "theme_settings": {},
+    "backup_metadata": {},
+}
+
+
+def normalize_settings(settings: Optional[dict] = None) -> dict:
+    """Add new settings defaults without changing or removing legacy fields."""
+    return {**SETTINGS_DEFAULTS, **(settings or {})}
+
+
 @api_router.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
     s = await db.settings.find_one({"key": "main"}, {"_id": 0})
-    if not s:
-        s = {
-            "key": "main",
-            "business_name": "MedStock Pharmacy",
-            "business_address": "",
-            "business_phone": "",
-            "business_gstin": "",
-            "signature_b64": "",
-        }
-    return s
+    return normalize_settings(s)
 
 
 @api_router.put("/settings")
@@ -7583,7 +7598,7 @@ async def update_settings(payload: dict, user: dict = Depends(require_role("admi
     payload["key"] = "main"
     await db.settings.update_one({"key": "main"}, {"$set": payload}, upsert=True)
     s = await db.settings.find_one({"key": "main"}, {"_id": 0})
-    return s
+    return normalize_settings(s)
 
 
 # ---------------- Daily Sales Book (business-summary register) ----------------
