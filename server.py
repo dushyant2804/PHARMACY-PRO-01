@@ -247,6 +247,8 @@ logging.basicConfig(level=logging.INFO)
 _background_tasks = set()
 
 EXPIRY_WARNING_DAYS = 90
+DASHBOARD_RECENTLY_EXPIRED_DAYS = 90
+LOW_STOCK_STATUSES = {"low_stock", "reordered", "abandoned", "restocked"}
 PASSWORD_MAX_AGE_DAYS = 183
 PASSWORD_RESET_ATTEMPTS = 5
 PASSWORD_RESET_TTL_MINUTES = 10
@@ -536,6 +538,12 @@ def expiry_details(expiry, today):
             details["expiry_status"] = "warning"
 
     return details
+
+
+def _low_stock_status(medicine: dict) -> str:
+    """Return the dashboard workflow status without confusing it with batch status."""
+    status = medicine.get("low_stock_status")
+    return status if status in LOW_STOCK_STATUSES else "low_stock"
 
 
 def parse_iso_date(value):
@@ -5947,6 +5955,7 @@ async def dashboard_summary(
                 "name": m.get("name"),
                 "qty": available,
                 "threshold": threshold,
+                "status": _low_stock_status(m),
             })
 
         if available <= 0:
@@ -5969,7 +5978,10 @@ async def dashboard_summary(
             "expired_days_ago": expiry_info["expired_days_ago"],
         }
 
-        if expiry_info["expiry_status"] == "expired":
+        if (
+            expiry_info["expiry_status"] == "expired"
+            and expiry_info["days_expired"] <= DASHBOARD_RECENTLY_EXPIRED_DAYS
+        ):
             expired_items.append(expiry_item)
         elif expiry_info["expiry_status"] == "warning":
             expiring_soon_items.append(expiry_item)
@@ -5977,13 +5989,14 @@ async def dashboard_summary(
     # CUSTOMER OUTSTANDING
     customer_txns = await db.customer_transactions.find({}, {"_id": 0}).to_list(5000)
 
-    customer_outstanding = 0
+    customer_balances = defaultdict(float)
 
     for t in customer_txns:
+        customer_id = t.get("customer_id") or "__unassigned__"
 
         if t.get("type") == "sale":
             amt = float(t.get("amount", 0))
-            customer_outstanding += amt
+            customer_balances[customer_id] += amt
 
             try:
                 dt = datetime.fromisoformat(t["created_at"]).date()
@@ -5999,7 +6012,7 @@ async def dashboard_summary(
 
         elif t.get("type") == "payment":
             amt = float(t.get("amount", 0))
-            customer_outstanding -= amt
+            customer_balances[customer_id] -= amt
             received_total += amt
 
             try:
@@ -6013,6 +6026,8 @@ async def dashboard_summary(
 
             except Exception:
                 pass
+
+    customer_outstanding = sum(max(0.0, balance) for balance in customer_balances.values())
 
     # DISTRIBUTOR OUTSTANDING
     distributors = await db.distributors.find({}, {"_id": 0}).to_list(1000)
@@ -6070,10 +6085,14 @@ async def dashboard_summary(
         "total_purchase_amount": round(total_purchase_amount, 2),
 
         "customer_outstanding": round(customer_outstanding, 2),
+        "customer_receivables": round(customer_outstanding, 2),
         "customer_outstanding_month": round(customer_outstanding_month, 2),
         "customer_outstanding_today": round(customer_outstanding_today, 2),
 
         "distributor_outstanding": round(distributor_outstanding, 2),
+        "distributor_payables": round(distributor_outstanding, 2),
+        # Backward-compatible combined value for older dashboard clients.
+        "pending_payment": round(customer_outstanding + distributor_outstanding, 2),
 
         "amount_received": round(received_total, 2),
         "amount_received_month": round(received_month, 2),
@@ -6081,6 +6100,7 @@ async def dashboard_summary(
 
         "low_stock_count": len(low_stock_items),
         "low_stock_items": low_stock_items,
+        "low_stock_medicines": low_stock_items,
 
         "expiring_soon_count": len(expiring_soon_items),
         "expiring_soon_items": expiring_soon_items,
@@ -6088,6 +6108,7 @@ async def dashboard_summary(
 
         "expired_count": len(expired_items),
         "expired_items": expired_items,
+        "recently_expired_medicines": expired_items,
 
         "patient_alert_count": len(patient_alerts),
         "patient_alerts": patient_alerts,
