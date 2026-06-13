@@ -6550,8 +6550,10 @@ async def dashboard_summary(
         threshold = m.get("low_stock_threshold")
 
         name_key = str(m.get("name") or "").strip().upper()
+        medicine_id = m.get("id") or m.get("medicine_key")
         item = low_stock_by_name.setdefault(name_key, {
-            "id": m.get("id"), "name": m.get("name"), "qty": 0,
+            "medicine_id": medicine_id, "id": medicine_id, "_id": medicine_id,
+            "name": m.get("name"), "qty": 0,
             "current_stock": 0, "available_qty": 0, "threshold": threshold,
             "status": _low_stock_status(m),
             "low_stock_status": _low_stock_status(m),
