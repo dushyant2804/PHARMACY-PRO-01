@@ -68,15 +68,25 @@ class LowStockWorkflowTest(unittest.IsolatedAsyncioTestCase):
     async def test_dashboard_returns_low_stock_status(self):
         empty = _Collection([])
         fake_db = SimpleNamespace(
-            medicines=_Collection([{"id": "med-1", "name": "One", "purchased_units": 1, "low_stock_threshold": 5, "low_stock_status": "reordered", "purchase_price": 1}]),
+            medicines=_Collection([
+                {"id": "med-1", "name": "One", "purchased_units": 1, "low_stock_threshold": 5, "low_stock_status": "reordered", "purchase_price": 1},
+                {"medicine_key": "legacy-med-2", "name": "Two", "purchased_units": 1, "low_stock_threshold": 5, "purchase_price": 1},
+            ]),
             invoices=empty, expenses=empty, customer_transactions=empty, distributors=empty,
             distributor_transactions=empty, purchase_orders=empty, regular_patients=empty,
         )
         with patch("server.db", fake_db):
             result = await dashboard_summary(user={})
 
-        self.assertEqual(result["low_stock_items"][0]["status"], "reordered")
-        self.assertEqual(result["low_stock_items"][0]["low_stock_status"], "reordered")
+        by_name = {item["name"]: item for item in result["low_stock_items"]}
+        self.assertEqual(by_name["One"]["status"], "reordered")
+        self.assertEqual(by_name["One"]["low_stock_status"], "reordered")
+        self.assertEqual(by_name["One"]["medicine_id"], "med-1")
+        self.assertEqual(by_name["One"]["id"], "med-1")
+        self.assertEqual(by_name["One"]["_id"], "med-1")
+        self.assertEqual(by_name["Two"]["medicine_id"], "legacy-med-2")
+        self.assertEqual(by_name["Two"]["id"], "legacy-med-2")
+        self.assertEqual(by_name["Two"]["_id"], "legacy-med-2")
 
     def test_invalid_status_rejected(self):
         with self.assertRaises(ValidationError):
