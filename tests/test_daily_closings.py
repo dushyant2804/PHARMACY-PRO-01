@@ -102,7 +102,9 @@ class DailyClosingTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_calculates_mismatch_and_preserves_daily_sales(self):
         result = await self.create()
 
-        self.assertEqual(result["mismatch_amount"], -5.15)
+        self.assertEqual(result["mismatch_amount"], 195.10)
+        self.assertEqual(result["expected_cash"], 250.0)
+        self.assertEqual(result["closing_status"], "excess")
         self.assertEqual(result["created_by"], "Casey")
         self.assertFalse(result["locked"])
         self.assertEqual(len(self.daily_closings.rows), 1)
@@ -113,7 +115,7 @@ class DailyClosingTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.update(closing["id"], counted_cash=451.30, notes="Recounted")
 
-        self.assertEqual(result["mismatch_amount"], 1.05)
+        self.assertEqual(result["mismatch_amount"], 201.30)
         self.assertEqual(result["notes"], "Recounted")
 
     async def test_cashier_can_lock_then_cannot_edit_locked_closing(self):
@@ -141,7 +143,7 @@ class DailyClosingTests(unittest.IsolatedAsyncioTestCase):
             closing["id"], user=self.admin, counted_cash=450.25, locked=False
         )
 
-        self.assertEqual(result["mismatch_amount"], 0.0)
+        self.assertEqual(result["mismatch_amount"], 200.25)
         self.assertFalse(result["locked"])
 
     async def test_duplicate_date_is_rejected(self):

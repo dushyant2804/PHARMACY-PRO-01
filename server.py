@@ -1132,6 +1132,7 @@ DAILY_CLOSING_AMOUNT_FIELDS = (
     "expenses",
     "expected_total",
     "counted_cash",
+    "opening_cash",
 )
 
 
@@ -1144,9 +1145,11 @@ class DailyClosingCreate(BaseModel):
     card_sales: float = 0
     credit_sales: float = 0
     expenses: float = 0
-    expected_total: float
+    expected_total: float = 0
     counted_cash: float
     notes: str = ""
+    closing_notes: str = ""
+    opening_cash: float = 0
     locked: bool = False
 
     @field_validator("closing_date")
@@ -1178,6 +1181,8 @@ class DailyClosingUpdate(BaseModel):
     expected_total: Optional[float] = None
     counted_cash: Optional[float] = None
     notes: Optional[str] = None
+    closing_notes: Optional[str] = None
+    opening_cash: Optional[float] = None
     locked: Optional[bool] = None
 
     @field_validator("closing_date")
@@ -7452,15 +7457,76 @@ def _daily_closing_money(value: float) -> float:
 
 def _prepare_daily_closing(closing: dict) -> dict:
     prepared = dict(closing)
+    # Old records used expected_total as the expected drawer amount.
+    prepared.setdefault("expected_cash", prepared.get("expected_total", 0))
+    prepared.setdefault("total_expenses", prepared.get("expenses", 0))
+    prepared.setdefault("closing_notes", prepared.get("notes", ""))
     for field in DAILY_CLOSING_AMOUNT_FIELDS:
         prepared[field] = _daily_closing_money(prepared.get(field, 0))
-    prepared["mismatch_amount"] = _daily_closing_money(
-        prepared["counted_cash"] - prepared["expected_total"]
+    for field in ("expected_cash", "total_expenses"):
+        prepared[field] = _daily_closing_money(prepared.get(field, 0))
+    prepared["cash_mismatch"] = _daily_closing_money(prepared["counted_cash"] - prepared["expected_cash"])
+    prepared["mismatch_amount"] = prepared["cash_mismatch"]
+    tolerance = 0.01
+    prepared["closing_status"] = (
+        "balanced" if abs(prepared["cash_mismatch"]) <= tolerance
+        else "shortage" if prepared["cash_mismatch"] < 0
+        else "excess"
     )
     return prepared
 
 
+async def _daily_closing_expected(closing_date: str, opening_cash: float = 0) -> dict:
+    """Build an accounting snapshot without mutating sales or inventory."""
+    daily = await db.daily_sales.find({"sale_date": closing_date}, {"_id": 0}).to_list(2000)
+    invoice_collection = getattr(db, "invoices", None)
+    expense_collection = getattr(db, "expenses", None)
+    invoices = (
+        await invoice_collection.find({}, {"_id": 0}).to_list(5000)
+        if invoice_collection else []
+    )
+    invoices = [row for row in invoices if str(row.get("created_at", "")).startswith(closing_date)]
+    expenses = (
+        await expense_collection.find({"date": closing_date}, {"_id": 0}).to_list(2000)
+        if expense_collection else []
+    )
+    normalized = [_normalize_daily_sale(row) for row in daily]
+    # Very old daily-sale rows had only total_amount; they represented paid cash
+    # unless explicitly marked pending.
+    for source, row in zip(daily, normalized):
+        if not any(source.get(field) is not None for field in (
+            "cash_sales", "upi_sales", "card_sales", "outstanding_sales"
+        )):
+            amount = _money(source.get("total_amount"))
+            row["outstanding_sales" if source.get("payment_status") == "pending" else "cash_sales"] = amount
+    splits = {
+        "cash_sales": sum(row["cash_sales"] for row in normalized),
+        "upi_sales": sum(row["upi_sales"] for row in normalized),
+        "card_sales": sum(row["card_sales"] for row in normalized),
+        "credit_sales": sum(row["outstanding_sales"] for row in normalized),
+    }
+    for invoice in invoices:
+        mode = invoice.get("payment_mode", "cash")
+        paid = _money(invoice.get("paid_amount"))
+        due = _money(invoice.get("due_amount"))
+        if mode in {"cash", "upi", "card"}:
+            splits[f"{mode}_sales"] += paid
+        else:
+            splits["cash_sales"] += paid  # legacy/mixed invoices do not retain a payment split
+        splits["credit_sales"] += due
+    total_expenses = _money(sum(_money(row.get("amount")) for row in expenses))
+    expected_total = _money(sum(splits.values()))
+    return {
+        **{key: _money(value) for key, value in splits.items()},
+        "expenses": total_expenses,
+        "total_expenses": total_expenses,
+        "expected_total": expected_total,
+        "expected_cash": _money(opening_cash + splits["cash_sales"] - total_expenses),
+    }
+
+
 def _daily_closing_public(closing: dict) -> dict:
+    closing = _prepare_daily_closing(closing)
     return {
         key: value
         for key, value in closing.items()
@@ -7476,8 +7542,10 @@ async def create_daily_closing(
     if await db.daily_closings.find_one({"closing_date": payload.closing_date}):
         raise HTTPException(status_code=409, detail="A closing already exists for this date")
 
+    data = payload.model_dump()
+    expected = await _daily_closing_expected(payload.closing_date, data.get("opening_cash", 0))
     closing = _prepare_daily_closing({
-        **payload.model_dump(),
+        **data, **expected,
         "id": str(uuid.uuid4()),
         "created_by": user.get("name") or user.get("id", ""),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -7526,8 +7594,12 @@ async def update_daily_closing(
         if duplicate:
             raise HTTPException(status_code=409, detail="A closing already exists for this date")
 
-    updated = _prepare_daily_closing({**existing, **changes})
-    mutable_fields = {*DAILY_CLOSING_AMOUNT_FIELDS, "closing_date", "notes", "locked", "mismatch_amount"}
+    target_date = changes.get("closing_date", existing.get("closing_date"))
+    opening_cash = changes.get("opening_cash", existing.get("opening_cash", 0))
+    expected = await _daily_closing_expected(target_date, opening_cash)
+    updated = _prepare_daily_closing({**existing, **changes, **expected})
+    mutable_fields = {*DAILY_CLOSING_AMOUNT_FIELDS, "closing_date", "notes", "closing_notes", "locked",
+                      "mismatch_amount", "expected_cash", "cash_mismatch", "total_expenses", "closing_status"}
     update_values = {key: updated[key] for key in mutable_fields if key in updated}
     await db.daily_closings.update_one({"id": closing_id}, {"$set": update_values})
     return _daily_closing_public({**existing, **update_values})
