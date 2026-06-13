@@ -7341,16 +7341,77 @@ async def update_settings(payload: dict, user: dict = Depends(require_role("admi
     return s
 
 
-# ---------------- Daily Sales Book (quick non-invoice entries) ----------------
+# ---------------- Daily Sales Book (business-summary register) ----------------
 class DailySaleCreate(BaseModel):
-    medicine_id: str
-    quantity: int
-    unit_type: Literal["unit", "box"] = "unit"
-    total_amount: float
-    customer_name: str = ""
-    payment_status: Literal["paid", "pending"] = "paid"
+    model_config = ConfigDict(extra="forbid")
+
+    cash_sales: float = 0
+    upi_sales: float = 0
+    outstanding_sales: float = 0
+    card_sales: float = 0
     notes: str = ""
     sale_date: Optional[str] = None  # YYYY-MM-DD; defaults to today
+
+    # Legacy quick-sale fields remain accepted so existing clients and records
+    # continue to work, but they are descriptive only and never affect stock.
+    medicine_id: Optional[str] = None
+    quantity: Optional[int] = None
+    unit_type: Literal["unit", "box"] = "unit"
+    total_amount: Optional[float] = None
+    customer_name: str = ""
+    payment_status: Literal["paid", "pending"] = "paid"
+
+    @field_validator("cash_sales", "upi_sales", "outstanding_sales", "card_sales")
+    @classmethod
+    def require_valid_daily_sale_amounts(cls, value, info):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{info.field_name} must be a finite non-negative amount")
+        return value
+
+
+class DailySaleUpdate(BaseModel):
+    cash_sales: Optional[float] = None
+    upi_sales: Optional[float] = None
+    outstanding_sales: Optional[float] = None
+    card_sales: Optional[float] = None
+    notes: Optional[str] = None
+    sale_date: Optional[str] = None
+
+    @field_validator("cash_sales", "upi_sales", "outstanding_sales", "card_sales")
+    @classmethod
+    def require_valid_daily_sale_update_amounts(cls, value, info):
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise ValueError(f"{info.field_name} must be a finite non-negative amount")
+        return value
+
+
+def _money(value) -> float:
+    return _daily_closing_money(float(value or 0))
+
+
+def _normalize_daily_sale(entry: dict) -> dict:
+    """Expose both standardized summary fields and legacy aliases."""
+    item = dict(entry)
+    legacy_total = _money(item.get("total_amount"))
+    cash = _money(item.get("cash_sales", legacy_total if item.get("payment_status") == "paid" else 0))
+    upi = _money(item.get("upi_sales"))
+    card = _money(item.get("card_sales"))
+    outstanding = _money(item.get(
+        "outstanding_sales",
+        legacy_total if item.get("payment_status") == "pending" else 0,
+    ))
+    gross = _money(cash + upi + card + outstanding)
+    item.update({
+        "cash_sales": cash,
+        "upi_sales": upi,
+        "card_sales": card,
+        "outstanding_sales": outstanding,
+        "gross_sales": gross,
+        "total_paid": _money(cash + upi + card),
+        "total_outstanding": outstanding,
+        "total_amount": gross,
+    })
+    return item
 
 @api_router.post("/daily-sales")
 async def create_daily_sale(
@@ -7358,60 +7419,24 @@ async def create_daily_sale(
     user: dict = Depends(get_current_user)
 ):
 
-    med = await db.medicines.find_one({
-        "id": payload.medicine_id
-    })
-
-    if not med:
-        raise HTTPException(
-            status_code=400,
-            detail="Medicine not found"
-        )
-
-    upb = max(
-        int(med.get("units_per_box") or 1),
-        1
-    )
-
-    units_needed = payload.quantity * (
-        upb if payload.unit_type == "box" else 1
-    )
-
-    sale_date = (
-        payload.sale_date
-        or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    )
+    sale_date = payload.sale_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    data = payload.model_dump()
+    # A legacy total is mapped to paid cash or outstanding unless the caller
+    # supplied standardized payment splits.
+    if payload.total_amount is not None and not any(
+        data[field] for field in ("cash_sales", "upi_sales", "card_sales", "outstanding_sales")
+    ):
+        target = "outstanding_sales" if payload.payment_status == "pending" else "cash_sales"
+        data[target] = payload.total_amount
 
     entry = {
         "id": str(uuid.uuid4()),
-
-        "medicine_id": payload.medicine_id,
-        "medicine_name": med["name"],
-
-        "batch_no": med.get("batch_no", ""),
-
-        "quantity": payload.quantity,
-
-        "unit_type": payload.unit_type,
-
-        "units_dispensed": units_needed,
-
-        "total_amount": float(payload.total_amount),
-
-        "customer_name": payload.customer_name or "Walk-in",
-
-        "payment_status": payload.payment_status,
-
-        "notes": payload.notes,
-
+        **data,
         "sale_date": sale_date,
-
-        "created_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "created_by": user.get("name", ""),
     }
+    entry = _normalize_daily_sale(entry)
 
     await db.daily_sales.insert_one(entry)
 
@@ -7523,7 +7548,31 @@ async def list_daily_sales(
             "stock_deductions": 0
         }
     ).sort("created_at", -1).to_list(2000)
-    return items
+    return [_normalize_daily_sale(item) for item in items]
+
+
+@api_router.put("/daily-sales/{sale_id}")
+async def update_daily_sale(
+    sale_id: str,
+    payload: DailySaleUpdate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    existing = await db.daily_sales.find_one({"id": sale_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    changes = payload.model_dump(exclude_unset=True)
+    updated = _normalize_daily_sale({**existing, **changes})
+    update_values = {
+        field: updated[field]
+        for field in (
+            "cash_sales", "upi_sales", "card_sales", "outstanding_sales",
+            "gross_sales", "total_paid", "total_outstanding", "total_amount",
+            "notes", "sale_date",
+        )
+        if field in updated
+    }
+    await db.daily_sales.update_one({"id": sale_id}, {"$set": update_values})
+    return {key: value for key, value in updated.items() if key not in {"_id", "stock_deductions"}}
 
 
 @api_router.get("/daily-sales/summary")
@@ -7543,49 +7592,32 @@ async def daily_sales_summary(
         {"_id": 0}
     ).to_list(2000)
 
-    live_total = sum(
-        i.get("total_amount", 0)
-        for i in items
-    )
-
-    live_paid = sum(
-        i.get("total_amount", 0)
-        for i in items
-        if i.get("payment_status") == "paid"
-    )
-
-    live_pending = sum(
-        i.get("total_amount", 0)
-        for i in items
-        if i.get("payment_status") == "pending"
-    )
-
-    historical_total = sum(
-        h.get("total_amount", 0)
-        for h in historical
-    )
-
-    historical_paid = sum(
-        h.get("cash_amount", 0)
-        + h.get("upi_amount", 0)
-        for h in historical
-    )
-
-    historical_pending = sum(
-        h.get("pending_amount", 0)
-        for h in historical
-    )
-
-    total = live_total + historical_total
-    paid = live_paid + historical_paid
-    pending = live_pending + historical_pending
+    expenses = await db.expenses.find({"date": target}, {"_id": 0}).to_list(2000)
+    normalized = [_normalize_daily_sale(item) for item in items]
+    cash = sum(i["cash_sales"] for i in normalized) + sum(_money(h.get("cash_amount")) for h in historical)
+    upi = sum(i["upi_sales"] for i in normalized) + sum(_money(h.get("upi_amount")) for h in historical)
+    card = sum(i["card_sales"] for i in normalized) + sum(_money(h.get("card_amount")) for h in historical)
+    pending = sum(i["outstanding_sales"] for i in normalized) + sum(_money(h.get("pending_amount")) for h in historical)
+    expense_total = sum(_money(expense.get("amount")) for expense in expenses)
+    paid = cash + upi + card
+    total = paid + pending
 
     return {
         "date": target,
         "count": len(items) + len(historical),
-        "total": round(total, 2),
-        "paid": round(paid, 2),
-        "pending": round(pending, 2),
+        "cash_sales": _money(cash),
+        "upi_sales": _money(upi),
+        "card_sales": _money(card),
+        "outstanding_sales": _money(pending),
+        "gross_sales": _money(total),
+        "total_paid": _money(paid),
+        "total_outstanding": _money(pending),
+        "total_expenses": _money(expense_total),
+        "estimated_net_profit": _money(total - expense_total),
+        # Backward-compatible summary aliases.
+        "total": _money(total),
+        "paid": _money(paid),
+        "pending": _money(pending),
     }
 
 @api_router.delete("/daily-sales/{sale_id}")
