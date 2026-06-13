@@ -357,6 +357,11 @@ STOCK_QUANTITY_FIELDS = {
     "purchase_return_units", "purchase_return_quantity", "returned_quantity", "returned_units",
     "available_stock", "current_stock", "total_stock", "stock_adjustment_units",
 }
+INVENTORY_MONEY_FIELDS = {
+    "purchase_price", "mrp", "cost_value", "mrp_value",
+    "total_cost_value", "total_mrp_value", "valuation_total", "valuation_totals",
+}
+STANDARD_MEDICINE_CATEGORIES = {"OTC", "H", "H1", "X", "NRX", "G"}
 
 
 def round_qty(value) -> float:
@@ -372,9 +377,43 @@ def _normalize_inventory_quantities(value):
     if not isinstance(value, dict):
         return value
     return {
-        key: (round_qty(item) if key in STOCK_QUANTITY_FIELDS else _normalize_inventory_quantities(item))
+        key: (
+            round_qty(item) if key in STOCK_QUANTITY_FIELDS
+            else round(float(item or 0), 2) if key in INVENTORY_MONEY_FIELDS and isinstance(item, (int, float))
+            else _normalize_inventory_quantities(item)
+        )
         for key, item in value.items()
     }
+
+
+def _inventory_category(value) -> dict:
+    """Keep the stored category while exposing a stable badge value."""
+    category = str(value or "OTC").strip() or "OTC"
+    normalized = category.upper().replace(" ", "")
+    if normalized == "NRX":
+        normalized = "NRx"
+    return {
+        "category": category,
+        "category_code": normalized if normalized.upper() in STANDARD_MEDICINE_CATEGORIES else category,
+        "category_status": normalized if normalized.upper() in STANDARD_MEDICINE_CATEGORIES else "other",
+    }
+
+
+def _inventory_stock_status(medicine: dict, today: Optional[date] = None) -> str:
+    stock = _available_stock(medicine)
+    if stock <= 0:
+        return "sold_out"
+    if expiry_details(medicine.get("expiry_date"), today or datetime.now(timezone.utc).date())["expiry_status"] == "expired":
+        return "expired"
+    threshold = medicine.get("low_stock_threshold")
+    if threshold is None:
+        return "healthy"
+    threshold = max(0.0, float(threshold))
+    if stock <= max(1.0, threshold * 0.25):
+        return "critical"
+    if stock <= threshold:
+        return "low_stock"
+    return "healthy"
 
 
 def _stock_quantity(medicine: dict, canonical_key: str, *fallback_keys: str) -> float:
@@ -1951,6 +1990,7 @@ async def list_medicines(
             {field: {"$regex": search_pattern, "$options": "i"}}
             for field in ("name", "batch_no", "manufacturer", "barcode")
         ]
+        q["$or"].append({"category": {"$regex": search_pattern, "$options": "i"}})
 
     if category:
         q["category"] = category
@@ -2092,6 +2132,8 @@ async def list_medicines(
         m["available_stock"] = qty
         m["return_status"] = return_status
         m["status"] = return_status
+        m["stock_status"] = _inventory_stock_status(m, today)
+        m.update(_inventory_category(m.get("category")))
 
         # EXPIRY WARNING SYSTEM
 
@@ -2151,6 +2193,12 @@ async def list_medicines(
 
                 "category":
                     m.get("category"),
+
+                "category_code":
+                    m.get("category_code"),
+
+                "category_status":
+                    m.get("category_status"),
 
                 "mrp":
                     m.get("mrp"),
@@ -2301,6 +2349,18 @@ async def list_medicines(
             "status":
                 return_status,
 
+            "stock_status":
+                m.get("stock_status"),
+
+            "category":
+                m.get("category"),
+
+            "category_code":
+                m.get("category_code"),
+
+            "category_status":
+                m.get("category_status"),
+
             "pack_size":
                 m.get("pack_size"),
 
@@ -2323,6 +2383,25 @@ async def list_medicines(
     result = list(
         grouped.values()
     )
+
+    for item in result:
+        aggregate_stock = {
+            **item,
+            "purchased_units": item.get("total_stock"),
+            "sold_units": 0,
+            "purchase_return_units": 0,
+            "stock_adjustment_units": 0,
+        }
+        item["stock_status"] = _inventory_stock_status(aggregate_stock, today)
+        if item["total_stock"] > 0 and any(
+            batch.get("stock_status") == "expired" and batch.get("available_stock", 0) > 0
+            for batch in item["batches"]
+        ):
+            item["stock_status"] = "expired"
+        item["current_stock"] = item["total_stock"]
+        item["available_qty"] = item["total_stock"]
+        item["cost_value"] = round(float(item.get("purchase_price") or 0) * item["total_stock"], 2)
+        item["mrp_value"] = round(float(item.get("mrp") or 0) * item["total_stock"], 2)
 
     result.sort(
         key=lambda x: (
@@ -7476,6 +7555,20 @@ async def rebuild_inventory():
         if key:
             existing_medicines[key] = old
 
+    # Invoice lines are the source of truth for future sales rebuilds. Legacy
+    # batches without matching invoice history retain their existing sold value.
+    invoice_sold_by_id = defaultdict(float)
+    invoice_sold_by_key = defaultdict(float)
+    invoices_collection = getattr(db, "invoices", None)
+    if invoices_collection is not None:
+        async for invoice in invoices_collection.find({}):
+            for item in invoice.get("items", []):
+                quantity = round_qty(item.get("quantity_units", item.get("quantity", 0)))
+                if item.get("medicine_id"):
+                    invoice_sold_by_id[item["medicine_id"]] += quantity
+                if item.get("medicine_key"):
+                    invoice_sold_by_key[item["medicine_key"]] += quantity
+
     # REBUILD FROM PO
     cursor = db.purchase_orders.find({})
 
@@ -7554,10 +7647,17 @@ async def rebuild_inventory():
                     # PURCHASE STOCK FROM PO
                     "purchased_units": 0,
 
-                    # MANUAL SOLD QTY PRESERVED
+                    # Prefer invoice-derived sales; preserve legacy/manual data
+                    # only when no matching invoice history is available.
                     "sold_units":
-                        round_qty(existing.get("sold_units", 0))
-                        if existing else 0,
+                        round_qty(
+                            invoice_sold_by_id.get(existing.get("id"))
+                            if existing and existing.get("id") in invoice_sold_by_id
+                            else invoice_sold_by_key.get(key)
+                            if key in invoice_sold_by_key
+                            else existing.get("sold_units", 0)
+                            if existing else 0
+                        ),
 
                     # PURCHASE RETURNS PRESERVED
                     "purchase_return_units":
@@ -7582,12 +7682,20 @@ async def rebuild_inventory():
 
             medicines[key]["purchased_units"] = round_qty(medicines[key]["purchased_units"] + qty)
 
-    # FULL REBUILD
-    await db.medicines.delete_many({})
-
+    # Upsert calculated batches rather than deleting the collection. This keeps
+    # historical/orphaned and long-expired inventory records intact.
     for m in medicines.values():
-
-        await db.medicines.insert_one(m)
+        derivatives = {
+            "available_stock": _available_stock(m),
+            "quantity_units": _available_stock(m),
+            "return_status": _return_status(m),
+            "status": _return_status(m),
+        }
+        await db.medicines.update_one(
+            {"medicine_key": m["medicine_key"]},
+            {"$set": {**m, **derivatives}},
+            upsert=True,
+        )
 
     # Rebuild the derived return quantity from the source-of-truth return
     # collection, including legacy records created before this field existed.
