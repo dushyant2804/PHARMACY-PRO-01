@@ -1432,6 +1432,7 @@ class PurchaseReturnUpdate(BaseModel):
     return_date: Optional[str] = None
     reason: Optional[Literal["Expired", "Damaged", "Wrong Item", "Other"]] = None
     return_quantity: Optional[float] = None
+    purchase_rate: Optional[float] = None
     notes: Optional[str] = None
     adjust_distributor_ledger: Optional[bool] = None
 
@@ -1447,6 +1448,13 @@ class PurchaseReturnUpdate(BaseModel):
     def validate_return_quantity(cls, value):
         if value is not None and value <= 0:
             raise ValueError("return_quantity must be greater than zero")
+        return value
+
+    @field_validator("purchase_rate")
+    @classmethod
+    def validate_purchase_rate(cls, value):
+        if value is not None and value <= 0:
+            raise ValueError("purchase_rate must be greater than zero")
         return value
 
     @field_validator("notes", mode="before")
@@ -5890,10 +5898,17 @@ async def update_purchase_return(
     current = await db.purchase_returns.find_one({"id": return_id})
     if not current:
         raise HTTPException(status_code=404, detail="Purchase return not found")
-    if current.get("po_adjustment_id"):
-        raise HTTPException(status_code=409, detail="Purchase return is applied to a purchase order; release it before editing")
+    status = _purchase_return_settlement_status(current)
+    if status == "voided" or current.get("voided_at"):
+        raise HTTPException(status_code=409, detail="Voided purchase returns cannot be edited")
+    if status == "settled_by_po":
+        raise HTTPException(status_code=409, detail="Purchase return is settled in a purchase order and cannot be edited")
+    if status == "ledger_adjusted":
+        raise HTTPException(status_code=409, detail="Ledger-adjusted purchase returns cannot be edited; void the ledger adjustment first")
 
     changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        return _return_public(current)
     updated = {**current, **changes}
     updated["ledger_adjusted"] = bool(updated.get("adjust_distributor_ledger"))
     updated["purchase_rate"] = _money_float(_to_decimal(updated["purchase_rate"]))
@@ -5941,33 +5956,54 @@ async def delete_purchase_return(
     current = await db.purchase_returns.find_one({"id": return_id})
     if not current:
         raise HTTPException(status_code=404, detail="Purchase return not found")
-    if current.get("po_adjustment_id"):
-        raise HTTPException(status_code=409, detail="Purchase return is applied to a purchase order; release it before deleting")
+    status = _purchase_return_settlement_status(current)
+    if status == "voided" or current.get("voided_at"):
+        raise HTTPException(status_code=409, detail="Purchase return is already voided")
+    if status == "settled_by_po":
+        raise HTTPException(status_code=409, detail="Purchase return is settled in a purchase order and cannot be voided")
 
     quantity = float(current.get("return_quantity", 0) or 0)
+    stock_restored = False
 
     async def write(session=None):
+        nonlocal stock_restored
+        voided_at = datetime.now(timezone.utc).isoformat()
         if current.get("ledger_transaction_id"):
-            await db.distributor_transactions.delete_one(
-                {"id": current["ledger_transaction_id"], "return_id": return_id}, session=session
+            await db.distributor_transactions.update_one(
+                {"id": current["ledger_transaction_id"], "return_id": return_id},
+                {"$set": {
+                    "voided_at": voided_at,
+                    "voided_by": user.get("name") or user.get("id", ""),
+                    "void_reason": "Purchase return voided",
+                }},
+                session=session,
             )
         await _set_purchase_return_stock_delta(current["medicine_id"], -quantity, session=session)
+        stock_restored = True
         result = await db.purchase_returns.update_one({
             "id": return_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]
         }, {"$set": {
-            "voided_at": datetime.now(timezone.utc).isoformat(),
+            "voided_at": voided_at,
             "voided_by": user.get("name") or user.get("id", ""),
             "settlement_status": "voided",
+            "ledger_adjusted": False,
+            "adjust_distributor_ledger": False,
+            "settled_return_value": 0.0,
         }}, session=session)
         if result.modified_count != 1:
             raise HTTPException(status_code=409, detail="Purchase return changed or was applied to a purchase order")
-        return {"message": "Purchase return deleted", "id": return_id}
+        return {"message": "Purchase return voided", "id": return_id}
 
     async def transaction_operation(session):
         return await write(session=session)
 
     async def fallback_operation():
-        return await write()
+        try:
+            return await write()
+        except Exception:
+            if stock_restored:
+                await _set_rounded_stock_delta(current["medicine_id"], "purchase_return_units", quantity)
+            raise
 
     return await _run_with_transaction(transaction_operation, fallback_operation)
 

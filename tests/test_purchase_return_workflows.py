@@ -203,22 +203,76 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated["return_quantity"], 1)
         self.assertEqual(self.fake_db.medicines.rows[0]["purchase_return_units"], 1)
 
-    async def test_delete_restores_stock_and_linked_return_is_blocked(self):
+    async def test_edit_unsettled_return_updates_safe_fields_and_rate(self):
+        async def fallback_only(operation, fallback):
+            return await fallback()
+        payload = PurchaseReturnUpdate(
+            return_date="2026-06-02", reason="Damaged", notes="Updated",
+            purchase_rate=12, adjust_distributor_ledger=False,
+        )
+        with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
+            updated = await update_purchase_return("return-1", payload, {"id": "user"})
+        self.assertEqual(updated["return_date"], "2026-06-02")
+        self.assertEqual(updated["reason"], "Damaged")
+        self.assertEqual(updated["notes"], "Updated")
+        self.assertEqual(updated["purchase_rate"], 12.0)
+        self.assertEqual(updated["return_amount"], 24.0)
+
+    async def test_settled_or_ledger_adjusted_return_cannot_be_edited(self):
+        for settlement in (
+            {"settlement_status": "settled_by_po", "settled_by_po": "po-1"},
+            {"settlement_status": "ledger_adjusted", "ledger_adjusted": True},
+        ):
+            self.fake_db.purchase_returns.rows[0].update(settlement)
+            with patch("server.db", self.fake_db):
+                with self.assertRaises(HTTPException) as caught:
+                    await update_purchase_return("return-1", PurchaseReturnUpdate(notes="unsafe"), {"id": "user"})
+            self.assertEqual(caught.exception.status_code, 409)
+            self.assertIn("cannot be edited", caught.exception.detail)
+            self.fake_db.purchase_returns.rows[0] = dict(self.return_row)
+
+    async def test_void_restores_stock_preserves_history_and_linked_return_is_blocked(self):
         async def fallback_only(operation, fallback):
             return await fallback()
         with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
-            await delete_purchase_return("return-1", {"id": "user"})
+            response = await delete_purchase_return("return-1", {"id": "user"})
+        self.assertEqual(response["message"], "Purchase return voided")
         self.assertEqual(self.fake_db.medicines.rows[0]["purchase_return_units"], 0)
         self.assertEqual(len(self.fake_db.purchase_returns.rows), 1)
         self.assertEqual(self.fake_db.purchase_returns.rows[0]["settlement_status"], "voided")
+        self.assertEqual(self.fake_db.purchase_returns.rows[0]["return_quantity"], 2)
+        self.assertEqual(self.fake_db.purchase_returns.rows[0]["reason"], "Expired")
         self.assertIn("voided_at", self.fake_db.purchase_returns.rows[0])
 
-        linked = {**self.return_row, "po_adjustment_id": "po-1"}
+        linked = {
+            **{key: value for key, value in self.return_row.items() if not key.startswith("voided_")},
+            "settlement_status": "settled_by_po", "settled_by_po": "po-1",
+        }
         self.fake_db.purchase_returns.rows[:] = [linked]
         with patch("server.db", self.fake_db):
             with self.assertRaises(HTTPException) as caught:
                 await delete_purchase_return("return-1", {"id": "user"})
         self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("cannot be voided", caught.exception.detail)
+
+    async def test_void_ledger_adjusted_return_keeps_voided_ledger_history(self):
+        self.fake_db.purchase_returns.rows[0].update({
+            "ledger_adjusted": True, "adjust_distributor_ledger": True,
+            "ledger_transaction_id": "txn-1", "settlement_status": "ledger_adjusted",
+        })
+        self.fake_db.distributor_transactions.rows.append({
+            "id": "txn-1", "return_id": "return-1", "amount": 20,
+        })
+
+        async def fallback_only(operation, fallback):
+            return await fallback()
+        with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
+            await delete_purchase_return("return-1", {"name": "Admin"})
+
+        self.assertEqual(len(self.fake_db.distributor_transactions.rows), 1)
+        self.assertEqual(self.fake_db.distributor_transactions.rows[0]["voided_by"], "Admin")
+        self.assertIn("voided_at", self.fake_db.distributor_transactions.rows[0])
+        self.assertFalse(self.fake_db.purchase_returns.rows[0]["ledger_adjusted"])
 
 
 class PurchaseReturnStockBackfillTests(unittest.IsolatedAsyncioTestCase):
