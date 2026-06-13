@@ -5013,6 +5013,70 @@ def _current_distributor_balance(distributor: dict, transactions: list[dict]) ->
     return round(balance, 2)
 
 
+def _distributor_identity_values(distributor: dict, requested_id: str | None = None) -> set[str]:
+    values = set()
+    for field in ("_id", "_legacy_object_id", "id", "distributor_id"):
+        value = distributor.get(field)
+        if value is not None and str(value).strip():
+            values.add(str(value).strip())
+    if requested_id and str(requested_id).strip():
+        values.add(str(requested_id).strip())
+    return values
+
+
+def _belongs_to_distributor(row: dict, identity_values: set[str], names: set[str]) -> bool:
+    linked_values = {
+        str(row.get(field)).strip()
+        for field in ("distributor_id", "distributor", "distributorId")
+        if row.get(field) is not None and str(row.get(field)).strip()
+    }
+    if linked_values & identity_values:
+        return True
+    # Names are only a legacy fallback when no usable identifier is present.
+    if linked_values:
+        return False
+    row_names = {
+        str(row.get(field)).strip().casefold()
+        for field in ("distributor_name", "name")
+        if row.get(field) is not None and str(row.get(field)).strip()
+    }
+    return bool(row_names & names)
+
+
+def _purchase_order_ledger_transaction(po: dict, distributor_id: str) -> dict:
+    transaction_date = po.get("po_date") or po.get("created_at")
+    return {
+        "id": f"purchase-order-{po.get('id') or po.get('po_no') or po.get('invoice_ref')}",
+        "purchase_order_id": po.get("id"),
+        "distributor_id": distributor_id,
+        "type": "purchase",
+        "display_type": "Purchase",
+        "amount": _safe_float(po.get("grand_total", po.get("total", 0))),
+        "invoice_number": po.get("invoice_ref"),
+        "bill_number": po.get("po_no"),
+        "reference_number": po.get("po_no") or po.get("invoice_ref"),
+        "notes": po.get("notes"),
+        "created_at": transaction_date,
+        "transaction_date": transaction_date,
+        "date": transaction_date,
+        "is_system_generated": True,
+        "source": "purchase_order",
+    }
+
+
+def _purchase_transaction_matches_po(txn: dict, po: dict) -> bool:
+    if str(txn.get("type") or "").lower() not in {"purchase", "sale"}:
+        return False
+    po_ids = {str(value) for value in (po.get("id"), po.get("po_no"), po.get("invoice_ref")) if value}
+    txn_refs = {
+        str(txn.get(field))
+        for field in ("purchase_order_id", "po_id", "reference", "reference_number",
+                      "invoice_number", "bill_number", "id")
+        if txn.get(field)
+    }
+    return bool(po_ids & txn_refs)
+
+
 @api_router.get("/ledger/distributor/{did}")
 async def distributor_ledger(
     did: str,
@@ -5029,16 +5093,30 @@ async def distributor_ledger(
 ):
     dist = await db.distributors.find_one({"id": did}, {"_id": 0})
     if not dist:
+        candidates = await db.distributors.find({}).to_list(5000)
+        dist = next((row for row in candidates if did in _distributor_identity_values(row)), None)
+    if not dist:
         raise HTTPException(status_code=404, detail="Distributor not found")
+    if dist.get("_id") is not None:
+        dist["_legacy_object_id"] = str(dist.pop("_id"))
 
     opening_balance_date = _distributor_opening_balance_date(dist)
     if opening_balance_date:
         dist["opening_balance_date"] = opening_balance_date
 
-    txns = await db.distributor_transactions.find(
-        {"distributor_id": did},
-        {"_id": 0},
-    ).sort("created_at", 1).to_list(1000)
+    identity_values = _distributor_identity_values(dist, did)
+    names = {
+        str(dist.get(field)).strip().casefold()
+        for field in ("name", "distributor_name")
+        if dist.get(field) and str(dist.get(field)).strip()
+    }
+    all_txns = await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000)
+    txns = [txn for txn in all_txns if _belongs_to_distributor(txn, identity_values, names)]
+    purchase_orders = await db.purchase_orders.find({}, {"_id": 0}).to_list(10000)
+    matching_pos = [po for po in purchase_orders if _belongs_to_distributor(po, identity_values, names)]
+    for po in matching_pos:
+        if not any(_purchase_transaction_matches_po(txn, po) for txn in txns):
+            txns.append(_purchase_order_ledger_transaction(po, str(dist.get("id") or did)))
 
     opening_txn = None
     non_opening_txns = []
@@ -5053,6 +5131,7 @@ async def distributor_ledger(
         opening_txn or _opening_balance_transaction(dist),
         *non_opening_txns,
     ]
+    ledger_txns.sort(key=_distributor_fifo_sort_key)
     available_financial_years = _available_financial_years(ledger_txns)
     financial_year_metadata = _distributor_financial_year_metadata(
         ledger_txns,
@@ -5081,14 +5160,14 @@ async def distributor_ledger(
 
     for txn in ledger_txns:
         balance, bucket = _apply_distributor_transaction(balance, txn)
-        amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
+        txn_amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
 
         if bucket == "purchase":
-            total_purchases += amount
+            total_purchases += txn_amount
         elif bucket == "adjustment":
-            total_adjustments += amount
+            total_adjustments += txn_amount
         else:
-            total_paid += amount
+            total_paid += txn_amount
 
         txn_id = _serializable_transaction_id(txn.get("id") if isinstance(txn, dict) else None)
         running.append(_json_safe_ledger_transaction({
