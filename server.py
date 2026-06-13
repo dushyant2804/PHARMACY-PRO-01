@@ -895,6 +895,7 @@ class Medicine(BaseModel):
     gst_rate: float = 12.0
     barcode: Optional[str] = None
     low_stock_threshold: int = 10
+    low_stock_status: Literal["low_stock", "reordered", "abandoned", "restocked"] = "low_stock"
 
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     
@@ -919,6 +920,10 @@ class MedicineCreate(BaseModel):
     low_stock_threshold: int = 10
 
     auto_ledger: bool = True
+
+
+class LowStockStatusUpdate(BaseModel):
+    status: Literal["low_stock", "reordered", "abandoned", "restocked"]
     
 # Keep migration-only types separate so they can be removed from the normal
 # workflow without changing the permanent adjustment types. Existing records
@@ -2247,6 +2252,7 @@ async def list_medicines(
         m["return_status"] = return_status
         m["status"] = return_status
         m["stock_status"] = _inventory_stock_status(m, today)
+        m["low_stock_status"] = _low_stock_status(m)
         m.update(_inventory_category(m.get("category")))
 
         # EXPIRY WARNING SYSTEM
@@ -2280,6 +2286,9 @@ async def list_medicines(
 
                 "low_stock_threshold":
                     m.get("low_stock_threshold"),
+
+                "low_stock_status":
+                    _low_stock_status(m),
 
                 "sold_units":
                     0,
@@ -2421,6 +2430,9 @@ async def list_medicines(
             "low_stock_threshold":
                 m.get("low_stock_threshold"),
 
+            "low_stock_status":
+                _low_stock_status(m),
+
             "batch_no":
                 m.get("batch_no"),
 
@@ -2525,7 +2537,30 @@ async def list_medicines(
     )
 
     return _normalize_inventory_quantities(result)
-    
+
+
+@api_router.put("/medicines/{medicine_id}/low-stock-status")
+async def update_low_stock_status(
+    medicine_id: str,
+    payload: LowStockStatusUpdate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    """Persist workflow state without changing any stock quantity fields."""
+    medicine_filter = _medicine_identity_filter(medicine_id)
+    result = await db.medicines.update_one(
+        medicine_filter,
+        {"$set": {"low_stock_status": payload.status}},
+    )
+    if not result.matched_count:
+        raise HTTPException(status_code=404, detail="Medicine not found")
+
+    return {
+        "medicine_id": medicine_id,
+        "low_stock_status": payload.status,
+        "status": payload.status,
+    }
+
+
 @api_router.put("/medicines/{medicine_id}/threshold")
 async def update_threshold(
     medicine_id: str,
@@ -6519,6 +6554,7 @@ async def dashboard_summary(
             "id": m.get("id"), "name": m.get("name"), "qty": 0,
             "current_stock": 0, "available_qty": 0, "threshold": threshold,
             "status": _low_stock_status(m),
+            "low_stock_status": _low_stock_status(m),
         })
         if threshold is not None:
             item["threshold"] = max(item["threshold"] or 0, threshold)
@@ -8190,6 +8226,9 @@ async def rebuild_inventory():
                     "low_stock_threshold":
                         existing.get("low_stock_threshold")
                         if existing else None,
+
+                    "low_stock_status":
+                        _low_stock_status(existing or {}),
 
                     "id":
                        existing.get("id")
