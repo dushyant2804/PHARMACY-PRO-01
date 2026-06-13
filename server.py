@@ -668,6 +668,68 @@ async def _get_patient_alerts(today=None) -> list:
     return alerts
 
 
+def _patient_medicine_matches(patient: dict, medicine: dict) -> bool:
+    """Match explicit inventory references first, then legacy name/batch snapshots."""
+    patient_refs = {
+        str(patient.get(key) or "").strip().lower()
+        for key in ("medicine_id", "medicine_key")
+        if patient.get(key)
+    }
+    medicine_refs = {
+        str(medicine.get(key) or "").strip().lower()
+        for key in ("id", "medicine_key")
+        if medicine.get(key)
+    }
+    if patient_refs and patient_refs & medicine_refs:
+        return True
+    if str(patient.get("medicine_name") or "").strip().lower() != str(medicine.get("name") or "").strip().lower():
+        return False
+    selected_batch = str(patient.get("batch") or "").strip().lower()
+    return not selected_batch or selected_batch == str(medicine.get("batch_no") or "").strip().lower()
+
+
+async def _link_patient_medicine(data: dict) -> dict:
+    """Enrich patient tracking with an inventory snapshot without changing stock."""
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
+    matches = [medicine for medicine in medicines if _patient_medicine_matches(data, medicine)]
+    if not matches:
+        return data
+    medicine = sorted(matches, key=_fifo_expiry_key)[0]
+    linked = dict(data)
+    linked.update({
+        "medicine_id": medicine.get("id") or linked.get("medicine_id"),
+        "medicine_key": medicine.get("medicine_key") or linked.get("medicine_key"),
+        "medicine_name": medicine.get("name") or linked.get("medicine_name"),
+        "batch": medicine.get("batch_no") or linked.get("batch"),
+        "expiry": medicine.get("expiry_date") or linked.get("expiry"),
+        "current_mrp": round(float(medicine["mrp"]), 2) if medicine.get("mrp") is not None else linked.get("current_mrp"),
+    })
+    return linked
+
+
+async def _get_patient_stock_alerts() -> list:
+    patients = await db.regular_patients.find({}, {"_id": 0}).to_list(2000)
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
+    alerts = []
+    for medicine in medicines:
+        status = _inventory_stock_status(medicine)
+        if status not in {"low_stock", "critical", "sold_out"}:
+            continue
+        affected = [patient for patient in patients if _has_patient_identity(patient) and _patient_medicine_matches(patient, medicine)]
+        if affected:
+            alerts.append({
+                "medicine_id": medicine.get("id"),
+                "medicine_key": medicine.get("medicine_key"),
+                "medicine_name": medicine.get("name"),
+                "batch": medicine.get("batch_no"),
+                "stock_status": status,
+                "available_stock": round_qty(_available_stock(medicine)),
+                "affected_patient_count": len(affected),
+                "patient_names": sorted({patient["name"] for patient in affected}),
+            })
+    return alerts
+
+
 # ---------------- Auth helpers ----------------
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -888,13 +950,23 @@ class RegularPatient(BaseModel):
     address: Optional[str] = None
 
     medicine_name: str
+    medicine_id: Optional[str] = None
+    medicine_key: Optional[str] = None
+    current_mrp: Optional[float] = None
+    batch: Optional[str] = None
+    expiry: Optional[str] = None
+    dosage: Optional[str] = None
+    frequency: Optional[str] = None
+    duration: Optional[str] = None
     duration_days: int
     last_refill_date: str
 
     condition: str = ""
 
     @field_validator(
-        "name", "phone", "medicine_name", "last_refill_date", "condition", mode="before"
+        "name", "phone", "medicine_name", "last_refill_date", "condition",
+        "medicine_id", "medicine_key", "batch", "expiry", "dosage", "frequency",
+        "duration", mode="before"
     )
     @classmethod
     def trim_string_fields(cls, value):
@@ -903,6 +975,11 @@ class RegularPatient(BaseModel):
         if isinstance(value, str):
             return value.strip()
         return value
+
+    @field_validator("current_mrp")
+    @classmethod
+    def normalize_current_mrp(cls, value):
+        return None if value is None else round(float(value), 2)
 
     @field_validator("address", mode="before")
     @classmethod
@@ -2907,7 +2984,7 @@ async def add_patient(
     payload: RegularPatient,
     user: dict = Depends(get_current_user)
 ):
-    data = payload.model_dump()
+    data = await _link_patient_medicine(payload.model_dump())
     await db.regular_patients.insert_one(data)
     return {"success": True}
 
@@ -2921,10 +2998,11 @@ async def update_patient(
     if not phone:
         raise HTTPException(status_code=400, detail="Patient phone is required")
 
+    data = await _link_patient_medicine(payload.model_dump())
     result = await db.regular_patients.update_one(
         {"phone": phone},
         {
-            "$set": payload.model_dump()
+            "$set": data
         }
     )
 
@@ -2953,6 +3031,11 @@ async def list_patients(user: dict = Depends(get_current_user)):
 @api_router.get("/patients/alerts")
 async def patient_alerts(user: dict = Depends(get_current_user)):
     return await _get_patient_alerts()
+
+
+@api_router.get("/patients/stock-alerts")
+async def patient_stock_alerts(user: dict = Depends(get_current_user)):
+    return await _get_patient_stock_alerts()
 
 
 @api_router.delete("/patients")
