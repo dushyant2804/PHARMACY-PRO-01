@@ -16,6 +16,8 @@ import hmac
 import secrets
 import smtplib
 import json
+import csv
+import io
 import urllib.request
 from contextvars import ContextVar
 from email.message import EmailMessage
@@ -27,7 +29,7 @@ from collections import defaultdict
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
@@ -3660,7 +3662,9 @@ async def _reapply_daily_sale_stock(restored: list[dict]):
 
 
 INVOICE_PAYMENT_MODES = {"cash", "upi", "card", "credit", "mixed"}
-INTERNAL_INVOICE_FIELDS = {"purchase_cost", "estimated_profit", "margin_percentage"}
+INTERNAL_INVOICE_FIELDS = {
+    "purchase_cost", "profit", "estimated_profit", "margin", "margin_percentage",
+}
 INVOICE_MONEY_FIELDS = {
     "subtotal", "gst_total", "gst", "bill_discount", "discount", "grand_total",
     "total", "paid_amount", "paid", "due_amount", "due", *INTERNAL_INVOICE_FIELDS,
@@ -4109,6 +4113,15 @@ async def get_invoice(inv_id: str, user: dict = Depends(get_current_user)):
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
     return _normalize_invoice(inv, include_internal=_invoice_user_can_view_internal(user))
+
+
+@api_router.get("/invoices/{inv_id}/share")
+async def get_invoice_share_payload(inv_id: str, user: dict = Depends(get_current_user)):
+    """Return customer-safe invoice data; delivery is deliberately left to the client."""
+    inv = await db.invoices.find_one({"id": inv_id}, {"_id": 0})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return {"invoice": _normalize_invoice(inv, include_internal=False)}
 
 
 # ---------------- Ledgers ----------------
@@ -6232,6 +6245,66 @@ async def customer_ledger(cid: str, search: Optional[str] = None, invoice_number
         return (not search or search.lower() in text.lower()) and (not invoice_number or invoice_number.lower() in str(t.get("invoice_number") or t.get("reference") or "").lower()) and (not reference_number or reference_number.lower() in str(t.get("reference_number") or t.get("reference") or "").lower()) and (not payment_mode or payment_mode.lower() == str(t.get("payment_mode") or t.get("mode") or "").lower()) and (not transaction_type or transaction_type.lower() == str(t.get("type") or "").lower()) and (not start or str(t.get("created_at", "")) >= start) and (not end or str(t.get("created_at", "")) <= end) and (amount is None or round(float(t.get("amount", 0) or 0), 2) == round(amount, 2))
     running = [t for t in running if matches(t)]
     return {"customer": cust, "transactions": running, "balance": round(balance, 2)}
+
+
+def _ledger_export_csv(owner_type: str, ledger: dict, start_date: date | None, end_date: date | None) -> str:
+    owner = ledger[owner_type]
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["Ledger Owner", owner.get("name") or owner.get("customer_name") or owner.get("distributor_name") or ""])
+    writer.writerow(["Phone", owner.get("phone") or owner.get("mobile") or owner.get("contact_number") or ""])
+    writer.writerow(["Date Range", f"{start_date.isoformat() if start_date else 'Beginning'} to {end_date.isoformat() if end_date else 'Present'}"])
+    writer.writerow(["Current Balance", _round_ledger_money(ledger.get("balance", 0))])
+    writer.writerow([])
+    writer.writerow(["Transaction Date", "Transaction Type", "Reference/Invoice Number", "Mode", "Amount", "Running Balance", "Notes"])
+    for txn in ledger.get("transactions", []):
+        writer.writerow([
+            txn.get("transaction_date") or txn.get("date") or txn.get("created_at") or "",
+            txn.get("display_type") or txn.get("subtype") or txn.get("type") or "",
+            _distributor_bill_reference(txn),
+            txn.get("payment_mode") or txn.get("mode") or "",
+            _round_ledger_money(txn.get("amount", 0)),
+            _round_ledger_money(txn.get("running_balance", 0)),
+            txn.get("notes") or "",
+        ])
+    return output.getvalue()
+
+
+@api_router.get("/ledger/{ledger_type}/{owner_id}/export")
+async def export_ledger(
+    ledger_type: str,
+    owner_id: str,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    user: dict = Depends(get_current_user),
+):
+    if ledger_type not in {"customer", "distributor"}:
+        raise HTTPException(status_code=400, detail="Ledger type must be customer or distributor")
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=400, detail="start_date must not be after end_date")
+
+    if ledger_type == "customer":
+        ledger = await customer_ledger(
+            owner_id,
+            start=start_date.isoformat() if start_date else None,
+            end=f"{end_date.isoformat()}T23:59:59.999999" if end_date else None,
+            user=user,
+        )
+    else:
+        ledger = await distributor_ledger(
+            owner_id,
+            date_from=start_date,
+            date_to=end_date,
+            user=user,
+        )
+
+    csv_text = _ledger_export_csv(ledger_type, ledger, start_date, end_date)
+    filename = f"{ledger_type}-ledger-{owner_id}.csv"
+    return StreamingResponse(
+        iter([csv_text]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @api_router.delete("/ledger/customer/{cid}/transaction/{txn_id}")
