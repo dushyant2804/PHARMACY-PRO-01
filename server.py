@@ -4376,7 +4376,8 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _round_ledger_money(value: float) -> float:
-    return round(_safe_float(value), 2)
+    """Round ledger currency with the same decimal-safe rule used by POs."""
+    return _money_float(_to_decimal(value))
 
 
 def _serializable_transaction_id(value) -> str | None:
@@ -6737,7 +6738,7 @@ def _calculate_purchase_order_totals(payload: POCreate) -> dict:
 
     for item in payload.items:
         # Free quantity is intentionally excluded from the PO taxable subtotal.
-        line_subtotal = _to_decimal(item.purchase_price) * _to_decimal(item.quantity)
+        line_subtotal = _round_money(_to_decimal(item.purchase_price) * _to_decimal(item.quantity))
         gst_rate = _to_decimal(item.gst_rate)
         slab_subtotals[gst_rate] += line_subtotal
 
@@ -6797,7 +6798,9 @@ def _calculate_purchase_order_totals(payload: POCreate) -> dict:
 
 
 def _purchase_return_credit(item: dict) -> float:
-    return round(float(item.get("return_quantity", 0) or 0) * float(item.get("purchase_rate", 0) or 0), 2)
+    return _money_float(
+        _to_decimal(item.get("return_quantity")) * _to_decimal(item.get("purchase_rate"))
+    )
 
 
 async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[str] = None) -> tuple[list[dict], float]:
@@ -6813,23 +6816,26 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
         return str(value or "").strip().casefold()
 
     def same_number(left, right):
-        return abs(float(left or 0) - float(right or 0)) < 0.000001
+        return _round_money(_to_decimal(left)) == _round_money(_to_decimal(right))
 
     def matches(row: POReturnCreditRow, item: dict) -> bool:
         if item.get("distributor_id") and item.get("distributor_id") != payload.distributor_id:
             return False
-        if normalized(item.get("medicine_key")) and normalized(row.medicine_key):
+        if item.get("medicine_id") and row.medicine_id:
+            medicine_matches = item.get("medicine_id") == row.medicine_id
+        elif normalized(item.get("medicine_key")) and normalized(row.medicine_key):
             medicine_matches = normalized(item.get("medicine_key")) == normalized(row.medicine_key)
         else:
             medicine_matches = normalized(item.get("medicine_name")) == normalized(row.medicine_name)
         required = (
             medicine_matches
             and normalized(item.get("batch_number")) == normalized(row.batch_number)
-            and normalized(item.get("expiry_date")) == normalized(row.expiry_date)
             and same_number(item.get("return_quantity"), row.return_quantity)
             and same_number(item.get("purchase_rate"), row.purchase_rate)
         )
         if not required:
+            return False
+        if item.get("expiry_date") and row.expiry_date and normalized(item.get("expiry_date")) != normalized(row.expiry_date):
             return False
         if row.gst_rate is not None and item.get("gst_rate") is not None and not same_number(item.get("gst_rate"), row.gst_rate):
             return False
@@ -6851,10 +6857,16 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
                 returns.append(selected)
                 known_ids.add(row.id)
             continue
-        if row.return_quantity <= 0 or row.purchase_rate <= 0 or not row.medicine_name or not row.batch_number or not row.expiry_date:
-            raise HTTPException(status_code=400, detail="PO return row requires medicine, batch, expiry, quantity, and purchase rate")
+        if row.return_quantity <= 0 or row.purchase_rate <= 0 or not row.medicine_name or not row.batch_number:
+            raise HTTPException(status_code=400, detail="PO return row requires medicine, batch, quantity, and purchase rate")
 
-        match = next((item for item in candidates if item.get("id") not in known_ids and matches(row, item)), None)
+        match = next((
+            item for item in candidates
+            if item.get("id") not in known_ids
+            and not item.get("ledger_adjusted")
+            and not item.get("adjust_distributor_ledger")
+            and matches(row, item)
+        ), None)
         if match:
             returns.append(match)
             known_ids.add(match["id"])
@@ -6896,18 +6908,23 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
         assigned_po = item.get("po_adjustment_id")
         if assigned_po and assigned_po != allow_po_id:
             raise HTTPException(status_code=409, detail="Purchase return credit is already assigned to another purchase order")
+        if item.get("ledger_adjusted") or item.get("adjust_distributor_ledger"):
+            raise HTTPException(status_code=409, detail="Purchase return credit is already reflected in the distributor ledger")
         item["return_amount"] = _purchase_return_credit(item)
-    credit = round(sum(item["return_amount"] for item in returns), 2)
+    credit = _money_float(sum((_to_decimal(item["return_amount"]) for item in returns), Decimal("0")))
     return returns, credit
 
 
 def _apply_po_return_credit(po_totals: dict, returns: list[dict], credit: float) -> dict:
+    credit = _money_float(_to_decimal(credit))
+    payable_base = _to_decimal(po_totals.get("sub_total", po_totals["grand_total"]))
+    payable = _money_float(max(Decimal("0"), payable_base - _to_decimal(credit)))
     return {
         "purchase_return_ids": [item["id"] for item in returns],
         "purchase_return_adjustment": credit,
-        "purchase_return_details": [{"id": item["id"], "medicine_name": item.get("medicine_name"), "batch_number": item.get("batch_number"), "return_amount": round(float(item.get("return_amount", 0) or 0), 2)} for item in returns],
-        "subtotal_after_purchase_return": round(max(0.0, float(po_totals.get("sub_total", po_totals["grand_total"])) - credit), 2),
-        "final_payable_total": round(max(0.0, float(po_totals.get("sub_total", po_totals["grand_total"])) - credit), 2),
+        "purchase_return_details": [{"id": item["id"], "medicine_name": item.get("medicine_name"), "batch_number": item.get("batch_number"), "return_amount": _money_float(_to_decimal(item.get("return_amount")))} for item in returns],
+        "subtotal_after_purchase_return": payable,
+        "final_payable_total": payable,
     }
 
 
@@ -6976,6 +6993,7 @@ async def create_po(
             **i.model_dump(),
             "quantity": round_qty(i.quantity),
             "free_quantity": round_qty(i.free_quantity),
+            "item_total": _money_float(_to_decimal(i.purchase_price) * _to_decimal(i.quantity)),
             "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
             "expiry_date": normalize_expiry(i.expiry_date),
         }
@@ -7098,6 +7116,7 @@ async def update_po(
                      **i.model_dump(),
                      "quantity": round_qty(i.quantity),
                      "free_quantity": round_qty(i.free_quantity),
+                     "item_total": _money_float(_to_decimal(i.purchase_price) * _to_decimal(i.quantity)),
                      "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
                      "expiry_date": normalize_expiry(i.expiry_date),
                    }
