@@ -8,7 +8,13 @@ os.environ.setdefault("DB_NAME", "pharmacy_test")
 os.environ.setdefault("JWT_SECRET", "test-secret")
 
 from fastapi import HTTPException
-from server import StockAdjustmentCreate, create_stock_adjustment, stock_adjustment_summary
+from pydantic import ValidationError
+from server import (
+    MIGRATION_ONLY_STOCK_ADJUSTMENT_TYPES,
+    StockAdjustmentCreate,
+    create_stock_adjustment,
+    stock_adjustment_summary,
+)
 
 
 class Cursor:
@@ -98,7 +104,7 @@ class StockAdjustmentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.user = {"id": "user-1", "name": "Pharmacist", "role": "pharmacist"}
 
-    def payload(self, quantity, adjustment_type="Manual Correction"):
+    def payload(self, quantity, adjustment_type="correction"):
         return StockAdjustmentCreate(
             adjustment_date="2026-06-12",
             medicine_id="med-1",
@@ -110,7 +116,7 @@ class StockAdjustmentTests(unittest.IsolatedAsyncioTestCase):
             reference_number="ADJ-1",
         )
 
-    async def create(self, quantity, adjustment_type="Manual Correction"):
+    async def create(self, quantity, adjustment_type="correction"):
         with patch("server.db", self.fake_db), patch(
             "server._run_with_transaction", side_effect=fallback_only
         ):
@@ -124,10 +130,13 @@ class StockAdjustmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.medicine["is_low_stock"])
         self.assertEqual(result["medicine_name"], "Qutan 50")
         self.assertEqual(result["created_by"], "Pharmacist")
+        self.assertEqual(result["current_stock"], 7)
+        self.assertEqual(result["adjustment_quantity"], 3)
+        self.assertEqual(result["resulting_stock"], 10)
         self.assertEqual(len(self.fake_db.stock_adjustments.rows), 1)
 
     async def test_negative_adjustment_reduces_selected_batch_and_recalculates_status(self):
-        await self.create(-7, "Damaged")
+        await self.create(-7, "damaged")
 
         self.assertEqual(self.medicine["stock_adjustment_units"], -7)
         self.assertEqual(self.medicine["available_stock"], 0)
@@ -137,7 +146,7 @@ class StockAdjustmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_over_reduction_is_rejected_without_audit_record(self):
         with self.assertRaises(HTTPException) as caught:
-            await self.create(-8, "Theft/Loss")
+            await self.create(-8, "damaged")
 
         self.assertEqual(caught.exception.status_code, 400)
         self.assertNotIn("stock_adjustment_units", self.medicine)
@@ -157,6 +166,18 @@ class StockAdjustmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["negative_quantity"], -3)
         self.assertEqual(result["net_quantity"], 1)
         self.assertEqual(result["by_type"]["Damaged"], {"count": 2, "net_quantity": -3})
+
+    async def test_opening_reconciliation_is_accepted_and_updates_inventory(self):
+        result = await self.create(5, "opening_reconciliation")
+
+        self.assertEqual(MIGRATION_ONLY_STOCK_ADJUSTMENT_TYPES, ("opening_reconciliation",))
+        self.assertEqual(self.medicine["available_stock"], 12)
+        self.assertEqual(result["resulting_stock"], 12)
+        self.assertEqual(result["adjustment_type"], "opening_reconciliation")
+
+    def test_sold_is_not_a_stock_adjustment_type(self):
+        with self.assertRaises(ValidationError):
+            self.payload(-1, "sold")
 
 
 if __name__ == "__main__":
