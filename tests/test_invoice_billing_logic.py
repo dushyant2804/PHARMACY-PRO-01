@@ -4,7 +4,13 @@ os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "pharmacy_test")
 os.environ.setdefault("JWT_SECRET", "test-secret")
 
-from server import InvoiceCreate, _invoice_paid_amount, _normalize_invoice
+from server import (
+    InvoiceCreate,
+    _invoice_paid_amount,
+    _invoice_user_can_view_internal,
+    _normalize_invoice,
+    _strip_internal_invoice_fields,
+)
 
 
 def test_payment_mode_is_separate_and_supports_mixed():
@@ -52,3 +58,37 @@ def test_legacy_combined_invoice_is_normalized_without_exposing_profit():
     internal = _normalize_invoice(legacy, include_internal=True)
     assert internal["purchase_cost"] == 4.0
     assert internal["estimated_profit"] == 6.13
+
+
+def test_only_admin_can_receive_internal_invoice_profit_intelligence():
+    assert _invoice_user_can_view_internal({"role": "admin"})
+    assert not _invoice_user_can_view_internal({"role": "cashier"})
+    assert not _invoice_user_can_view_internal({"role": "pharmacist"})
+    assert not _invoice_user_can_view_internal(None)
+
+
+def test_customer_print_pdf_and_share_sanitizer_removes_nested_profit_data():
+    payload = {
+        "invoice": {
+            "purchase_cost": 10,
+            "items": [{"estimated_profit": 2, "margin_percentage": 20, "name": "Safe"}],
+        },
+        "share": [{"purchase_cost": 1, "message": "Invoice"}],
+    }
+    sanitized = _strip_internal_invoice_fields(payload)
+    assert sanitized == {
+        "invoice": {"items": [{"name": "Safe"}]},
+        "share": [{"message": "Invoice"}],
+    }
+
+
+def test_all_common_invoice_money_aliases_are_two_decimal_safe():
+    invoice = {
+        field: 10.129
+        for field in (
+            "subtotal", "discount", "gst", "grand_total", "total", "paid", "due",
+            "purchase_cost", "estimated_profit", "margin_percentage",
+        )
+    }
+    normalized = _normalize_invoice(invoice, include_internal=True)
+    assert all(value == 10.13 for value in normalized.values() if isinstance(value, float))
