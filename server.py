@@ -5157,7 +5157,29 @@ def _available_batch_stock(medicine: dict) -> float:
 
 
 def _return_public(return_doc: dict) -> dict:
-    return {key: value for key, value in return_doc.items() if key != "_id"}
+    public = {key: value for key, value in return_doc.items() if key != "_id"}
+    return _normalized_purchase_return_money(public)
+
+
+def _normalized_purchase_return_money(return_doc: dict) -> dict:
+    """Expose accounting values consistently without making legacy records unreadable."""
+    normalized = dict(return_doc)
+    for field in ("purchase_rate", "gst_rate", "return_amount", "settled_return_value"):
+        if normalized.get(field) is not None:
+            normalized[field] = _money_float(_to_decimal(normalized[field]))
+    if normalized.get("return_amount") is None:
+        normalized["return_amount"] = _purchase_return_credit(normalized)
+    return normalized
+
+
+def _purchase_return_settlement_status(return_doc: dict) -> str:
+    if return_doc.get("settlement_status"):
+        return return_doc["settlement_status"]
+    if return_doc.get("po_adjustment_id") or return_doc.get("settled_by_po"):
+        return "settled_by_po"
+    if return_doc.get("ledger_adjusted") or return_doc.get("adjust_distributor_ledger"):
+        return "ledger_adjusted"
+    return "unsettled"
 
 
 async def _find_purchase_return_medicine(payload: PurchaseReturnCreate, session=None) -> dict:
@@ -5193,7 +5215,7 @@ def _purchase_return_ledger_transaction(return_doc: dict) -> dict:
         "type": "purchase_return",
         "subtype": "Purchase Return / Expiry Return",
         "direction": "credit_adjustment",
-        "amount": return_doc["return_amount"],
+        "amount": _money_float(_to_decimal(return_doc["return_amount"])),
         "reference": return_doc["id"],
         "return_id": return_doc["id"],
         "notes": (
@@ -5328,6 +5350,8 @@ async def recalculate_purchase_return_stock(tenant_id: Optional[str] = None) -> 
     matched_returns = 0
 
     for return_doc in purchase_returns:
+        if return_doc.get("voided_at"):
+            continue
         medicine = _match_purchase_return_medicine(return_doc, medicines, tenant_id)
         if not medicine:
             unmatched_return_ids.append(return_doc.get("id"))
@@ -5472,7 +5496,10 @@ async def create_purchase_return(
         else payload.distributor
     )
 
-    return_amount = round(payload.return_quantity * payload.purchase_rate, 2)
+    return_amount = _purchase_return_credit({
+        "return_quantity": payload.return_quantity,
+        "purchase_rate": payload.purchase_rate,
+    })
     now = datetime.now(timezone.utc).isoformat()
 
     purchase_return = {
@@ -5486,14 +5513,19 @@ async def create_purchase_return(
         "batch_number": payload.batch_number,
         "expiry_date": payload.expiry_date,
         "return_quantity": payload.return_quantity,
-        "purchase_rate": payload.purchase_rate,
-        "gst_rate": medicine.get("gst_rate"),
+        "purchase_rate": _money_float(_to_decimal(payload.purchase_rate)),
+        "gst_rate": _money_float(_to_decimal(medicine.get("gst_rate"))),
         "return_amount": return_amount,
         "reason": payload.reason,
         "notes": payload.notes,
         "adjust_distributor_ledger": payload.adjust_distributor_ledger,
         "ledger_adjusted": payload.adjust_distributor_ledger,
         "ledger_transaction_id": None,
+        "settlement_status": "ledger_adjusted" if payload.adjust_distributor_ledger else "unsettled",
+        "settled_by_po": None,
+        "settled_at": now if payload.adjust_distributor_ledger else None,
+        "settlement_reference": None,
+        "settled_return_value": return_amount if payload.adjust_distributor_ledger else 0.0,
         "created_at": now,
         "created_by": user.get("name", ""),
     }
@@ -5600,7 +5632,12 @@ async def update_purchase_return(
     changes = payload.model_dump(exclude_unset=True)
     updated = {**current, **changes}
     updated["ledger_adjusted"] = bool(updated.get("adjust_distributor_ledger"))
-    updated["return_amount"] = round(float(updated["return_quantity"]) * float(updated["purchase_rate"]), 2)
+    updated["purchase_rate"] = _money_float(_to_decimal(updated["purchase_rate"]))
+    if updated.get("gst_rate") is not None:
+        updated["gst_rate"] = _money_float(_to_decimal(updated["gst_rate"]))
+    updated["return_amount"] = _purchase_return_credit(updated)
+    updated["settlement_status"] = "ledger_adjusted" if updated["ledger_adjusted"] else "unsettled"
+    updated["settled_return_value"] = updated["return_amount"] if updated["ledger_adjusted"] else 0.0
     updated["updated_at"] = datetime.now(timezone.utc).isoformat()
     delta = float(updated["return_quantity"]) - float(current.get("return_quantity", 0) or 0)
 
@@ -5651,10 +5688,14 @@ async def delete_purchase_return(
                 {"id": current["ledger_transaction_id"], "return_id": return_id}, session=session
             )
         await _set_purchase_return_stock_delta(current["medicine_id"], -quantity, session=session)
-        result = await db.purchase_returns.delete_one({
+        result = await db.purchase_returns.update_one({
             "id": return_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]
-        }, session=session)
-        if result.deleted_count != 1:
+        }, {"$set": {
+            "voided_at": datetime.now(timezone.utc).isoformat(),
+            "voided_by": user.get("name") or user.get("id", ""),
+            "settlement_status": "voided",
+        }}, session=session)
+        if result.modified_count != 1:
             raise HTTPException(status_code=409, detail="Purchase return changed or was applied to a purchase order")
         return {"message": "Purchase return deleted", "id": return_id}
 
@@ -5698,8 +5739,9 @@ async def list_purchase_returns(
         {"_id": 0},
     ).sort("return_date", -1).skip((page - 1) * page_size).limit(page_size).to_list(page_size)
 
+    normalized_items = [_normalized_purchase_return_money(item) for item in items]
     return {
-        "items": items,
+        "items": normalized_items,
         "page": page,
         "page_size": page_size,
         "total": total,
@@ -5737,6 +5779,7 @@ async def purchase_return_report(
 
     total_quantity = 0.0
     total_value = 0.0
+    settled_value = 0.0
 
     def add_summary(bucket: dict, key: str, quantity: float, value: float):
         bucket[key]["quantity"] += quantity
@@ -5745,9 +5788,11 @@ async def purchase_return_report(
 
     for item in returns:
         quantity = float(item.get("return_quantity", 0) or 0)
-        value = float(item.get("return_amount", 0) or 0)
+        value = _purchase_return_credit(item)
         total_quantity += quantity
         total_value += value
+        if _purchase_return_settlement_status(item) in {"ledger_adjusted", "settled_by_po"}:
+            settled_value += value
 
         add_summary(by_distributor, item.get("distributor") or "Unknown", quantity, value)
         add_summary(by_medicine, item.get("medicine_name") or "Unknown", quantity, value)
@@ -5772,6 +5817,8 @@ async def purchase_return_report(
         "end": end,
         "total_returned_quantity": round(total_quantity, 2),
         "total_return_value": round(total_value, 2),
+        "settled_return_value": _money_float(_to_decimal(settled_value)),
+        "unsettled_return_value": _money_float(_to_decimal(total_value) - _to_decimal(settled_value)),
         "return_count": len(returns),
         "returns_by_distributor": finalize_summary(by_distributor),
         "returns_by_medicine": finalize_summary(by_medicine),
@@ -6926,10 +6973,12 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
             "distributor": payload.distributor_name, "distributor_id": payload.distributor_id,
             "medicine_id": medicine.get("id"), "medicine_key": medicine.get("medicine_key") or row.medicine_key,
             "medicine_name": row.medicine_name, "batch_number": row.batch_number, "expiry_date": row.expiry_date,
-            "return_quantity": row.return_quantity, "purchase_rate": row.purchase_rate,
-            "gst_rate": row.gst_rate if row.gst_rate is not None else medicine.get("gst_rate"),
+            "return_quantity": row.return_quantity, "purchase_rate": _money_float(_to_decimal(row.purchase_rate)),
+            "gst_rate": _money_float(_to_decimal(row.gst_rate if row.gst_rate is not None else medicine.get("gst_rate"))),
             "return_amount": _purchase_return_credit(row.model_dump()), "reason": row.reason or "Other", "notes": row.notes,
             "adjust_distributor_ledger": False, "ledger_adjusted": False, "ledger_transaction_id": None,
+            "settlement_status": "unsettled", "settled_by_po": None, "settled_at": None,
+            "settlement_reference": None, "settled_return_value": 0.0,
             "created_at": now, "created_by": "PO return credit", "auto_created_from_po_credit": True,
         }
         try:
@@ -6944,12 +6993,17 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
     for item in returns:
         if item.get("distributor_id") and item.get("distributor_id") != payload.distributor_id:
             raise HTTPException(status_code=400, detail="Purchase return distributor does not match purchase order distributor")
+        if item.get("voided_at"):
+            raise HTTPException(status_code=409, detail="Voided purchase return credit cannot be applied to a purchase order")
         assigned_po = item.get("po_adjustment_id")
         if assigned_po and assigned_po != allow_po_id:
             raise HTTPException(status_code=409, detail="Purchase return credit is already assigned to another purchase order")
         if item.get("ledger_adjusted") or item.get("adjust_distributor_ledger"):
             raise HTTPException(status_code=409, detail="Purchase return credit is already reflected in the distributor ledger")
         item["return_amount"] = _purchase_return_credit(item)
+        item["purchase_rate"] = _money_float(_to_decimal(item.get("purchase_rate")))
+        if item.get("gst_rate") is not None:
+            item["gst_rate"] = _money_float(_to_decimal(item.get("gst_rate")))
     credit = _money_float(sum((_to_decimal(item["return_amount"]) for item in returns), Decimal("0")))
     return returns, credit
 
@@ -6967,11 +7021,34 @@ def _apply_po_return_credit(po_totals: dict, returns: list[dict], credit: float)
     }
 
 
+def _po_return_settlement_fields(po_id: str, settled_at: str) -> dict:
+    return {
+        "po_adjustment_id": po_id,
+        "po_adjusted_at": settled_at,
+        "settlement_status": "settled_by_po",
+        "settled_by_po": po_id,
+        "settled_at": settled_at,
+        "settlement_reference": po_id,
+    }
+
+
+def _released_po_return_settlement_fields() -> dict:
+    return {
+        "settlement_status": "unsettled",
+        "settled_by_po": None,
+        "settled_at": None,
+        "settlement_reference": None,
+        "settled_return_value": 0.0,
+    }
+
+
 @api_router.get("/purchase-orders/eligible-purchase-returns/{distributor_id}")
 async def eligible_po_purchase_returns(distributor_id: str, user: dict = Depends(get_current_user)):
     returns = await db.purchase_returns.find({"distributor_id": distributor_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]}, {"_id": 0}).sort("return_date", -1).to_list(1000)
     result = []
     for item in returns:
+        if item.get("voided_at") or item.get("ledger_adjusted") or item.get("adjust_distributor_ledger"):
+            continue
         medicine = await db.medicines.find_one({"id": item.get("medicine_id")}, {"_id": 0}) if item.get("medicine_id") else None
         medicine = medicine or {}
         credit = _purchase_return_credit(item)
@@ -7059,7 +7136,11 @@ async def create_po(
 
     await db.purchase_orders.insert_one(po)
     if return_adjustment["purchase_return_ids"]:
-        await db.purchase_returns.update_many({"id": {"$in": return_adjustment["purchase_return_ids"]}}, {"$set": {"po_adjustment_id": po["id"], "po_adjusted_at": datetime.now(timezone.utc).isoformat()}})
+        settled_at = datetime.now(timezone.utc).isoformat()
+        await db.purchase_returns.update_many(
+            {"id": {"$in": return_adjustment["purchase_return_ids"]}},
+            {"$set": _po_return_settlement_fields(po["id"], settled_at)},
+        )
 
     po.pop("_id", None)
     await rebuild_inventory()
@@ -7099,7 +7180,10 @@ async def delete_po(
             )
 
     if po.get("purchase_return_ids"):
-        await db.purchase_returns.update_many({"id": {"$in": po["purchase_return_ids"]}, "po_adjustment_id": po_id}, {"$unset": {"po_adjustment_id": "", "po_adjusted_at": ""}})
+        await db.purchase_returns.update_many(
+            {"id": {"$in": po["purchase_return_ids"]}, "po_adjustment_id": po_id},
+            {"$unset": {"po_adjustment_id": "", "po_adjusted_at": ""}, "$set": _released_po_return_settlement_fields()},
+        )
 
     await db.purchase_orders.delete_one({
         "id": po_id
@@ -7199,9 +7283,16 @@ async def update_po(
     old_return_ids = set(old_po.get("purchase_return_ids", []))
     new_return_ids = set(return_adjustment["purchase_return_ids"])
     if old_return_ids - new_return_ids:
-        await db.purchase_returns.update_many({"id": {"$in": list(old_return_ids - new_return_ids)}, "po_adjustment_id": po_id}, {"$unset": {"po_adjustment_id": "", "po_adjusted_at": ""}})
+        await db.purchase_returns.update_many(
+            {"id": {"$in": list(old_return_ids - new_return_ids)}, "po_adjustment_id": po_id},
+            {"$unset": {"po_adjustment_id": "", "po_adjusted_at": ""}, "$set": _released_po_return_settlement_fields()},
+        )
     if new_return_ids:
-        await db.purchase_returns.update_many({"id": {"$in": list(new_return_ids)}}, {"$set": {"po_adjustment_id": po_id, "po_adjusted_at": datetime.now(timezone.utc).isoformat()}})
+        settled_at = datetime.now(timezone.utc).isoformat()
+        await db.purchase_returns.update_many(
+            {"id": {"$in": list(new_return_ids)}},
+            {"$set": _po_return_settlement_fields(po_id, settled_at)},
+        )
     await rebuild_inventory()
 
     return {"message": "PO updated", **return_adjustment}

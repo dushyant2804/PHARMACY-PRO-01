@@ -15,6 +15,8 @@ from server import (
     PurchaseReturnUpdate,
     _available_stock,
     _resolve_po_purchase_returns,
+    _po_return_settlement_fields,
+    _purchase_return_settlement_status,
     _return_status,
     delete_purchase_return,
     rebuild_inventory,
@@ -112,6 +114,27 @@ class PurchaseOrderReturnMergeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_db.purchase_returns.rows), 1)
         stock_delta.assert_not_awaited()
 
+    async def test_existing_unadjusted_return_gets_po_settlement_metadata_without_side_effects(self):
+        existing = {
+            "id": "return-1", "distributor_id": "dist-1", "medicine_name": "Qutan 50",
+            "batch_number": "B1", "return_quantity": 2, "purchase_rate": 10,
+            "ledger_adjusted": False, "created_at": "2026-06-01T00:00:00+00:00",
+            "notes": "preserve me",
+        }
+        fake_db = SimpleNamespace(purchase_returns=Collection([existing]), medicines=Collection([]))
+        row = POReturnCreditRow(id="return-1", medicine_name="Qutan 50", batch_number="B1", return_quantity=2, purchase_rate=10)
+        with patch("server.db", fake_db), patch("server._set_purchase_return_stock_delta", new=AsyncMock()) as stock_delta:
+            returns, credit = await _resolve_po_purchase_returns(self.payload([row]))
+            fake_db.purchase_returns.rows[0].update(_po_return_settlement_fields("po-1", "2026-06-13T00:00:00+00:00"))
+
+        self.assertEqual(len(fake_db.purchase_returns.rows), 1)
+        self.assertEqual(returns[0]["id"], "return-1")
+        self.assertEqual(credit, 20.0)
+        self.assertEqual(fake_db.purchase_returns.rows[0]["created_at"], "2026-06-01T00:00:00+00:00")
+        self.assertEqual(fake_db.purchase_returns.rows[0]["notes"], "preserve me")
+        self.assertEqual(_purchase_return_settlement_status(fake_db.purchase_returns.rows[0]), "settled_by_po")
+        stock_delta.assert_not_awaited()
+
     async def test_inline_po_return_matches_without_expiry_and_preserves_history(self):
         existing = {
             "id": "return-1", "distributor_id": "dist-1", "medicine_name": "Qutan 50",
@@ -186,10 +209,12 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
             await delete_purchase_return("return-1", {"id": "user"})
         self.assertEqual(self.fake_db.medicines.rows[0]["purchase_return_units"], 0)
-        self.assertEqual(self.fake_db.purchase_returns.rows, [])
+        self.assertEqual(len(self.fake_db.purchase_returns.rows), 1)
+        self.assertEqual(self.fake_db.purchase_returns.rows[0]["settlement_status"], "voided")
+        self.assertIn("voided_at", self.fake_db.purchase_returns.rows[0])
 
         linked = {**self.return_row, "po_adjustment_id": "po-1"}
-        self.fake_db.purchase_returns.rows.append(linked)
+        self.fake_db.purchase_returns.rows[:] = [linked]
         with patch("server.db", self.fake_db):
             with self.assertRaises(HTTPException) as caught:
                 await delete_purchase_return("return-1", {"id": "user"})
