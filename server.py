@@ -3218,6 +3218,9 @@ async def list_distributors(
         )
         distributor["current_balance"] = current_balance
         distributor["outstanding_balance"] = current_balance
+        distributor["total_payable"] = _round_ledger_money(max(current_balance, 0))
+        distributor["total_receivable_from_distributors"] = _round_ledger_money(abs(min(current_balance, 0)))
+        distributor["net_distributor_balance"] = current_balance
         distributor["distributor_status"] = distributor.get("distributor_status") or "active"
         purchases = [
             txn for txn in transactions_by_distributor.get(distributor.get("id"), [])
@@ -3233,10 +3236,9 @@ async def list_distributors(
             for txn in transactions_by_distributor.get(distributor.get("id"), [])
             if txn.get("type") == "payment"
         ))
-        # The payable balance treats every non-purchase ledger row as a credit.
-        # Keep the summary card on the same basis so purchases - paid/adjusted
-        # always reconciles to the displayed payable amount.
-        paid_adjusted = _round_ledger_money(distributor["total_purchases"] - current_balance)
+        # Reconcile paid/adjusted to the payable side only. Credits beyond the
+        # distributor's purchases are receivables, not additional payments.
+        paid_adjusted = _round_ledger_money(distributor["total_purchases"] - distributor["total_payable"])
         distributor["actual_payments"] = actual_payments
         distributor["total_paid"] = paid_adjusted
         distributor["total_paid_adjusted"] = paid_adjusted

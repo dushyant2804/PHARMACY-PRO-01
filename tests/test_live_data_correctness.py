@@ -58,6 +58,30 @@ class LiveDataCorrectnessTests(unittest.IsolatedAsyncioTestCase):
             result[0]["outstanding_balance"],
         )
 
+    async def test_distributor_receivable_is_separate_from_payable_and_paid_adjusted(self):
+        db = SimpleNamespace(
+            distributors=Collection([
+                {"id": "payable", "name": "Payable"},
+                {"id": "receivable", "name": "Receivable"},
+            ]),
+            distributor_transactions=Collection([
+                {"distributor_id": "payable", "type": "purchase", "amount": 100},
+                {"distributor_id": "payable", "type": "payment", "amount": 40},
+                {"distributor_id": "receivable", "type": "credit_adjustment", "amount": 55},
+            ]),
+        )
+
+        with patch("server.db", db):
+            result = await list_distributors(user={})
+
+        by_id = {item["id"]: item for item in result}
+        self.assertEqual(sum(item["total_payable"] for item in result), 60)
+        self.assertEqual(sum(item["total_receivable_from_distributors"] for item in result), 55)
+        self.assertEqual(sum(item["net_distributor_balance"] for item in result), 5)
+        self.assertEqual(sum(item["total_paid_adjusted"] for item in result), 40)
+        self.assertEqual(by_id["receivable"]["total_paid_adjusted"], 0)
+        self.assertEqual(by_id["receivable"]["total_receivable_from_distributors"], 55)
+
     async def test_customer_summary_combines_invoices_and_unlinked_credit_ledger_without_double_counting(self):
         db = SimpleNamespace(
             customers=Collection([{"id": "c1", "name": "C", "opening_balance": 5}]),
