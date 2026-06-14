@@ -37,19 +37,26 @@ class LiveDataCorrectnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_available_stock(rebuilt), 10)
         self.assertEqual(_return_status(rebuilt), "Not Returned")
 
-    async def test_distributor_summary_counts_opening_and_only_payment_transactions_as_paid(self):
+    async def test_distributor_summary_reconciles_payments_and_adjustments_to_payable(self):
         db = SimpleNamespace(
             distributors=Collection([{"id": "d1", "name": "D", "opening_balance": 40}]),
             distributor_transactions=Collection([
                 {"distributor_id": "d1", "type": "purchase", "amount": 100},
                 {"distributor_id": "d1", "type": "payment", "amount": 30},
                 {"distributor_id": "d1", "type": "purchase_return", "amount": 10},
+                {"distributor_id": "d1", "type": "credit_adjustment", "amount": 5},
             ]),
         )
         with patch("server.db", db): result = await list_distributors(user={})
         self.assertEqual(result[0]["total_purchases"], 140)
-        self.assertEqual(result[0]["total_paid"], 30)
-        self.assertEqual(result[0]["outstanding_balance"], 100)
+        self.assertEqual(result[0]["actual_payments"], 30)
+        self.assertEqual(result[0]["total_paid"], 45)
+        self.assertEqual(result[0]["total_paid_adjusted"], 45)
+        self.assertEqual(result[0]["outstanding_balance"], 95)
+        self.assertEqual(
+            result[0]["total_purchases"] - result[0]["total_paid_adjusted"],
+            result[0]["outstanding_balance"],
+        )
 
     async def test_customer_summary_combines_invoices_and_unlinked_credit_ledger_without_double_counting(self):
         db = SimpleNamespace(

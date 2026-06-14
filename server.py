@@ -3228,11 +3228,18 @@ async def list_distributors(
         distributor["total_purchases"] = _round_ledger_money(
             opening + sum(_safe_float(txn.get("amount")) for txn in purchases)
         )
-        distributor["total_paid"] = _round_ledger_money(sum(
+        actual_payments = _round_ledger_money(sum(
             _safe_float(txn.get("amount"))
             for txn in transactions_by_distributor.get(distributor.get("id"), [])
             if txn.get("type") == "payment"
         ))
+        # The payable balance treats every non-purchase ledger row as a credit.
+        # Keep the summary card on the same basis so purchases - paid/adjusted
+        # always reconciles to the displayed payable amount.
+        paid_adjusted = _round_ledger_money(distributor["total_purchases"] - current_balance)
+        distributor["actual_payments"] = actual_payments
+        distributor["total_paid"] = paid_adjusted
+        distributor["total_paid_adjusted"] = paid_adjusted
         purchase_dates = [
             _distributor_transaction_date(txn).isoformat()
             for txn in purchases
