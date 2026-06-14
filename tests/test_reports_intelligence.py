@@ -31,6 +31,29 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", SimpleNamespace(medicines=medicines)):
             stock = await stock_valuation(user={}); expiry = await expiry_report(user={})
         self.assertEqual(stock["total_expiry_value_at_risk"], 25.81); self.assertEqual(expiry["total_value_at_risk"], 25.81)
+        self.assertEqual(expiry["expiry_risk_count"], 2)
+        self.assertGreater(expiry["expiry_value_at_risk"], 0)
+
+    async def test_expiry_report_uses_only_available_stock_and_cost_rate(self):
+        medicines = Collection([
+            {"id":"expired","purchased_units":5,"sold_units":2,"purchase_return_units":1,"purchase_price":10,"mrp":100,"expiry_date":iso(2)},
+            {"id":"30","purchased_units":2,"purchase_price":7,"mrp":70,"expiry_date":iso(-20)},
+            {"id":"90","purchased_units":3,"purchase_price":4,"mrp":40,"expiry_date":iso(-60)},
+            {"id":"safe","purchased_units":1,"purchase_price":5,"expiry_date":iso(-120)},
+            {"id":"sold","purchased_units":2,"sold_units":2,"purchase_price":99,"expiry_date":iso(2)},
+            {"id":"returned","purchased_units":2,"purchase_return_units":2,"purchase_price":99,"expiry_date":iso(-10)},
+        ])
+        with patch("server.db", SimpleNamespace(medicines=medicines)):
+            result = await expiry_report(user={})
+        self.assertEqual(result["expired_count"], 1)
+        self.assertEqual(result["expiring_30_count"], 1)
+        self.assertEqual(result["expiring_90_count"], 1)
+        self.assertEqual(result["safe_count"], 1)
+        self.assertEqual(result["expiry_risk_count"], 3)
+        self.assertEqual(result["expired_value_at_risk"], 20)
+        self.assertEqual(result["expiring_30_value_at_risk"], 14)
+        self.assertEqual(result["expiring_90_value_at_risk"], 12)
+        self.assertEqual(result["expiry_value_at_risk"], 46)
 
     async def test_outstanding_split_and_legacy_distributor_opening_balance(self):
         db = SimpleNamespace(customers=Collection([{"id":"c1","name":"C"}]), distributors=Collection([{"id":"d1","name":"D","opening_balance":10}]), customer_transactions=Collection([{"customer_id":"c1","type":"sale","amount":100,"created_at":iso(100)}, {"customer_id":"c1","type":"payment","amount":25,"created_at":iso(1)}]), distributor_transactions=Collection([]))
