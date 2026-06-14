@@ -6859,21 +6859,31 @@ async def sales_report(start: Optional[str] = None, end: Optional[str] = None, u
 async def stock_valuation(user: dict = Depends(get_current_user)):
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
     cost_value = mrp_value = total_units = 0.0
-    risk = {"expired": {"count": 0, "value_at_risk": 0.0}, "near_expiry": {"count": 0, "value_at_risk": 0.0}}
+    risk = {key: {"count": 0, "value_at_risk": 0.0} for key in ("expired", "expiring_30", "expiring_90", "safe")}
     today = datetime.now(timezone.utc).date()
     for medicine in medicines:
         available = _available_stock(medicine)
         cost = available * _safe_float(medicine.get("purchase_price"))
         total_units += available; cost_value += cost; mrp_value += available * _safe_float(medicine.get("mrp"))
         details = expiry_details(medicine.get("expiry_date"), today)
-        key = "expired" if details["expiry_status"] == "expired" else "near_expiry" if details["expiry_status"] == "warning" else None
-        if key and available > 0:
+        days = details["days_to_expiry"]
+        key = ("expired" if details["expiry_status"] == "expired" else "expiring_30" if days is not None and days <= 30
+               else "expiring_90" if days is not None and days <= EXPIRY_WARNING_DAYS else "safe")
+        if available > 0:
             risk[key]["count"] += 1; risk[key]["value_at_risk"] += cost
+    expiry_risk_count = sum(risk[key]["count"] for key in ("expired", "expiring_30", "expiring_90"))
+    expiry_value_at_risk = sum(risk[key]["value_at_risk"] for key in ("expired", "expiring_30", "expiring_90"))
     return {"total_items": len(medicines), "total_units": round_qty(total_units), "cost_value": _round_ledger_money(cost_value),
             "mrp_value": _round_ledger_money(mrp_value), "potential_profit": _round_ledger_money(mrp_value-cost_value),
             "expiry_risk_counts": {key: value["count"] for key, value in risk.items()},
-            "expiry_value_at_risk": {key: _round_ledger_money(value["value_at_risk"]) for key, value in risk.items()},
-            "total_expiry_value_at_risk": _round_ledger_money(sum(value["value_at_risk"] for value in risk.values()))}
+            "expiry_values_at_risk": {key: _round_ledger_money(value["value_at_risk"]) for key, value in risk.items()},
+            "expiry_risk_count": expiry_risk_count, "expiry_value_at_risk": _round_ledger_money(expiry_value_at_risk),
+            "expired_count": risk["expired"]["count"], "expiring_30_count": risk["expiring_30"]["count"],
+            "expiring_90_count": risk["expiring_90"]["count"], "safe_count": risk["safe"]["count"],
+            "expired_value_at_risk": _round_ledger_money(risk["expired"]["value_at_risk"]),
+            "expiring_30_value_at_risk": _round_ledger_money(risk["expiring_30"]["value_at_risk"]),
+            "expiring_90_value_at_risk": _round_ledger_money(risk["expiring_90"]["value_at_risk"]),
+            "total_expiry_value_at_risk": _round_ledger_money(expiry_value_at_risk)}
 
 
 def _outstanding_aging(transactions: list[dict], charge_types: set[str], credit_types: set[str]) -> dict:
@@ -6955,17 +6965,14 @@ async def add_daily_summary(payload: dict, user: dict = Depends(get_current_user
 async def expiry_report(user: dict = Depends(get_current_user)):
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
     today = datetime.now(timezone.utc).date()
-    expired, near = [], []
+    expired, expiring_30, expiring_90, safe = [], [], [], []
 
     for m in medicines:
-        if _available_stock(m) <= 0:
-            continue
-        details = expiry_details(
-            m.get("expiry_date"),
-            today
-        )
-
         available = _available_stock(m)
+        if available <= 0:
+            continue
+        details = expiry_details(m.get("expiry_date"), today)
+
         item = {
             **m,
             "available_units": round_qty(available),
@@ -6979,8 +6986,19 @@ async def expiry_report(user: dict = Depends(get_current_user)):
 
         if details["expiry_status"] == "expired":
             expired.append(item)
-        elif details["expiry_status"] == "warning":
-            near.append(item)
+        elif details["days_to_expiry"] is not None and details["days_to_expiry"] <= 30:
+            expiring_30.append(item)
+        elif details["days_to_expiry"] is not None and details["days_to_expiry"] <= EXPIRY_WARNING_DAYS:
+            # This is the non-overlapping 31-90 day risk bucket.
+            expiring_90.append(item)
+        else:
+            safe.append(item)
+
+    near = expiring_30 + expiring_90
+    expired_value = sum(item["cost_value_at_risk"] for item in expired)
+    expiring_30_value = sum(item["cost_value_at_risk"] for item in expiring_30)
+    expiring_90_value = sum(item["cost_value_at_risk"] for item in expiring_90)
+    expiry_value = expired_value + expiring_30_value + expiring_90_value
 
     return {
         "expired": sorted(
@@ -6994,9 +7012,16 @@ async def expiry_report(user: dict = Depends(get_current_user)):
         ),
         "expired_count": len(expired),
         "near_expiry_count": len(near),
-        "expired_value_at_risk": _round_ledger_money(sum(item["cost_value_at_risk"] for item in expired)),
-        "near_expiry_value_at_risk": _round_ledger_money(sum(item["cost_value_at_risk"] for item in near)),
-        "total_value_at_risk": _round_ledger_money(sum(item["cost_value_at_risk"] for item in expired + near)),
+        "expiry_risk_count": len(expired) + len(near),
+        "expiring_30_count": len(expiring_30),
+        "expiring_90_count": len(expiring_90),
+        "safe_count": len(safe),
+        "expired_value_at_risk": _round_ledger_money(expired_value),
+        "expiring_30_value_at_risk": _round_ledger_money(expiring_30_value),
+        "expiring_90_value_at_risk": _round_ledger_money(expiring_90_value),
+        "near_expiry_value_at_risk": _round_ledger_money(expiring_30_value + expiring_90_value),
+        "expiry_value_at_risk": _round_ledger_money(expiry_value),
+        "total_value_at_risk": _round_ledger_money(expiry_value),
     }
 
 
