@@ -458,6 +458,17 @@ def _available_stock(medicine: dict) -> float:
     ))
 
 
+def _expiry_risk_values(expired: float, expiring_30: float, expiring_90: float) -> dict:
+    """Round expiry buckets first so the API total always equals their displayed sum."""
+    values = {
+        "expired_value_at_risk": _round_ledger_money(expired),
+        "expiring_30_value_at_risk": _round_ledger_money(expiring_30),
+        "expiring_90_value_at_risk": _round_ledger_money(expiring_90),
+    }
+    values["expiry_value_at_risk"] = _round_ledger_money(sum(values.values()))
+    return values
+
+
 def _safe_legacy_sold_stock(medicine: dict) -> float:
     """Retain legacy/manual sold stock only when it agrees with a stored stock snapshot."""
     sold = _stock_quantity(medicine, "sold_units", "sold_quantity")
@@ -6872,18 +6883,17 @@ async def stock_valuation(user: dict = Depends(get_current_user)):
         if available > 0:
             risk[key]["count"] += 1; risk[key]["value_at_risk"] += cost
     expiry_risk_count = sum(risk[key]["count"] for key in ("expired", "expiring_30", "expiring_90"))
-    expiry_value_at_risk = sum(risk[key]["value_at_risk"] for key in ("expired", "expiring_30", "expiring_90"))
+    expiry_values = _expiry_risk_values(
+        risk["expired"]["value_at_risk"], risk["expiring_30"]["value_at_risk"], risk["expiring_90"]["value_at_risk"]
+    )
     return {"total_items": len(medicines), "total_units": round_qty(total_units), "cost_value": _round_ledger_money(cost_value),
             "mrp_value": _round_ledger_money(mrp_value), "potential_profit": _round_ledger_money(mrp_value-cost_value),
             "expiry_risk_counts": {key: value["count"] for key, value in risk.items()},
             "expiry_values_at_risk": {key: _round_ledger_money(value["value_at_risk"]) for key, value in risk.items()},
-            "expiry_risk_count": expiry_risk_count, "expiry_value_at_risk": _round_ledger_money(expiry_value_at_risk),
+            "expiry_risk_count": expiry_risk_count,
             "expired_count": risk["expired"]["count"], "expiring_30_count": risk["expiring_30"]["count"],
             "expiring_90_count": risk["expiring_90"]["count"], "safe_count": risk["safe"]["count"],
-            "expired_value_at_risk": _round_ledger_money(risk["expired"]["value_at_risk"]),
-            "expiring_30_value_at_risk": _round_ledger_money(risk["expiring_30"]["value_at_risk"]),
-            "expiring_90_value_at_risk": _round_ledger_money(risk["expiring_90"]["value_at_risk"]),
-            "total_expiry_value_at_risk": _round_ledger_money(expiry_value_at_risk)}
+            **expiry_values, "total_expiry_value_at_risk": expiry_values["expiry_value_at_risk"]}
 
 
 def _outstanding_aging(transactions: list[dict], charge_types: set[str], credit_types: set[str]) -> dict:
@@ -6998,7 +7008,7 @@ async def expiry_report(user: dict = Depends(get_current_user)):
     expired_value = sum(item["cost_value_at_risk"] for item in expired)
     expiring_30_value = sum(item["cost_value_at_risk"] for item in expiring_30)
     expiring_90_value = sum(item["cost_value_at_risk"] for item in expiring_90)
-    expiry_value = expired_value + expiring_30_value + expiring_90_value
+    expiry_values = _expiry_risk_values(expired_value, expiring_30_value, expiring_90_value)
 
     return {
         "expired": sorted(
@@ -7016,12 +7026,11 @@ async def expiry_report(user: dict = Depends(get_current_user)):
         "expiring_30_count": len(expiring_30),
         "expiring_90_count": len(expiring_90),
         "safe_count": len(safe),
-        "expired_value_at_risk": _round_ledger_money(expired_value),
-        "expiring_30_value_at_risk": _round_ledger_money(expiring_30_value),
-        "expiring_90_value_at_risk": _round_ledger_money(expiring_90_value),
-        "near_expiry_value_at_risk": _round_ledger_money(expiring_30_value + expiring_90_value),
-        "expiry_value_at_risk": _round_ledger_money(expiry_value),
-        "total_value_at_risk": _round_ledger_money(expiry_value),
+        **expiry_values,
+        "near_expiry_value_at_risk": _round_ledger_money(
+            expiry_values["expiring_30_value_at_risk"] + expiry_values["expiring_90_value_at_risk"]
+        ),
+        "total_value_at_risk": expiry_values["expiry_value_at_risk"],
     }
 
 
