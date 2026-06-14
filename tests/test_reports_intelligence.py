@@ -55,6 +55,27 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["expiring_90_value_at_risk"], 12)
         self.assertEqual(result["expiry_value_at_risk"], 46)
 
+    async def test_stock_and_expiry_api_expose_exact_non_overlapping_risk_bucket_values(self):
+        medicines = Collection([
+            {"id":"expired","purchased_units":3,"sold_units":1,"purchase_price":10.125,"expiry_date":iso(2)},
+            {"id":"30","purchased_units":2,"purchase_price":7.005,"expiry_date":iso(-30)},
+            {"id":"90","purchased_units":3,"purchase_price":4.005,"expiry_date":iso(-31)},
+            {"id":"safe","purchased_units":5,"purchase_price":100,"expiry_date":iso(-91)},
+            {"id":"sold","purchased_units":2,"sold_units":2,"purchase_price":100,"expiry_date":iso(2)},
+            {"id":"returned","purchased_units":2,"purchase_return_units":2,"purchase_price":100,"expiry_date":iso(-10)},
+        ])
+        with patch("server.db", SimpleNamespace(medicines=medicines)):
+            reports = [await stock_valuation(user={}), await expiry_report(user={})]
+
+        bucket_fields = ("expired_value_at_risk", "expiring_30_value_at_risk", "expiring_90_value_at_risk")
+        for result in reports:
+            self.assertGreater(result["expiry_value_at_risk"], 0)
+            for field in bucket_fields:
+                self.assertIn(field, result)
+                self.assertGreater(result[field], 0)
+            self.assertEqual(result["expiry_value_at_risk"], sum(result[field] for field in bucket_fields))
+            self.assertEqual(result["expiry_value_at_risk"], 46.28)
+
     async def test_outstanding_split_and_legacy_distributor_opening_balance(self):
         db = SimpleNamespace(customers=Collection([{"id":"c1","name":"C"}]), distributors=Collection([{"id":"d1","name":"D","opening_balance":10}]), customer_transactions=Collection([{"customer_id":"c1","type":"sale","amount":100,"created_at":iso(100)}, {"customer_id":"c1","type":"payment","amount":25,"created_at":iso(1)}]), distributor_transactions=Collection([]))
         with patch("server.db", db): result = await outstanding_report(user={})
