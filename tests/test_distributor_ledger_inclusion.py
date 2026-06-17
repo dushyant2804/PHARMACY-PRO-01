@@ -196,3 +196,60 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["net_balance_for_selected_period"], -1169)
         self.assertEqual(result["payable_for_selected_period"], 0)
         self.assertEqual(result["receivable_for_selected_period"], 1169)
+
+    async def test_global_opening_balance_purchase_dedupe_for_multiple_distributors(self):
+        distributors = [
+            {"id": "d1", "name": "Supplier 1", "opening_balance": 100, "opening_balance_date": "2026-04-01"},
+            {"id": "d2", "name": "Supplier 2", "opening_balance": 200, "opening_balance_date": "2026-04-02"},
+        ]
+        transactions = [
+            {"id": "ob-1", "distributor_id": "d1", "type": "opening_balance", "amount": 100,
+             "invoice_number": "  OB   001 ", "bill_amount": 100, "paid_amount": 0, "due_amount": 100,
+             "created_at": "2026-04-01T09:15:00+00:00"},
+            {"id": "dup-1", "distributor_id": "d1", "type": "purchase", "amount": 100,
+             "invoice_no": "ob 001", "bill_amount": 100, "paid_amount": 0, "due_amount": 100,
+             "created_at": "2026-04-01T18:30:00+00:00"},
+            {"id": "real-1", "distributor_id": "d1", "type": "purchase", "amount": 100,
+             "invoice_number": "INV-REAL", "created_at": "2026-04-01T18:30:00+00:00"},
+            {"id": "pay-1", "distributor_id": "d1", "type": "payment", "amount": 100,
+             "reference_number": "ob 001", "created_at": "2026-04-01T18:30:00+00:00"},
+            {"id": "ob-2", "distributor_id": "d2", "type": "opening_balance", "amount": 200,
+             "bill_number": "B-200", "created_at": "2026-04-02"},
+            {"id": "dup-2", "distributor_id": "d2", "type": "purchase", "amount": 200,
+             "bill_no": " b-200 ", "created_at": "2026-04-02T23:59:00+00:00"},
+        ]
+
+        d1 = await self.ledger(distributors, transactions, [], did="d1")
+        d2 = await self.ledger(distributors, transactions, [], did="d2")
+
+        self.assertEqual([row["id"] for row in d1["transactions"]], ["ob-1", "pay-1", "real-1"])
+        self.assertEqual(sum(row["type"] == "opening_balance" for row in d1["transactions"]), 1)
+        self.assertFalse(any(row.get("id") == "dup-1" for row in d1["transactions"]))
+        self.assertEqual(d1["transactions"][-1]["running_balance"], 100)
+        self.assertEqual(d1["total_purchases"], 200)
+        self.assertEqual(d1["total_paid"], 100)
+        self.assertEqual(d1["balance"], 100)
+        self.assertEqual(d1["balance_for_selected_period"], 100)
+
+        self.assertEqual([row["id"] for row in d2["transactions"]], ["ob-2"])
+        self.assertFalse(any(row.get("id") == "dup-2" for row in d2["transactions"]))
+        self.assertEqual(d2["total_purchases"], 200)
+        self.assertEqual(d2["balance"], 200)
+
+    async def test_opening_balance_duplicate_fallback_matches_without_invoice_reference(self):
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 150}],
+            [
+                {"id": "ob", "distributor_id": "d1", "type": "opening_balance", "amount": 150,
+                 "bill_amount": 150, "paid_amount": 20, "due_amount": 130,
+                 "created_at": "2026-04-01T00:00:00+00:00"},
+                {"id": "dup", "distributor_id": "d1", "type": "purchase", "amount": 150,
+                 "bill_amount": 150, "paid_amount": 20, "due_amount": 130,
+                 "created_at": "2026-04-01T12:00:00+00:00"},
+            ],
+            [],
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["ob"])
+        self.assertEqual(result["total_purchases"], 150)
+        self.assertEqual(result["balance"], 150)

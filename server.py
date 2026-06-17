@@ -4376,7 +4376,7 @@ def _opening_balance_amount_matches(txn: dict, distributor: dict) -> bool:
 
 
 def _normalized_ledger_reference(value) -> str:
-    return str(value or "").strip().casefold()
+    return " ".join(str(value or "").strip().casefold().split())
 
 
 def _ledger_reference_values(source: dict, field_names: tuple[str, ...]) -> set[str]:
@@ -4464,6 +4464,95 @@ def _is_duplicate_opening_balance_row(txn: dict, distributor: dict, opening_txn:
     txn_date = _distributor_transaction_date(txn)
     return bool(opening_date and txn_date and opening_date == txn_date)
 
+
+
+
+def _ledger_amount_key(value) -> float:
+    return _round_ledger_money(_safe_float(value))
+
+
+def _ledger_reference_match_values(source: dict) -> set[str]:
+    generic_opening_refs = {"opening balance", "opening_balance", "opening-balance"}
+    return {
+        value
+        for value in _ledger_reference_values(
+            source,
+            (
+                "invoice_no",
+                "invoice_number",
+                "bill_no",
+                "bill_number",
+                "reference_no",
+                "reference_number",
+                "reference",
+                "receipt_invoice_no",
+                "receipt_number",
+            ),
+        )
+        if value not in generic_opening_refs
+    }
+
+
+def _ledger_amount_detail_key(txn: dict) -> tuple[float, float, float]:
+    return (
+        _ledger_amount_key(txn.get("bill_amount")),
+        _ledger_amount_key(txn.get("paid_amount")),
+        _ledger_amount_key(txn.get("due_amount")),
+    )
+
+
+def _dedupe_distributor_opening_balance_rows(transactions: list[dict], distributor_id: str | None) -> list[dict]:
+    """Remove normal rows that duplicate an opening-balance bill before balances are calculated."""
+    opening_ref_keys: set[tuple[str, str, float, object]] = set()
+    opening_fallback_keys: set[tuple[str, float, object, tuple[float, float, float]]] = set()
+
+    for txn in transactions:
+        if not _is_explicit_opening_balance_transaction(txn, distributor_id):
+            continue
+        txn_distributor_id = str(txn.get("distributor_id") or distributor_id or "")
+        txn_date = _distributor_transaction_date(txn)
+        amount = _ledger_amount_key(txn.get("amount"))
+        refs = _ledger_reference_match_values(txn)
+        for ref in refs:
+            opening_ref_keys.add((txn_distributor_id, ref, amount, txn_date))
+        if not refs:
+            opening_fallback_keys.add((txn_distributor_id, amount, txn_date, _ledger_amount_detail_key(txn)))
+
+    if not opening_ref_keys and not opening_fallback_keys:
+        return transactions
+
+    deduped = []
+    for txn in transactions:
+        if _is_explicit_opening_balance_transaction(txn, distributor_id):
+            deduped.append(txn)
+            continue
+
+        txn_type = str(txn.get("type") or "").strip().lower()
+        if txn_type not in {"purchase", "sale", "payment"}:
+            deduped.append(txn)
+            continue
+
+        txn_distributor_id = str(txn.get("distributor_id") or distributor_id or "")
+        txn_date = _distributor_transaction_date(txn)
+        amount = _ledger_amount_key(txn.get("amount"))
+        refs = _ledger_reference_match_values(txn)
+        ref_match = any((txn_distributor_id, ref, amount, txn_date) in opening_ref_keys for ref in refs)
+        fallback_match = (
+            not refs
+            and (txn_distributor_id, amount, txn_date, _ledger_amount_detail_key(txn)) in opening_fallback_keys
+        )
+
+        # Actual payments can share amount/date/reference with an opening balance; only legacy
+        # payment rows explicitly labelled as opening balance should be suppressed.
+        if txn_type == "payment" and not _has_opening_balance_metadata(txn):
+            deduped.append(txn)
+            continue
+
+        if ref_match or fallback_match:
+            continue
+        deduped.append(txn)
+
+    return deduped
 
 def _is_explicit_opening_balance_transaction(txn: dict, distributor_id: str | None = None) -> bool:
     if not isinstance(txn, dict):
@@ -5273,6 +5362,7 @@ async def distributor_ledger(
     if opening_txn is not None or _safe_float(dist.get("opening_balance", 0)) != 0:
         ledger_txns.append(opening_txn or _opening_balance_transaction(dist))
     ledger_txns.extend(non_opening_txns)
+    ledger_txns = _dedupe_distributor_opening_balance_rows(ledger_txns, str(dist.get("id") or did))
     ledger_txns.sort(key=_distributor_fifo_sort_key)
     available_financial_years = _available_financial_years(ledger_txns)
     financial_year_metadata = _distributor_financial_year_metadata(
