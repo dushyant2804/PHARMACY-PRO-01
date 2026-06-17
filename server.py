@@ -4375,6 +4375,72 @@ def _opening_balance_amount_matches(txn: dict, distributor: dict) -> bool:
         return False
 
 
+def _normalized_ledger_reference(value) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _ledger_reference_values(source: dict, field_names: tuple[str, ...]) -> set[str]:
+    if not isinstance(source, dict):
+        return set()
+    return {
+        _normalized_ledger_reference(source.get(field_name))
+        for field_name in field_names
+        if _normalized_ledger_reference(source.get(field_name))
+    }
+
+
+def _opening_balance_reference_values(distributor: dict, opening_txn: dict | None = None) -> set[str]:
+    values = _ledger_reference_values(
+        distributor,
+        (
+            "opening_balance_invoice_number",
+            "opening_balance_bill_number",
+            "opening_balance_reference_number",
+            "opening_balance_receipt_number",
+        ),
+    )
+    values.update(_ledger_reference_values(
+        opening_txn or {},
+        (
+            "invoice_number",
+            "invoice_no",
+            "bill_number",
+            "bill_no",
+            "reference_number",
+            "reference_no",
+            "reference",
+            "receipt_number",
+        ),
+    ))
+    return values
+
+
+def _transaction_reference_values(txn: dict) -> set[str]:
+    return _ledger_reference_values(
+        txn,
+        (
+            "invoice_number",
+            "invoice_no",
+            "bill_number",
+            "bill_no",
+            "reference_number",
+            "reference_no",
+            "reference",
+            "receipt_number",
+        ),
+    )
+
+
+def _opening_balance_duplicate_reference_matches(
+    txn: dict,
+    distributor: dict,
+    opening_txn: dict | None = None,
+) -> bool:
+    opening_refs = _opening_balance_reference_values(distributor, opening_txn)
+    txn_refs = _transaction_reference_values(txn)
+    return not opening_refs or bool(opening_refs & txn_refs)
+
+
 def _is_duplicate_opening_balance_row(txn: dict, distributor: dict, opening_txn: dict | None = None) -> bool:
     """Detect legacy synthetic purchase/payment rows that duplicate the distributor opening balance."""
     if not isinstance(txn, dict):
@@ -4383,11 +4449,13 @@ def _is_duplicate_opening_balance_row(txn: dict, distributor: dict, opening_txn:
     txn_type = str(txn.get("type") or "").strip().lower()
     if txn_type not in {"purchase", "payment"}:
         return False
-    if txn_type == "opening_balance" or txn.get("is_opening_balance"):
+    if txn.get("is_opening_balance"):
         return False
     if not _has_opening_balance_metadata(txn):
         return False
     if not _opening_balance_amount_matches(txn, distributor):
+        return False
+    if not _opening_balance_duplicate_reference_matches(txn, distributor, opening_txn):
         return False
 
     opening_date = _distributor_transaction_date(
@@ -4395,6 +4463,18 @@ def _is_duplicate_opening_balance_row(txn: dict, distributor: dict, opening_txn:
     )
     txn_date = _distributor_transaction_date(txn)
     return bool(opening_date and txn_date and opening_date == txn_date)
+
+
+def _is_explicit_opening_balance_transaction(txn: dict, distributor_id: str | None = None) -> bool:
+    if not isinstance(txn, dict):
+        return False
+    txn_id = str(txn.get("id") or "")
+    txn_type = str(txn.get("type") or "").strip().lower()
+    return (
+        bool(distributor_id and txn_id == _opening_balance_transaction_id(distributor_id))
+        or txn_type == "opening_balance"
+        or bool(txn.get("is_opening_balance"))
+    )
 
 
 async def _find_distributor_opening_balance_transaction(distributor: dict):
@@ -5181,7 +5261,7 @@ async def distributor_ledger(
     opening_txn = None
     non_opening_txns = []
     for txn in txns:
-        if _is_opening_balance_transaction(txn, did):
+        if _is_explicit_opening_balance_transaction(txn, did):
             if opening_txn is None:
                 opening_txn = _normalize_opening_balance_transaction(txn, dist)
             continue
@@ -5224,7 +5304,7 @@ async def distributor_ledger(
         balance, bucket = _apply_distributor_transaction(balance, txn)
         txn_amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
 
-        if bucket == "purchase" and not txn.get("is_opening_balance"):
+        if bucket == "purchase":
             total_purchases += txn_amount
         elif bucket == "adjustment":
             total_adjustments += txn_amount
@@ -5261,6 +5341,7 @@ async def distributor_ledger(
         )
 
     filtered_running = [txn for txn in running if matches_filters(txn)]
+    selected_period_net_balance = _round_ledger_money(total_purchases - total_paid)
     return {
         "distributor": dist,
         "transactions": filtered_running,
@@ -5268,6 +5349,10 @@ async def distributor_ledger(
         "total_purchases": round(total_purchases, 2),
         "total_paid": round(total_paid, 2),
         "total_adjustments": round(total_adjustments, 2),
+        "balance_for_selected_period": selected_period_net_balance,
+        "net_balance_for_selected_period": selected_period_net_balance,
+        "payable_for_selected_period": _round_ledger_money(max(selected_period_net_balance, 0)),
+        "receivable_for_selected_period": _round_ledger_money(abs(min(selected_period_net_balance, 0))),
         "available_financial_years": available_financial_years,
         "current_financial_year": _current_financial_year(),
         **financial_year_metadata,
@@ -6353,6 +6438,16 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
             "transactions": [],
         }
 
+    opening_txns_by_distributor = {}
+    for txn in transactions:
+        did = txn.get("distributor_id")
+        distributor = distributor_lookup.get(did, {})
+        if _is_opening_balance_transaction(txn, did):
+            opening_txns_by_distributor.setdefault(
+                did,
+                _normalize_opening_balance_transaction(txn, distributor),
+            )
+
     for txn in transactions:
         did = txn.get("distributor_id")
         if did not in summaries:
@@ -6369,13 +6464,21 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
                 "transactions": [],
             }
 
+        distributor = distributor_lookup.get(did, {})
+        if _is_duplicate_opening_balance_row(
+            txn,
+            distributor,
+            opening_txns_by_distributor.get(did),
+        ):
+            continue
+
         amount = float(txn.get("amount", 0) or 0)
         summary = summaries[did]
 
         if _is_opening_balance_transaction(txn, did):
-            continue
-
-        if txn.get("type") in ["purchase", "sale"]:
+            summary["purchase_total"] += amount
+            summary["net_change"] += amount
+        elif txn.get("type") in ["purchase", "sale"]:
             summary["purchase_total"] += amount
             summary["net_change"] += amount
         elif txn.get("type") == "payment":
