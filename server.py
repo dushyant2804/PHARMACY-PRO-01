@@ -4651,8 +4651,11 @@ def _opening_balance_transaction(distributor: dict) -> dict:
         "is_opening_balance": True,
         "is_system_generated": True,
         "is_synthetic": True,
-        "source": "opening_balance_generation",
-        "backend_row_source": "opening_balance_generation",
+        "source": "opening_balance",
+        "backend_row_source": "opening_balance",
+        "transaction_id": None,
+        "can_edit": False,
+        "can_delete": False,
         "running_balance": round(opening_balance, 2),
     }
 
@@ -4677,6 +4680,9 @@ def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict
         "is_synthetic": False,
         "backend_row_source": "distributor_transactions",
         "source": txn.get("source") or "distributor_transactions",
+        "transaction_id": _ledger_row_persisted_id(txn),
+        "can_edit": bool(_ledger_row_persisted_id(txn)),
+        "can_delete": False,
     }
     return normalized
 
@@ -5437,6 +5443,9 @@ def _annotate_distributor_transaction_source(txn: dict) -> dict:
         annotated.setdefault("transaction_id", persisted_id)
     if txn.get("_id") is not None:
         annotated.setdefault("transaction_object_id", str(txn.get("_id")))
+    is_opening_txn = _is_opening_balance_transaction(annotated, annotated.get("distributor_id"))
+    annotated.setdefault("can_edit", bool(persisted_id))
+    annotated.setdefault("can_delete", bool(persisted_id and not is_opening_txn))
     return annotated
 
 
@@ -5529,8 +5538,11 @@ def _purchase_order_ledger_transaction(po: dict, distributor_id: str) -> dict:
         "date": transaction_date,
         "is_system_generated": True,
         "is_synthetic": True,
-        "source": "purchase_order",
+        "source": "purchase_orders",
         "backend_row_source": "purchase_orders",
+        "transaction_id": None,
+        "can_edit": False,
+        "can_delete": False,
     }
 
 
