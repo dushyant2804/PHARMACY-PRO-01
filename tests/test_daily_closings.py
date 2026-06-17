@@ -65,9 +65,13 @@ class DailyClosingTests(unittest.IsolatedAsyncioTestCase):
         self.daily_sales = Collection([
             {"id": "sale-1", "sale_date": "2026-06-12", "total_amount": 250.0}
         ])
+        self.invoices = Collection()
+        self.expenses = Collection()
         self.fake_db = SimpleNamespace(
             daily_closings=self.daily_closings,
             daily_sales=self.daily_sales,
+            invoices=self.invoices,
+            expenses=self.expenses,
         )
         self.cashier = {"id": "cashier-1", "name": "Casey", "role": "cashier"}
         self.pharmacist = {"id": "pharmacist-1", "name": "Pat", "role": "pharmacist"}
@@ -109,6 +113,144 @@ class DailyClosingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["locked"])
         self.assertEqual(len(self.daily_closings.rows), 1)
         self.assertEqual(self.daily_sales.rows[0]["total_amount"], 250.0)
+
+
+    async def test_invoice_only_closing_counts_invoice_once(self):
+        self.daily_sales.rows.clear()
+        self.invoices.rows.append({
+            "id": "inv-1",
+            "invoice_no": "INV-1",
+            "created_at": "2026-06-12T10:00:00+00:00",
+            "payment_mode": "cash",
+            "paid_amount": 100,
+            "due_amount": 0,
+        })
+
+        result = await self.create(opening_cash=50, counted_cash=130)
+
+        self.assertEqual(result["cash_sales"], 100)
+        self.assertEqual(result["expected_cash"], 150)
+        self.assertEqual(result["mismatch_amount"], -20)
+        self.assertEqual(result["closing_status"], "shortage")
+
+    async def test_daily_sales_only_closing_counts_manual_sale_once(self):
+        self.daily_sales.rows = [{
+            "id": "manual-1",
+            "sale_date": "2026-06-12",
+            "source": "manual",
+            "cash_sales": 100,
+            "upi_sales": 0,
+            "card_sales": 0,
+            "outstanding_sales": 0,
+        }]
+
+        result = await self.create(opening_cash=50, counted_cash=150)
+
+        self.assertEqual(result["cash_sales"], 100)
+        self.assertEqual(result["expected_cash"], 150)
+        self.assertEqual(result["mismatch_amount"], 0)
+        self.assertEqual(result["closing_status"], "balanced")
+
+    async def test_same_invoice_and_daily_sale_is_counted_once(self):
+        self.daily_sales.rows = [{
+            "id": "sale-1",
+            "sale_date": "2026-06-12",
+            "cash_sales": 100,
+            "upi_sales": 0,
+            "card_sales": 0,
+            "outstanding_sales": 0,
+        }]
+        self.invoices.rows.append({
+            "id": "inv-1",
+            "invoice_no": "INV-1",
+            "created_at": "2026-06-12T10:00:00+00:00",
+            "payment_mode": "cash",
+            "paid_amount": 100,
+            "due_amount": 0,
+        })
+        self.expenses.rows.append({"id": "exp-1", "date": "2026-06-12", "amount": 20})
+
+        result = await self.create(opening_cash=50, counted_cash=130)
+
+        self.assertEqual(result["cash_sales"], 100)
+        self.assertEqual(result["expenses"], 20)
+        self.assertEqual(result["expected_total"], 100)
+        self.assertEqual(result["expected_cash"], 130)
+        self.assertEqual(result["mismatch_amount"], 0)
+
+    async def test_invoice_backed_daily_sale_reference_is_excluded(self):
+        self.daily_sales.rows = [{
+            "id": "sale-1",
+            "sale_date": "2026-06-12",
+            "invoice_id": "inv-1",
+            "source": "invoice",
+            "cash_sales": 100,
+            "upi_sales": 0,
+            "card_sales": 0,
+            "outstanding_sales": 0,
+        }]
+        self.invoices.rows.append({
+            "id": "inv-1",
+            "invoice_no": "INV-1",
+            "created_at": "2026-06-12T10:00:00+00:00",
+            "payment_mode": "cash",
+            "paid_amount": 100,
+            "due_amount": 0,
+        })
+
+        result = await self.create(opening_cash=50, counted_cash=150)
+
+        self.assertEqual(result["cash_sales"], 100)
+        self.assertEqual(result["expected_cash"], 150)
+
+    async def test_mixed_payment_modes_and_expenses_are_aggregated_once(self):
+        self.daily_sales.rows = [{
+            "id": "manual-1",
+            "sale_date": "2026-06-12",
+            "source": "manual",
+            "cash_sales": 25,
+            "upi_sales": 0,
+            "card_sales": 0,
+            "outstanding_sales": 0,
+        }]
+        self.invoices.rows.extend([
+            {"id": "cash-inv", "created_at": "2026-06-12T09:00:00+00:00", "payment_mode": "cash", "paid_amount": 100, "due_amount": 0},
+            {"id": "upi-inv", "created_at": "2026-06-12T10:00:00+00:00", "payment_mode": "upi", "paid_amount": 80, "due_amount": 0},
+            {"id": "card-inv", "created_at": "2026-06-12T11:00:00+00:00", "payment_mode": "card", "paid_amount": 70, "due_amount": 0},
+            {"id": "credit-inv", "created_at": "2026-06-12T12:00:00+00:00", "payment_mode": "credit", "paid_amount": 0, "due_amount": 60},
+            {"id": "mixed-inv", "created_at": "2026-06-12T13:00:00+00:00", "payment_mode": "mixed", "paid_amount": 40, "due_amount": 30},
+        ])
+        self.expenses.rows.append({"id": "exp-1", "date": "2026-06-12", "amount": 20})
+
+        result = await self.create(opening_cash=50, counted_cash=195)
+
+        self.assertEqual(result["cash_sales"], 165)
+        self.assertEqual(result["upi_sales"], 80)
+        self.assertEqual(result["card_sales"], 70)
+        self.assertEqual(result["credit_sales"], 90)
+        self.assertEqual(result["expected_total"], 405)
+        self.assertEqual(result["expected_cash"], 195)
+        self.assertEqual(result["mismatch_amount"], 0)
+
+    async def test_mismatch_sign_remains_negative_for_shortage_positive_for_excess(self):
+        self.daily_sales.rows = [{
+            "id": "manual-1",
+            "sale_date": "2026-06-12",
+            "cash_sales": 100,
+            "upi_sales": 0,
+            "card_sales": 0,
+            "outstanding_sales": 0,
+        }]
+
+        shortage = await self.create(opening_cash=50, counted_cash=125)
+        self.daily_closings.rows.clear()
+        excess = await self.create(opening_cash=50, counted_cash=175)
+
+        self.assertEqual(shortage["expected_cash"], 150)
+        self.assertEqual(shortage["mismatch_amount"], -25)
+        self.assertEqual(shortage["closing_status"], "shortage")
+        self.assertEqual(excess["mismatch_amount"], 25)
+        self.assertEqual(excess["closing_status"], "excess")
 
     async def test_update_recalculates_mismatch(self):
         closing = await self.create()

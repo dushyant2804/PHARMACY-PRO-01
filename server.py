@@ -25,7 +25,7 @@ from datetime import datetime, timezone, timedelta, date
 from calendar import monthrange
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Literal
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -8242,6 +8242,69 @@ def _daily_closing_money(value: float) -> float:
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def _empty_daily_closing_splits() -> dict:
+    return {
+        "cash_sales": 0,
+        "upi_sales": 0,
+        "card_sales": 0,
+        "credit_sales": 0,
+    }
+
+
+def _daily_sale_split_signature(row: dict) -> tuple[float, float, float, float]:
+    return tuple(_money(row.get(field)) for field in (
+        "cash_sales", "upi_sales", "card_sales", "outstanding_sales"
+    ))
+
+
+def _invoice_daily_closing_splits(invoice: dict) -> dict:
+    splits = _empty_daily_closing_splits()
+    mode = str(invoice.get("payment_mode") or "cash").lower()
+    paid = _money(invoice.get("paid_amount"))
+    due = _money(invoice.get("due_amount"))
+    if mode in {"cash", "upi", "card"}:
+        splits[f"{mode}_sales"] += paid
+    else:
+        # Credit and legacy/mixed invoices do not retain a detailed payment split.
+        splits["cash_sales"] += paid
+    splits["credit_sales"] += due
+    return {key: _money(value) for key, value in splits.items()}
+
+
+def _invoice_split_signature(splits: dict) -> tuple[float, float, float, float]:
+    return tuple(_money(splits.get(field)) for field in (
+        "cash_sales", "upi_sales", "card_sales", "credit_sales"
+    ))
+
+
+def _daily_sale_invoice_reference_values(row: dict) -> set[str]:
+    return {
+        str(row.get(field)).strip()
+        for field in (
+            "invoice_id", "invoice_no", "invoice_number", "source_ref",
+            "source_id", "reference", "reference_number",
+        )
+        if row.get(field) is not None and str(row.get(field)).strip()
+    }
+
+
+def _invoice_reference_values(invoice: dict) -> set[str]:
+    return {
+        str(invoice.get(field)).strip()
+        for field in ("id", "invoice_no", "invoice_number", "reference", "reference_number")
+        if invoice.get(field) is not None and str(invoice.get(field)).strip()
+    }
+
+
+def _daily_sale_is_invoice_backed(row: dict, invoice_refs: set[str]) -> bool:
+    source = str(row.get("source") or row.get("source_type") or "").strip().lower()
+    if source in {"invoice", "billing", "bill", "pos"}:
+        return True
+    if row.get("invoice_id") or row.get("invoice_no") or row.get("invoice_number"):
+        return True
+    return bool(_daily_sale_invoice_reference_values(row) & invoice_refs)
+
+
 def _prepare_daily_closing(closing: dict) -> dict:
     prepared = dict(closing)
     # Old records used expected_total as the expected drawer amount.
@@ -8277,6 +8340,16 @@ async def _daily_closing_expected(closing_date: str, opening_cash: float = 0) ->
         await expense_collection.find({"date": closing_date}, {"_id": 0}).to_list(2000)
         if expense_collection else []
     )
+    splits = _empty_daily_closing_splits()
+    invoice_refs = set()
+    invoice_signatures = Counter()
+    for invoice in invoices:
+        invoice_splits = _invoice_daily_closing_splits(invoice)
+        for key, value in invoice_splits.items():
+            splits[key] += value
+        invoice_signatures[_invoice_split_signature(invoice_splits)] += 1
+        invoice_refs.update(_invoice_reference_values(invoice))
+
     normalized = [_normalize_daily_sale(row) for row in daily]
     # Very old daily-sale rows had only total_amount; they represented paid cash
     # unless explicitly marked pending.
@@ -8286,21 +8359,23 @@ async def _daily_closing_expected(closing_date: str, opening_cash: float = 0) ->
         )):
             amount = _money(source.get("total_amount"))
             row["outstanding_sales" if source.get("payment_status") == "pending" else "cash_sales"] = amount
-    splits = {
-        "cash_sales": sum(row["cash_sales"] for row in normalized),
-        "upi_sales": sum(row["upi_sales"] for row in normalized),
-        "card_sales": sum(row["card_sales"] for row in normalized),
-        "credit_sales": sum(row["outstanding_sales"] for row in normalized),
-    }
-    for invoice in invoices:
-        mode = invoice.get("payment_mode", "cash")
-        paid = _money(invoice.get("paid_amount"))
-        due = _money(invoice.get("due_amount"))
-        if mode in {"cash", "upi", "card"}:
-            splits[f"{mode}_sales"] += paid
-        else:
-            splits["cash_sales"] += paid  # legacy/mixed invoices do not retain a payment split
-        splits["credit_sales"] += due
+
+    for source, row in zip(daily, normalized):
+        source_marker = str(source.get("source") or source.get("source_type") or "").strip().lower()
+        signature = _daily_sale_split_signature(row)
+        if _daily_sale_is_invoice_backed(source, invoice_refs):
+            continue
+        # Legacy daily_sales rows often have no source marker. If one exactly
+        # matches a same-day invoice payment split, treat the invoice as the
+        # source of truth and consume one matching invoice signature. Explicit
+        # manual rows remain counted even if their amount matches an invoice.
+        if not source_marker and invoice_signatures[signature] > 0:
+            invoice_signatures[signature] -= 1
+            continue
+        splits["cash_sales"] += row["cash_sales"]
+        splits["upi_sales"] += row["upi_sales"]
+        splits["card_sales"] += row["card_sales"]
+        splits["credit_sales"] += row["outstanding_sales"]
     total_expenses = _money(sum(_money(row.get("amount")) for row in expenses))
     expected_total = _money(sum(splits.values()))
     return {
