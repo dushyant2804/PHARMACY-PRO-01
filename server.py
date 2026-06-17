@@ -4956,9 +4956,10 @@ def _json_safe_ledger_value(value):
     return str(value)
 
 
-def _json_safe_ledger_transaction(txn: dict) -> dict:
+def _json_safe_ledger_transaction(txn: dict, include_items: bool = False) -> dict:
     safe_txn = _json_safe_ledger_value(txn if isinstance(txn, dict) else {})
-    safe_txn.pop("items", None)
+    if not include_items:
+        safe_txn.pop("items", None)
     for money_field in ("amount", "running_balance", "bill_amount", "paid_amount", "due_amount"):
         if money_field in safe_txn:
             safe_txn[money_field] = _round_ledger_money(safe_txn[money_field])
@@ -5287,7 +5288,7 @@ def _purchase_invoice_identity_keys(txn: dict, distributor_id: str | None = None
         txn.get("purchase_order_id") or txn.get("po_id")
     )
     if purchase_order_id:
-        keys.append((txn_distributor_id, "po", purchase_order_id, txn_date, amount))
+        keys.append((txn_distributor_id, "po", purchase_order_id))
     return keys
 
 
@@ -5309,6 +5310,30 @@ def _purchase_invoice_row_score(txn: dict) -> tuple[int, int, int, int]:
     )
     # Keep deterministic order for ties by preserving the existing first row.
     return (has_po_id, is_po_source, metadata_count, len(str(txn.get("id") or "")))
+
+
+def _canonical_purchase_invoice_display_row(existing: dict, candidate: dict) -> dict:
+    """Pick the richer duplicate invoice row without combining duplicate amounts."""
+    existing_is_po = existing.get("source") == "purchase_order"
+    candidate_is_po = candidate.get("source") == "purchase_order"
+    if (
+        existing_is_po
+        and not candidate_is_po
+        and _ledger_amount_key(existing.get("amount")) != _ledger_amount_key(candidate.get("amount"))
+    ):
+        canonical = dict(existing)
+        canonical["amount"] = candidate.get("amount")
+        return canonical
+
+    if _purchase_invoice_row_score(candidate) <= _purchase_invoice_row_score(existing):
+        return existing
+
+    canonical = dict(candidate)
+    # Keep the ledger amount already selected for display when a PO-linked row
+    # has richer metadata but a different stored amount.
+    if _ledger_amount_key(existing.get("amount")) != _ledger_amount_key(candidate.get("amount")):
+        canonical["amount"] = existing.get("amount")
+    return canonical
 
 
 def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distributor_id: str | None = None) -> list[dict]:
@@ -5335,12 +5360,17 @@ def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distribu
                     and _purchase_invoice_row_score(old_txn)
                     > _purchase_invoice_row_score(selected_by_group[group_id])
                 ):
-                    selected_by_group[group_id] = old_txn
+                    selected_by_group[group_id] = _canonical_purchase_invoice_display_row(
+                        selected_by_group[group_id],
+                        old_txn,
+                    )
                 for key, mapped_group in list(key_to_group.items()):
                     if mapped_group == other_group:
                         key_to_group[key] = group_id
-            if _purchase_invoice_row_score(txn) > _purchase_invoice_row_score(selected_by_group[group_id]):
-                selected_by_group[group_id] = txn
+            selected_by_group[group_id] = _canonical_purchase_invoice_display_row(
+                selected_by_group[group_id],
+                txn,
+            )
         else:
             group_id = next_group
             next_group += 1
@@ -5414,6 +5444,7 @@ def _purchase_order_ledger_transaction(po: dict, distributor_id: str) -> dict:
         "invoice_number": po.get("invoice_ref"),
         "bill_number": po.get("po_no"),
         "reference_number": po.get("po_no") or po.get("invoice_ref"),
+        "items": po.get("items") or [],
         "notes": po.get("notes"),
         "created_at": transaction_date,
         "transaction_date": transaction_date,
@@ -5445,9 +5476,9 @@ async def _canonical_distributor_ledger_transactions(
 ) -> list[dict]:
     """Build the single canonical transaction set used for distributor accounting.
 
-    This is the only place that mixes persisted distributor_transactions with
-    purchase-order synthetic rows, normalizes/dedupes opening balances, and
-    collapses PO + ledger rows for the same strong invoice identity.
+    This keeps the accounting transaction stream intact for existing balance
+    logic. The distributor ledger endpoint applies its own display-only
+    purchase invoice dedupe after this function returns.
     """
     did = str(distributor.get("id") or requested_id or "")
     identity_values = _distributor_identity_values(distributor, requested_id)
@@ -5569,7 +5600,7 @@ async def distributor_ledger(
                 else "partially_settled" if _safe_float(fifo_metadata_by_id.get(txn_id, {}).get("paid_amount")) > 0
                 else "unpaid"
             ) if bucket == "purchase" else None,
-        }))
+        }, include_items=True))
 
     def matches_filters(txn: dict) -> bool:
         txn_date = _distributor_transaction_date(txn)
