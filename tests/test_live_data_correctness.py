@@ -58,6 +58,89 @@ class LiveDataCorrectnessTests(unittest.IsolatedAsyncioTestCase):
             result[0]["outstanding_balance"],
         )
 
+
+    async def test_distributor_summary_dedupes_opening_balance_purchase_duplicate(self):
+        db = SimpleNamespace(
+            distributors=Collection([{
+                "id": "d1",
+                "name": "D",
+                "opening_balance": 1000,
+                "opening_balance_date": "2026-04-01",
+                "opening_balance_invoice_number": "OB-1000",
+            }]),
+            distributor_transactions=Collection([
+                {
+                    "id": "ob",
+                    "distributor_id": "d1",
+                    "type": "opening_balance",
+                    "amount": 1000,
+                    "invoice_number": "OB-1000",
+                    "transaction_date": "2026-04-01",
+                    "reference_number": "Opening Balance",
+                },
+                {
+                    "id": "dup",
+                    "distributor_id": "d1",
+                    "type": "purchase",
+                    "amount": 1000,
+                    "invoice_number": "OB-1000",
+                    "transaction_date": "2026-04-01",
+                    "reference_number": "Opening Balance",
+                },
+                {"id": "pay", "distributor_id": "d1", "type": "payment", "amount": 500},
+            ]),
+        )
+
+        with patch("server.db", db):
+            result = await list_distributors(user={})
+
+        self.assertEqual(result[0]["total_purchases"], 1000)
+        self.assertEqual(result[0]["actual_payments"], 500)
+        self.assertEqual(result[0]["total_paid"], 500)
+        self.assertEqual(result[0]["total_paid_adjusted"], 500)
+        self.assertEqual(result[0]["outstanding_balance"], 500)
+        self.assertEqual(
+            result[0]["total_purchases"] - result[0]["total_paid_adjusted"],
+            result[0]["outstanding_balance"],
+        )
+
+    async def test_distributor_summary_keeps_real_purchase_with_different_invoice(self):
+        db = SimpleNamespace(
+            distributors=Collection([{
+                "id": "d1",
+                "name": "D",
+                "opening_balance": 1000,
+                "opening_balance_date": "2026-04-01",
+                "opening_balance_invoice_number": "OB-1000",
+            }]),
+            distributor_transactions=Collection([
+                {
+                    "id": "ob",
+                    "distributor_id": "d1",
+                    "type": "opening_balance",
+                    "amount": 1000,
+                    "invoice_number": "OB-1000",
+                    "transaction_date": "2026-04-01",
+                },
+                {
+                    "id": "real",
+                    "distributor_id": "d1",
+                    "type": "purchase",
+                    "amount": 1000,
+                    "invoice_number": "REAL-1000",
+                    "transaction_date": "2026-04-01",
+                },
+                {"id": "pay", "distributor_id": "d1", "type": "payment", "amount": 500},
+            ]),
+        )
+
+        with patch("server.db", db):
+            result = await list_distributors(user={})
+
+        self.assertEqual(result[0]["total_purchases"], 2000)
+        self.assertEqual(result[0]["actual_payments"], 500)
+        self.assertEqual(result[0]["outstanding_balance"], 1500)
+
     async def test_distributor_receivable_is_separate_from_payable_and_paid_adjusted(self):
         db = SimpleNamespace(
             distributors=Collection([
