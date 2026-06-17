@@ -20,6 +20,11 @@ class Cursor:
 
 class Collection:
     def __init__(self, rows): self.rows = rows
+    async def find_one(self, query, *args, **kwargs):
+        return next(
+            (dict(row) for row in self.rows if all(str(row.get(k)) == str(v) for k, v in query.items())),
+            None,
+        )
     def find(self, query=None, projection=None):
         rows = self.rows
         if query:
@@ -185,3 +190,57 @@ class LiveDataCorrectnessTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", db): result = await purchase_return_report(user={})
         self.assertEqual(result["purchase_returns"][0]["id"], "r1")
         self.assertEqual(result["returns_by_medicine"][0]["value"], 10)
+
+from server import distributor_ledger
+
+
+class DistributorCanonicalAccountingRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_midha_style_list_and_ledger_balances_match_after_po_dedupe(self):
+        db = SimpleNamespace(
+            distributors=Collection([{"id": "midha", "name": "MIDHA DISTRIBUTORS"}]),
+            distributor_transactions=Collection([
+                {"id": "t-inv", "distributor_id": "midha", "type": "purchase", "amount": 35037.01,
+                 "invoice_no": "M-100", "created_at": "2026-05-01"},
+                {"id": "pay", "distributor_id": "midha", "type": "payment", "amount": 21265,
+                 "created_at": "2026-05-02"},
+            ]),
+            purchase_orders=Collection([
+                {"id": "po-midha", "distributor_id": "midha", "po_no": "PO-MIDHA", "invoice_ref": "M-100",
+                 "grand_total": 35037.01, "po_date": "2026-05-01"},
+            ]),
+        )
+        with patch("server.db", db):
+            listed = await list_distributors(user={})
+            ledger = await distributor_ledger("midha", user={})
+
+        self.assertEqual(listed[0]["current_balance"], ledger["balance"])
+        self.assertEqual(listed[0]["outstanding_balance"], ledger["balance"])
+        self.assertEqual(ledger["total_purchases"], 35037.01)
+        self.assertEqual(ledger["total_paid"], 21265)
+        self.assertEqual(ledger["balance"], 13772.01)
+        self.assertEqual(ledger["transactions"][-1]["running_balance"], ledger["balance"])
+
+    async def test_abhi_style_list_and_ledger_balances_match_after_po_dedupe(self):
+        db = SimpleNamespace(
+            distributors=Collection([{"id": "abhi", "name": "ABHI ENTERPRISES"}]),
+            distributor_transactions=Collection([
+                {"id": "t-inv", "distributor_id": "abhi", "type": "purchase", "amount": 50254,
+                 "invoice_no": "A-100", "created_at": "2026-05-01"},
+                {"id": "pay", "distributor_id": "abhi", "type": "payment", "amount": 36649,
+                 "created_at": "2026-05-02"},
+            ]),
+            purchase_orders=Collection([
+                {"id": "po-abhi", "distributor_id": "abhi", "po_no": "PO-ABHI", "invoice_ref": "A-100",
+                 "grand_total": 50254, "po_date": "2026-05-01"},
+            ]),
+        )
+        with patch("server.db", db):
+            listed = await list_distributors(user={})
+            ledger = await distributor_ledger("abhi", user={})
+
+        self.assertEqual(listed[0]["current_balance"], ledger["balance"])
+        self.assertEqual(listed[0]["outstanding_balance"], ledger["balance"])
+        self.assertEqual(ledger["total_purchases"], 50254)
+        self.assertEqual(ledger["total_paid"], 36649)
+        self.assertEqual(ledger["balance"], 13605)
+        self.assertEqual(ledger["transactions"][-1]["running_balance"], ledger["balance"])
