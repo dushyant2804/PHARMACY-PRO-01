@@ -294,6 +294,34 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(result["balance"], 100.0)
         self.assertEqual([row["id"] for row in result["transactions"]], ["txn-purchase", "payment-1"])
 
+    async def test_bracket_prefixed_invoice_duplicate_from_transaction_and_po_is_returned_once(self):
+        result = await self.ledger(
+            [{"id": "abhi", "name": "ABHI ENTERPRISES", "opening_balance": 0}],
+            [
+                {"id": "txn-q-4557", "distributor_id": "abhi", "type": "purchase", "amount": 1250,
+                 "invoice_no": "4557", "created_at": "2026-05-10T09:00:00+00:00"},
+            ],
+            [
+                {"id": "po-q-4557", "distributor_id": "abhi", "po_no": "PO-Q-4557",
+                 "invoice_ref": "(Q) 4557", "grand_total": 1250, "po_date": "2026-05-10",
+                 "items": [{"name": "Med"}]},
+            ],
+            did="abhi",
+        )
+
+        purchase_rows = [row for row in result["transactions"] if row.get("type") == "purchase"]
+        self.assertEqual(len(purchase_rows), 1)
+        self.assertEqual(purchase_rows[0]["id"], "txn-q-4557")
+        self.assertEqual(purchase_rows[0]["_debug_source"], "distributor_transactions")
+        self.assertFalse(purchase_rows[0]["_debug_is_synthetic"])
+        self.assertEqual(purchase_rows[0]["_debug_transaction_id"], "txn-q-4557")
+        self.assertEqual(purchase_rows[0]["_debug_purchase_order_id"], "po-q-4557")
+        self.assertIn("4557", purchase_rows[0]["_debug_invoice_identity"])
+        self.assertTrue(any("4557" in key for key in purchase_rows[0]["_debug_dedupe_key"]))
+        self.assertIn("invoice/ref identity", purchase_rows[0]["_debug_skip_reason"])
+        self.assertEqual(result["total_purchases"], 1250)
+        self.assertEqual(result["balance"], 1250)
+
     async def test_same_date_and_amount_with_different_invoice_refs_remain_separate(self):
         result = await self.ledger(
             [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
