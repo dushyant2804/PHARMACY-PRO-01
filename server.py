@@ -5255,6 +5255,24 @@ def _normalize_ledger_invoice_identity_value(value) -> str:
     return " ".join(str(value or "").strip().casefold().split())
 
 
+def _ledger_invoice_identity_variants(value) -> set[str]:
+    """Return comparable invoice identities, including legacy prefix-stripped forms."""
+    normalized = _normalize_ledger_invoice_identity_value(value)
+    if not normalized:
+        return set()
+
+    variants = {normalized}
+    # Legacy imports sometimes store distributor invoice series as a leading
+    # parenthesized prefix, e.g. "(Q) 4557", while the paired ledger row stores
+    # only "4557".  Keep the original identity and add only this deterministic
+    # alternate form so unrelated invoices with different explicit refs remain
+    # separate.
+    without_series = re.sub(r"^\([^)]+\)\s*", "", normalized).strip()
+    if without_series and without_series != normalized:
+        variants.add(without_series)
+    return variants
+
+
 def _purchase_invoice_reference_values(txn: dict) -> set[str]:
     if not isinstance(txn, dict):
         return set()
@@ -5271,9 +5289,7 @@ def _purchase_invoice_reference_values(txn: dict) -> set[str]:
         "receipt_invoice_no",
         "po_no",
     ):
-        normalized = _normalize_ledger_invoice_identity_value(txn.get(field_name))
-        if normalized:
-            refs.add(normalized)
+        refs.update(_ledger_invoice_identity_variants(txn.get(field_name)))
     return refs
 
 
@@ -5589,6 +5605,33 @@ async def _canonical_distributor_ledger_transactions(
     return canonical
 
 
+def _debug_purchase_invoice_identity(txn: dict) -> list[str]:
+    return sorted(_purchase_invoice_reference_values(txn))
+
+
+def _debug_purchase_invoice_dedupe_key(txn: dict, distributor_id: str | None = None) -> list[str]:
+    return [repr(key) for key in _purchase_invoice_identity_keys(txn, distributor_id)]
+
+
+def _with_distributor_ledger_debug_fields(txn: dict, distributor_id: str | None = None) -> dict:
+    debugged = dict(txn if isinstance(txn, dict) else {})
+    source = debugged.get("backend_row_source") or debugged.get("source") or "distributor_transactions"
+    debugged["_debug_source"] = source
+    debugged["_debug_is_synthetic"] = bool(debugged.get("is_synthetic"))
+    debugged["_debug_transaction_id"] = _serializable_transaction_id(
+        debugged.get("transaction_id") or debugged.get("id") or debugged.get("_id")
+    )
+    debugged["_debug_purchase_order_id"] = _serializable_transaction_id(
+        debugged.get("purchase_order_id") or debugged.get("po_id") or debugged.get("matched_purchase_order_id")
+    )
+    debugged["_debug_invoice_identity"] = _debug_purchase_invoice_identity(debugged)
+    debugged["_debug_dedupe_key"] = _debug_purchase_invoice_dedupe_key(debugged, distributor_id)
+    skip_reason = debugged.get("synthetic_purchase_order_skip_reason") or debugged.get("_debug_skip_reason")
+    if skip_reason:
+        debugged["_debug_skip_reason"] = skip_reason
+    return debugged
+
+
 def _distributor_ledger_totals(transactions: list[dict]) -> dict:
     balance = 0.0
     totals = {"total_purchases": 0.0, "total_paid": 0.0, "total_adjustments": 0.0, "balance": 0.0}
@@ -5673,7 +5716,7 @@ async def distributor_ledger(
             total_paid += txn_amount
 
         txn_id = _serializable_transaction_id(txn.get("id") if isinstance(txn, dict) else None)
-        running.append(_json_safe_ledger_transaction({
+        running.append(_json_safe_ledger_transaction(_with_distributor_ledger_debug_fields({
             **(txn if isinstance(txn, dict) else {}),
             **fifo_metadata_by_id.get(txn_id, {}),
             "running_balance": round(balance, 2),
@@ -5682,7 +5725,7 @@ async def distributor_ledger(
                 else "partially_settled" if _safe_float(fifo_metadata_by_id.get(txn_id, {}).get("paid_amount")) > 0
                 else "unpaid"
             ) if bucket == "purchase" else None,
-        }, include_items=True))
+        }, str(dist.get("id") or did)), include_items=True))
 
     def matches_filters(txn: dict) -> bool:
         txn_date = _distributor_transaction_date(txn)
