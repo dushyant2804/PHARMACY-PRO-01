@@ -130,7 +130,69 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opening_row["amount"], 293)
         self.assertEqual(opening_row["running_balance"], 293)
         self.assertEqual(result["balance"], 293)
-        self.assertEqual(result["total_purchases"], 0)
+        self.assertEqual(result["total_purchases"], 293)
+        self.assertEqual(result["balance_for_selected_period"], 293)
         self.assertFalse(
             any(row["type"] in {"purchase", "payment"} for row in result["transactions"])
         )
+
+    async def test_arti_style_opening_balance_duplicate_is_excluded_and_selected_balance_is_signed(self):
+        result = await self.ledger(
+            [{
+                "id": "arti",
+                "name": "ARTI ENTERPRISES",
+                "opening_balance": 1169,
+                "opening_balance_date": "2026-04-01",
+                "opening_balance_invoice_number": "OB-ARTI-1169",
+            }],
+            [
+                {
+                    "id": "duplicate-opening-purchase",
+                    "distributor_id": "arti",
+                    "type": "purchase",
+                    "amount": 1169,
+                    "invoice_number": "OB-ARTI-1169",
+                    "reference_number": "Opening Balance",
+                    "notes": "Opening Balance",
+                    "created_at": "2026-04-01",
+                },
+                {
+                    "id": "opening-payment",
+                    "distributor_id": "arti",
+                    "type": "payment",
+                    "amount": 1169,
+                    "reference_number": "PMT-OB-ARTI-1169",
+                    "created_at": "2026-04-02",
+                },
+                {
+                    "id": "p1",
+                    "distributor_id": "arti",
+                    "type": "purchase",
+                    "amount": 2844,
+                    "invoice_number": "INV-2844",
+                    "created_at": "2026-04-03",
+                },
+                {
+                    "id": "pay-1",
+                    "distributor_id": "arti",
+                    "type": "payment",
+                    "amount": 4013,
+                    "reference_number": "PMT-4013",
+                    "created_at": "2026-04-04",
+                },
+            ],
+            [],
+            did="arti",
+        )
+
+        self.assertEqual(
+            [row["id"] for row in result["transactions"]],
+            ["opening-balance-arti", "opening-payment", "p1", "pay-1"],
+        )
+        self.assertEqual(result["total_purchases"], 4013)
+        self.assertEqual(result["total_paid"], 5182)
+        self.assertEqual(result["balance"], -1169)
+        self.assertEqual(result["balance_for_selected_period"], -1169)
+        self.assertEqual(result["net_balance_for_selected_period"], -1169)
+        self.assertEqual(result["payable_for_selected_period"], 0)
+        self.assertEqual(result["receivable_for_selected_period"], 1169)
