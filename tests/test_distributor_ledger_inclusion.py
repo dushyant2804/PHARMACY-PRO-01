@@ -432,6 +432,34 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(result["total_paid"], 100)
         self.assertEqual(result["balance"], 150)
 
+
+    async def test_ledger_rows_expose_source_and_mutability_metadata(self):
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+            [{"id": "pay-1", "distributor_id": "d1", "type": "payment", "amount": 40,
+              "created_at": "2026-05-11T09:00:00+00:00"}],
+            [{"id": "po-1", "distributor_id": "d1", "po_no": "PO-1", "invoice_ref": "INV-1",
+              "grand_total": 100, "po_date": "2026-05-10", "items": [{"name": "Med"}]}],
+        )
+
+        synthetic_po = next(row for row in result["transactions"] if row.get("purchase_order_id") == "po-1")
+        persisted_payment = next(row for row in result["transactions"] if row.get("id") == "pay-1")
+
+        self.assertEqual(synthetic_po["source"], "purchase_orders")
+        self.assertEqual(synthetic_po["backend_row_source"], "purchase_orders")
+        self.assertTrue(synthetic_po["is_synthetic"])
+        self.assertEqual(synthetic_po["purchase_order_id"], "po-1")
+        self.assertIsNone(synthetic_po.get("transaction_id"))
+        self.assertFalse(synthetic_po["can_edit"])
+        self.assertFalse(synthetic_po["can_delete"])
+
+        self.assertEqual(persisted_payment["source"], "distributor_transactions")
+        self.assertFalse(persisted_payment["is_synthetic"])
+        self.assertEqual(persisted_payment["transaction_id"], "pay-1")
+        self.assertTrue(persisted_payment["can_edit"])
+        self.assertTrue(persisted_payment["can_delete"])
+        self.assertEqual(result["balance"], 60)
+
     async def test_monthly_summary_keeps_previous_non_ledger_deduped_purchase_set(self):
         fake_db = SimpleNamespace(
             distributors=Collection([{"id": "d1", "name": "Supplier", "opening_balance": 0}]),
