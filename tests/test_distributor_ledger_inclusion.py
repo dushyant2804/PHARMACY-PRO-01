@@ -284,13 +284,15 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
 
         purchase_rows = [row for row in result["transactions"] if row.get("type") == "purchase"]
         self.assertEqual(len(purchase_rows), 1)
-        self.assertEqual(purchase_rows[0]["purchase_order_id"], "po-100")
-        self.assertEqual(purchase_rows[0]["items"], [{"name": "Med"}])
+        self.assertEqual(purchase_rows[0]["id"], "txn-purchase")
+        self.assertEqual(purchase_rows[0]["backend_row_source"], "distributor_transactions")
+        self.assertFalse(purchase_rows[0]["is_synthetic"])
+        self.assertTrue(purchase_rows[0]["synthetic_purchase_order_skipped"])
         self.assertEqual(purchase_rows[0]["running_balance"], 123.46)
         self.assertEqual(result["total_purchases"], 123.46)
         self.assertEqual(result["total_paid"], 23.46)
         self.assertEqual(result["balance"], 100.0)
-        self.assertEqual([row["id"] for row in result["transactions"]], ["purchase-order-po-100", "payment-1"])
+        self.assertEqual([row["id"] for row in result["transactions"]], ["txn-purchase", "payment-1"])
 
     async def test_same_date_and_amount_with_different_invoice_refs_remain_separate(self):
         result = await self.ledger(
@@ -339,10 +341,68 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
             ],
         )
 
-        self.assertEqual([row["id"] for row in result["transactions"]], ["purchase-order-po-amount"])
-        self.assertEqual(result["transactions"][0]["items"], [{"name": "Med"}])
+        self.assertEqual([row["id"] for row in result["transactions"]], ["txn-purchase"])
         self.assertEqual(result["transactions"][0]["amount"], 99.99)
+        self.assertTrue(result["transactions"][0]["synthetic_purchase_order_skipped"])
         self.assertEqual(result["balance"], 99.99)
+
+    async def test_opening_balance_invoice_duplicate_normal_purchase_removed_once(self):
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 500,
+              "opening_balance_date": "2026-04-01", "opening_balance_invoice_number": "OB-1"}],
+            [
+                {"id": "ob", "distributor_id": "d1", "type": "opening_balance", "amount": 500,
+                 "invoice_no": "OB-1", "created_at": "2026-04-01"},
+                {"id": "dup", "distributor_id": "d1", "type": "purchase", "amount": 500,
+                 "invoice_no": "OB-1", "created_at": "2026-04-01", "notes": "Opening Balance"},
+            ],
+            [],
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["ob"])
+        self.assertEqual(result["total_purchases"], 500)
+        self.assertEqual(result["balance"], 500)
+
+    async def test_po_allocation_metadata_does_not_create_synthetic_payment_rows(self):
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+            [
+                {"id": "p1", "distributor_id": "d1", "type": "purchase", "amount": 100,
+                 "invoice_no": "INV-PAY", "created_at": "2026-05-10"},
+                {"id": "pay-real", "distributor_id": "d1", "type": "payment", "amount": 40,
+                 "receipt_invoice_no": "INV-PAY", "created_at": "2026-05-11"},
+            ],
+            [{"id": "po-pay", "distributor_id": "d1", "po_no": "PO-PAY", "invoice_ref": "INV-PAY",
+              "grand_total": 100, "po_date": "2026-05-10",
+              "adjusted_against": [{"transaction_id": "pay-real", "amount": 40}]}],
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["p1", "pay-real"])
+        self.assertEqual(sum(row["type"] == "payment" for row in result["transactions"]), 1)
+        self.assertEqual(result["transactions"][1]["backend_row_source"], "distributor_transactions")
+        self.assertEqual(result["total_paid"], 40)
+
+    async def test_multiple_po_allocation_metadata_rows_do_not_create_fake_adjusted_payments(self):
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+            [
+                {"id": "p1", "distributor_id": "d1", "type": "purchase", "amount": 200,
+                 "invoice_no": "M-1", "created_at": "2026-05-10"},
+                {"id": "pay-1", "distributor_id": "d1", "type": "payment", "amount": 30, "created_at": "2026-05-11"},
+                {"id": "pay-2", "distributor_id": "d1", "type": "payment", "amount": 70, "created_at": "2026-05-12"},
+            ],
+            [
+                {"id": "po-m1", "distributor_id": "d1", "invoice_ref": "M-1", "grand_total": 200,
+                 "po_date": "2026-05-10", "allocations": [{"amount": 30}, {"amount": 70}]},
+                {"id": "po-m2", "distributor_id": "d1", "invoice_ref": "M-2", "grand_total": 50,
+                 "po_date": "2026-05-13", "allocations": [{"amount": 10}]},
+            ],
+        )
+
+        self.assertEqual([row["type"] for row in result["transactions"]], ["purchase", "payment", "payment", "purchase"])
+        self.assertEqual(sum(row["type"] == "payment" for row in result["transactions"]), 2)
+        self.assertEqual(result["total_paid"], 100)
+        self.assertEqual(result["balance"], 150)
 
     async def test_monthly_summary_keeps_previous_non_ledger_deduped_purchase_set(self):
         fake_db = SimpleNamespace(
