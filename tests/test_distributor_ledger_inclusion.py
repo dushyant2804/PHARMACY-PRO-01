@@ -253,3 +253,78 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["id"] for row in result["transactions"]], ["ob"])
         self.assertEqual(result["total_purchases"], 150)
         self.assertEqual(result["balance"], 150)
+
+from server import _distributor_monthly_summary_data
+
+
+class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCase):
+    async def ledger(self, distributors, transactions, purchase_orders, **filters):
+        fake_db = SimpleNamespace(
+            distributors=Collection(distributors),
+            distributor_transactions=Collection(transactions),
+            purchase_orders=Collection(purchase_orders),
+        )
+        with patch("server.db", fake_db):
+            return await distributor_ledger(filters.pop("did", "d1"), user={}, **filters)
+
+    async def test_duplicate_purchase_invoice_from_transaction_and_po_is_returned_once(self):
+        distributors = [{"id": "d1", "name": "Supplier", "opening_balance": 0}]
+        transactions = [
+            {"id": "txn-purchase", "distributor_id": "d1", "type": "purchase", "amount": 123.456,
+             "invoice_no": "INV-100", "reference_number": "INV-100", "created_at": "2026-05-10T09:00:00+00:00"},
+            {"id": "payment-1", "distributor_id": "d1", "type": "payment", "amount": 23.46,
+             "reference_number": "PAY-INV-100", "receipt_invoice_no": "INV-100", "created_at": "2026-05-11T09:00:00+00:00"},
+        ]
+        purchase_orders = [
+            {"id": "po-100", "distributor_id": "d1", "po_no": "PO-100", "invoice_ref": "INV-100",
+             "grand_total": 123.456, "po_date": "2026-05-10", "items": [{"name": "Med"}]},
+        ]
+
+        result = await self.ledger(distributors, transactions, purchase_orders)
+
+        purchase_rows = [row for row in result["transactions"] if row.get("type") == "purchase"]
+        self.assertEqual(len(purchase_rows), 1)
+        self.assertEqual(purchase_rows[0]["purchase_order_id"], "po-100")
+        self.assertEqual(purchase_rows[0]["running_balance"], 123.46)
+        self.assertEqual(result["total_purchases"], 123.46)
+        self.assertEqual(result["total_paid"], 23.46)
+        self.assertEqual(result["balance"], 100.0)
+        self.assertEqual([row["id"] for row in result["transactions"]], ["purchase-order-po-100", "payment-1"])
+
+    async def test_same_date_and_amount_with_different_invoice_refs_remain_separate(self):
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+            [
+                {"id": "p1", "distributor_id": "d1", "type": "purchase", "amount": 50,
+                 "invoice_no": "INV-A", "created_at": "2026-05-10"},
+                {"id": "p2", "distributor_id": "d1", "type": "purchase", "amount": 50,
+                 "invoice_no": "INV-B", "created_at": "2026-05-10"},
+            ],
+            [],
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["p1", "p2"])
+        self.assertEqual([row["running_balance"] for row in result["transactions"]], [50, 100])
+        self.assertEqual(result["total_purchases"], 100)
+
+    async def test_monthly_summary_uses_deduped_purchase_invoice_set(self):
+        fake_db = SimpleNamespace(
+            distributors=Collection([{"id": "d1", "name": "Supplier", "opening_balance": 0}]),
+            distributor_transactions=Collection([
+                {"id": "txn-purchase", "distributor_id": "d1", "type": "purchase", "amount": 80,
+                 "invoice_no": "INV-MONTH", "created_at": "2026-05-10"},
+                {"id": "payment-1", "distributor_id": "d1", "type": "payment", "amount": 30,
+                 "reference_number": "PAY-INV-MONTH", "receipt_invoice_no": "INV-MONTH", "created_at": "2026-05-11"},
+            ]),
+            purchase_orders=Collection([
+                {"id": "po-month", "distributor_id": "d1", "po_no": "PO-MONTH", "invoice_ref": "INV-MONTH",
+                 "grand_total": 80, "po_date": "2026-05-10", "items": [{"name": "Med"}]},
+            ]),
+        )
+        with patch("server.db", fake_db):
+            result = await _distributor_monthly_summary_data("2026-05", "d1")
+
+        self.assertEqual(result["purchase_total"], 80)
+        self.assertEqual(result["payment_total"], 30)
+        self.assertEqual(result["net_change"], 50)
+        self.assertEqual(result["items"][0]["transaction_count"], 2)
