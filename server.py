@@ -3223,10 +3223,11 @@ async def list_distributors(
         if opening_balance_date:
             distributor["opening_balance_date"] = opening_balance_date
 
-        current_balance = _current_distributor_balance(
+        distributor_transactions = _distributor_opening_balance_deduped_transactions(
             distributor,
             transactions_by_distributor.get(distributor.get("id"), []),
         )
+        current_balance = _current_distributor_balance(distributor, distributor_transactions)
         distributor["current_balance"] = current_balance
         distributor["outstanding_balance"] = current_balance
         distributor["total_payable"] = _round_ledger_money(max(current_balance, 0))
@@ -3234,17 +3235,15 @@ async def list_distributors(
         distributor["net_distributor_balance"] = current_balance
         distributor["distributor_status"] = distributor.get("distributor_status") or "active"
         purchases = [
-            txn for txn in transactions_by_distributor.get(distributor.get("id"), [])
+            txn for txn in distributor_transactions
             if txn.get("type") in {"purchase", "sale", "opening_balance"}
         ]
-        opening_in_txns = any(_is_opening_balance_transaction(txn, distributor.get("id")) for txn in purchases)
-        opening = 0 if opening_in_txns else _safe_float(distributor.get("opening_balance"))
         distributor["total_purchases"] = _round_ledger_money(
-            opening + sum(_safe_float(txn.get("amount")) for txn in purchases)
+            sum(_safe_float(txn.get("amount")) for txn in purchases)
         )
         actual_payments = _round_ledger_money(sum(
             _safe_float(txn.get("amount"))
-            for txn in transactions_by_distributor.get(distributor.get("id"), [])
+            for txn in distributor_transactions
             if txn.get("type") == "payment"
         ))
         # Reconcile paid/adjusted to the payable side only. Credits beyond the
@@ -5220,23 +5219,35 @@ def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, st
     return balance - amount, "payment"
 
 
-def _current_distributor_balance(distributor: dict, transactions: list[dict]) -> float:
-    opening_transactions = [
-        txn for txn in transactions
-        if _is_opening_balance_transaction(txn, distributor.get("id"))
-    ]
-    balance = 0.0 if opening_transactions else _safe_float(distributor.get("opening_balance", 0))
-    used_opening_transaction = False
+def _distributor_opening_balance_deduped_transactions(
+    distributor: dict,
+    transactions: list[dict],
+) -> list[dict]:
+    """Return distributor transactions with one opening balance and no legacy duplicate row."""
+    distributor_id = str(distributor.get("id") or "")
+    opening_txn = None
+    non_opening_txns = []
 
     for txn in transactions:
-        if _is_opening_balance_transaction(txn, distributor.get("id")):
-            if used_opening_transaction:
-                continue
-            normalized = _normalize_opening_balance_transaction(txn, distributor)
-            balance, _bucket = _apply_distributor_transaction(balance, normalized)
-            used_opening_transaction = True
+        if _is_explicit_opening_balance_transaction(txn, distributor_id):
+            if opening_txn is None:
+                opening_txn = _normalize_opening_balance_transaction(txn, distributor)
             continue
+        if _is_duplicate_opening_balance_row(txn, distributor, opening_txn):
+            continue
+        non_opening_txns.append(txn)
 
+    deduped = []
+    if opening_txn is not None or _safe_float(distributor.get("opening_balance", 0)) != 0:
+        deduped.append(opening_txn or _opening_balance_transaction(distributor))
+    deduped.extend(non_opening_txns)
+    return _dedupe_distributor_opening_balance_rows(deduped, distributor_id)
+
+
+def _current_distributor_balance(distributor: dict, transactions: list[dict]) -> float:
+    balance = 0.0
+
+    for txn in _distributor_opening_balance_deduped_transactions(distributor, transactions):
         balance, _bucket = _apply_distributor_transaction(balance, txn)
 
     return round(balance, 2)
