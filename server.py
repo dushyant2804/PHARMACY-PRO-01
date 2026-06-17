@@ -4323,8 +4323,26 @@ def _is_opening_balance_transaction(txn: dict, distributor_id: str | None = None
     return (
         txn_type == "opening_balance"
         or display_type == "opening balance"
-        or (txn_type == "purchase" and (notes == "opening balance" or reference == "opening balance"))
+        or (txn_type in {"purchase", "payment"} and (notes == "opening balance" or reference == "opening balance"))
     )
+
+
+def _has_opening_balance_metadata(txn: dict) -> bool:
+    if not isinstance(txn, dict):
+        return False
+    metadata_values = (
+        txn.get("reference_number"),
+        txn.get("reference"),
+        txn.get("notes"),
+        txn.get("subtype"),
+        txn.get("display_type"),
+        txn.get("source"),
+    )
+    return any(str(value or "").strip().lower() in {
+        "opening balance",
+        "opening_balance",
+        "opening-balance",
+    } for value in metadata_values)
 
 
 DISTRIBUTOR_OPENING_BALANCE_DATE_FIELDS = (
@@ -4355,6 +4373,28 @@ def _opening_balance_amount_matches(txn: dict, distributor: dict) -> bool:
         return txn_amount == opening_balance
     except (TypeError, ValueError):
         return False
+
+
+def _is_duplicate_opening_balance_row(txn: dict, distributor: dict, opening_txn: dict | None = None) -> bool:
+    """Detect legacy synthetic purchase/payment rows that duplicate the distributor opening balance."""
+    if not isinstance(txn, dict):
+        return False
+
+    txn_type = str(txn.get("type") or "").strip().lower()
+    if txn_type not in {"purchase", "payment"}:
+        return False
+    if txn_type == "opening_balance" or txn.get("is_opening_balance"):
+        return False
+    if not _has_opening_balance_metadata(txn):
+        return False
+    if not _opening_balance_amount_matches(txn, distributor):
+        return False
+
+    opening_date = _distributor_transaction_date(
+        opening_txn or _opening_balance_transaction(distributor)
+    )
+    txn_date = _distributor_transaction_date(txn)
+    return bool(opening_date and txn_date and opening_date == txn_date)
 
 
 async def _find_distributor_opening_balance_transaction(distributor: dict):
@@ -4427,9 +4467,9 @@ def _opening_balance_transaction(distributor: dict) -> dict:
     return {
         "id": _opening_balance_transaction_id(distributor.get("id")),
         "distributor_id": distributor.get("id"),
-        "type": "purchase",
+        "type": "opening_balance",
         "subtype": "Opening Balance",
-        "display_type": "Purchase",
+        "display_type": "Opening Balance",
         "amount": opening_balance,
         "invoice_number": distributor.get("opening_balance_invoice_number"),
         "bill_number": distributor.get("opening_balance_bill_number"),
@@ -4452,9 +4492,9 @@ def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict
         **txn,
         "id": txn.get("id") or _opening_balance_transaction_id(distributor.get("id")),
         "distributor_id": txn.get("distributor_id") or distributor.get("id"),
-        "type": "purchase",
+        "type": "opening_balance",
         "subtype": "Opening Balance",
-        "display_type": "Purchase",
+        "display_type": "Opening Balance",
         "amount": _safe_float(txn.get("amount", distributor.get("opening_balance", 0))),
         "reference_number": txn.get("reference_number") or "Opening Balance",
         "notes": txn.get("notes") or "Opening Balance",
@@ -5145,12 +5185,14 @@ async def distributor_ledger(
             if opening_txn is None:
                 opening_txn = _normalize_opening_balance_transaction(txn, dist)
             continue
+        if _is_duplicate_opening_balance_row(txn, dist, opening_txn):
+            continue
         non_opening_txns.append(txn)
 
-    ledger_txns = [
-        opening_txn or _opening_balance_transaction(dist),
-        *non_opening_txns,
-    ]
+    ledger_txns = []
+    if opening_txn is not None or _safe_float(dist.get("opening_balance", 0)) != 0:
+        ledger_txns.append(opening_txn or _opening_balance_transaction(dist))
+    ledger_txns.extend(non_opening_txns)
     ledger_txns.sort(key=_distributor_fifo_sort_key)
     available_financial_years = _available_financial_years(ledger_txns)
     financial_year_metadata = _distributor_financial_year_metadata(
@@ -5182,7 +5224,7 @@ async def distributor_ledger(
         balance, bucket = _apply_distributor_transaction(balance, txn)
         txn_amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
 
-        if bucket == "purchase":
+        if bucket == "purchase" and not txn.get("is_opening_balance"):
             total_purchases += txn_amount
         elif bucket == "adjustment":
             total_adjustments += txn_amount
@@ -6330,6 +6372,9 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
         amount = float(txn.get("amount", 0) or 0)
         summary = summaries[did]
 
+        if _is_opening_balance_transaction(txn, did):
+            continue
+
         if txn.get("type") in ["purchase", "sale"]:
             summary["purchase_total"] += amount
             summary["net_change"] += amount
@@ -6372,6 +6417,44 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
     }
 
 
+async def repair_duplicate_distributor_opening_balance_rows(distributor_id: Optional[str] = None) -> dict:
+    distributor_query = {"id": distributor_id} if distributor_id else {}
+    distributors = await db.distributors.find(distributor_query, {"_id": 0}).to_list(5000)
+    removed_ids = []
+
+    for distributor in distributors:
+        did = distributor.get("id")
+        if not did:
+            continue
+
+        opening_txn = await _find_distributor_opening_balance_transaction(distributor)
+        txns = await db.distributor_transactions.find(
+            {"distributor_id": did},
+            {"_id": 0},
+        ).sort("created_at", 1).to_list(1000)
+        duplicate_ids = [
+            txn.get("id")
+            for txn in txns
+            if txn.get("id")
+            and _is_duplicate_opening_balance_row(txn, distributor, opening_txn)
+        ]
+        if not duplicate_ids:
+            continue
+
+        await db.distributor_transactions.delete_many({
+            "distributor_id": did,
+            "id": {"$in": duplicate_ids},
+        })
+        removed_ids.extend(duplicate_ids)
+
+    return {
+        "success": True,
+        "distributor_id": distributor_id,
+        "removed_count": len(removed_ids),
+        "removed_transaction_ids": removed_ids,
+    }
+
+
 @api_router.get("/distributors/monthly-summary")
 async def distributor_monthly_summary(
     month: str,
@@ -6388,6 +6471,14 @@ async def distributor_ledger_monthly_summary(
     user: dict = Depends(get_current_user),
 ):
     return await _distributor_monthly_summary_data(month, did)
+
+
+@api_router.post("/admin/repair-distributor-opening-balance-duplicates")
+async def repair_distributor_opening_balance_duplicates_endpoint(
+    distributor_id: Optional[str] = None,
+    user: dict = Depends(require_role("admin")),
+):
+    return await repair_duplicate_distributor_opening_balance_rows(distributor_id)
 
 
 @api_router.get("/ledger/customer/{cid}")

@@ -90,3 +90,47 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row["type"] for row in unfiltered["transactions"]}, {"purchase", "payment"})
         self.assertEqual([row["type"] for row in filtered["transactions"]], ["payment"])
         self.assertEqual(filtered["transactions"][0]["running_balance"], 20)
+
+    async def test_opening_balance_duplicate_purchase_or_payment_rows_are_not_returned(self):
+        result = await self.ledger(
+            [{
+                "id": "d1",
+                "name": "A TO Z MEDICAL AGENCY",
+                "opening_balance": 293,
+                "opening_balance_date": "2026-04-01",
+            }],
+            [
+                {
+                    "id": "legacy-opening-purchase",
+                    "distributor_id": "d1",
+                    "type": "purchase",
+                    "amount": 293,
+                    "reference_number": "Opening Balance",
+                    "notes": "Opening Balance",
+                    "created_at": "2026-04-01",
+                },
+                {
+                    "id": "legacy-opening-payment",
+                    "distributor_id": "d1",
+                    "type": "payment",
+                    "amount": 293,
+                    "reference_number": "Opening Balance",
+                    "notes": "Opening Balance",
+                    "created_at": "2026-04-01",
+                },
+            ],
+            [],
+        )
+
+        self.assertEqual(len(result["transactions"]), 1)
+        opening_row = result["transactions"][0]
+        self.assertTrue(opening_row["is_opening_balance"])
+        self.assertEqual(opening_row["type"], "opening_balance")
+        self.assertEqual(opening_row["display_type"], "Opening Balance")
+        self.assertEqual(opening_row["amount"], 293)
+        self.assertEqual(opening_row["running_balance"], 293)
+        self.assertEqual(result["balance"], 293)
+        self.assertEqual(result["total_purchases"], 0)
+        self.assertFalse(
+            any(row["type"] in {"purchase", "payment"} for row in result["transactions"])
+        )
