@@ -5241,8 +5241,130 @@ def _distributor_opening_balance_deduped_transactions(
     if opening_txn is not None or _safe_float(distributor.get("opening_balance", 0)) != 0:
         deduped.append(opening_txn or _opening_balance_transaction(distributor))
     deduped.extend(non_opening_txns)
-    return _dedupe_distributor_opening_balance_rows(deduped, distributor_id)
+    return _dedupe_distributor_purchase_invoice_rows(
+        _dedupe_distributor_opening_balance_rows(deduped, distributor_id),
+        distributor_id,
+    )
 
+
+def _normalize_ledger_invoice_identity_value(value) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _purchase_invoice_reference_values(txn: dict) -> set[str]:
+    if not isinstance(txn, dict):
+        return set()
+    refs = set()
+    for field_name in (
+        "invoice_no",
+        "invoice_number",
+        "invoice_ref",
+        "bill_no",
+        "bill_number",
+        "reference_no",
+        "reference_number",
+        "reference",
+        "receipt_invoice_no",
+    ):
+        normalized = _normalize_ledger_invoice_identity_value(txn.get(field_name))
+        if normalized:
+            refs.add(normalized)
+    return refs
+
+
+def _purchase_invoice_identity_keys(txn: dict, distributor_id: str | None = None) -> list[tuple]:
+    """Return robust identity keys for distributor purchase/invoice ledger rows."""
+    if not isinstance(txn, dict):
+        return []
+    txn_type = str(txn.get("type") or "").strip().lower()
+    if txn_type not in {"purchase", "sale"}:
+        return []
+    txn_distributor_id = str(distributor_id or txn.get("distributor_id") or "").strip()
+    txn_date = _distributor_transaction_date(txn)
+    amount = _ledger_amount_key(txn.get("amount"))
+    keys = [
+        (txn_distributor_id, "ref", ref, txn_date, amount)
+        for ref in sorted(_purchase_invoice_reference_values(txn))
+    ]
+    purchase_order_id = _normalize_ledger_invoice_identity_value(
+        txn.get("purchase_order_id") or txn.get("po_id")
+    )
+    if purchase_order_id:
+        keys.append((txn_distributor_id, "po", purchase_order_id, txn_date, amount))
+    return keys
+
+
+def _purchase_invoice_row_score(txn: dict) -> tuple[int, int, int, int]:
+    """Prefer richer canonical purchase rows, especially purchase-order-backed rows."""
+    if not isinstance(txn, dict):
+        return (0, 0, 0, 0)
+    has_po_id = int(bool(txn.get("purchase_order_id") or txn.get("po_id")))
+    is_po_source = int(
+        txn.get("source") == "purchase_order"
+        or str(txn.get("id") or "").startswith("purchase-order-")
+    )
+    metadata_fields = (
+        "items", "bill_amount", "paid_amount", "due_amount", "invoice_number",
+        "invoice_no", "bill_number", "bill_no", "reference_number", "reference", "notes",
+    )
+    metadata_count = sum(
+        1 for field_name in metadata_fields if txn.get(field_name) not in (None, "", [])
+    )
+    # Keep deterministic order for ties by preserving the existing first row.
+    return (has_po_id, is_po_source, metadata_count, len(str(txn.get("id") or "")))
+
+
+def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distributor_id: str | None = None) -> list[dict]:
+    """Keep one purchase ledger row per distributor invoice identity; never dedupe payments."""
+    selected_by_group: dict[int, dict] = {}
+    key_to_group: dict[tuple, int] = {}
+    group_order: list[tuple[str, object]] = []
+    next_group = 0
+
+    for txn in transactions:
+        keys = _purchase_invoice_identity_keys(txn, distributor_id)
+        if not keys:
+            group_order.append(("row", txn))
+            continue
+
+        matching_groups = {key_to_group[key] for key in keys if key in key_to_group}
+        if matching_groups:
+            group_id = min(matching_groups)
+            # Merge aliases if a richer multi-reference row bridges previously separate keys.
+            for other_group in sorted(matching_groups - {group_id}):
+                old_txn = selected_by_group.pop(other_group, None)
+                if (
+                    old_txn
+                    and _purchase_invoice_row_score(old_txn)
+                    > _purchase_invoice_row_score(selected_by_group[group_id])
+                ):
+                    selected_by_group[group_id] = old_txn
+                for key, mapped_group in list(key_to_group.items()):
+                    if mapped_group == other_group:
+                        key_to_group[key] = group_id
+            if _purchase_invoice_row_score(txn) > _purchase_invoice_row_score(selected_by_group[group_id]):
+                selected_by_group[group_id] = txn
+        else:
+            group_id = next_group
+            next_group += 1
+            selected_by_group[group_id] = txn
+            group_order.append(("group", group_id))
+
+        for key in keys:
+            key_to_group[key] = group_id
+
+    deduped = []
+    emitted_groups = set()
+    for marker_type, value in group_order:
+        if marker_type == "row":
+            deduped.append(value)
+            continue
+        group_id = key_to_group.get(value, value)
+        if group_id in emitted_groups or group_id not in selected_by_group:
+            continue
+        emitted_groups.add(group_id)
+        deduped.append(selected_by_group[group_id])
+    return deduped
 
 def _current_distributor_balance(distributor: dict, transactions: list[dict]) -> float:
     balance = 0.0
@@ -5355,8 +5477,7 @@ async def distributor_ledger(
     purchase_orders = await db.purchase_orders.find({}, {"_id": 0}).to_list(10000)
     matching_pos = [po for po in purchase_orders if _belongs_to_distributor(po, identity_values, names)]
     for po in matching_pos:
-        if not any(_purchase_transaction_matches_po(txn, po) for txn in txns):
-            txns.append(_purchase_order_ledger_transaction(po, str(dist.get("id") or did)))
+        txns.append(_purchase_order_ledger_transaction(po, str(dist.get("id") or did)))
 
     opening_txn = None
     non_opening_txns = []
@@ -5373,7 +5494,10 @@ async def distributor_ledger(
     if opening_txn is not None or _safe_float(dist.get("opening_balance", 0)) != 0:
         ledger_txns.append(opening_txn or _opening_balance_transaction(dist))
     ledger_txns.extend(non_opening_txns)
-    ledger_txns = _dedupe_distributor_opening_balance_rows(ledger_txns, str(dist.get("id") or did))
+    ledger_txns = _dedupe_distributor_purchase_invoice_rows(
+        _dedupe_distributor_opening_balance_rows(ledger_txns, str(dist.get("id") or did)),
+        str(dist.get("id") or did),
+    )
     ledger_txns.sort(key=_distributor_fifo_sort_key)
     available_financial_years = _available_financial_years(ledger_txns)
     financial_year_metadata = _distributor_financial_year_metadata(
@@ -6516,18 +6640,30 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
         distributor_query["id"] = distributor_id
 
     distributors = await db.distributors.find(distributor_query, {"_id": 0}).to_list(1000)
-    distributor_lookup = {d.get("id"): d for d in distributors}
-
-    txn_query = {"created_at": {"$regex": f"^{month}"}}
-    if distributor_id:
-        txn_query["distributor_id"] = distributor_id
-
-    transactions = await db.distributor_transactions.find(txn_query, {"_id": 0}).to_list(5000)
+    all_txns = await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000)
+    purchase_orders = await db.purchase_orders.find({}, {"_id": 0}).to_list(10000)
 
     summaries = {}
     for distributor in distributors:
         did = distributor.get("id")
-        summaries[did] = {
+        identity_values = _distributor_identity_values(distributor, distributor_id)
+        names = {
+            str(distributor.get(field)).strip().casefold()
+            for field in ("name", "distributor_name")
+            if distributor.get(field) and str(distributor.get(field)).strip()
+        }
+        dist_txns = [txn for txn in all_txns if _belongs_to_distributor(txn, identity_values, names)]
+        matching_pos = [po for po in purchase_orders if _belongs_to_distributor(po, identity_values, names)]
+        for po in matching_pos:
+            dist_txns.append(_purchase_order_ledger_transaction(po, str(did or distributor_id or "")))
+
+        ledger_txns = _distributor_opening_balance_deduped_transactions(distributor, dist_txns)
+        month_txns = [
+            txn for txn in ledger_txns
+            if (txn_date := _distributor_transaction_date(txn)) and txn_date.strftime("%Y-%m") == month
+        ]
+
+        summary = {
             "distributor_id": did,
             "distributor_name": distributor.get("name", ""),
             "month": month,
@@ -6539,58 +6675,22 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
             "transactions": [],
         }
 
-    opening_txns_by_distributor = {}
-    for txn in transactions:
-        did = txn.get("distributor_id")
-        distributor = distributor_lookup.get(did, {})
-        if _is_opening_balance_transaction(txn, did):
-            opening_txns_by_distributor.setdefault(
-                did,
-                _normalize_opening_balance_transaction(txn, distributor),
-            )
+        for txn in month_txns:
+            amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
+            bucket = _apply_distributor_transaction(0, txn)[1]
+            if bucket == "purchase":
+                summary["purchase_total"] += amount
+                summary["net_change"] += amount
+            elif bucket == "adjustment":
+                summary["adjustment_total"] += amount
+                summary["net_change"] -= amount
+            else:
+                summary["payment_total"] += amount
+                summary["net_change"] -= amount
+            summary["transaction_count"] += 1
+            summary["transactions"].append(_json_safe_ledger_transaction(txn))
 
-    for txn in transactions:
-        did = txn.get("distributor_id")
-        if did not in summaries:
-            distributor = distributor_lookup.get(did, {})
-            summaries[did] = {
-                "distributor_id": did,
-                "distributor_name": distributor.get("name", ""),
-                "month": month,
-                "purchase_total": 0.0,
-                "payment_total": 0.0,
-                "adjustment_total": 0.0,
-                "net_change": 0.0,
-                "transaction_count": 0,
-                "transactions": [],
-            }
-
-        distributor = distributor_lookup.get(did, {})
-        if _is_duplicate_opening_balance_row(
-            txn,
-            distributor,
-            opening_txns_by_distributor.get(did),
-        ):
-            continue
-
-        amount = float(txn.get("amount", 0) or 0)
-        summary = summaries[did]
-
-        if _is_opening_balance_transaction(txn, did):
-            summary["purchase_total"] += amount
-            summary["net_change"] += amount
-        elif txn.get("type") in ["purchase", "sale"]:
-            summary["purchase_total"] += amount
-            summary["net_change"] += amount
-        elif txn.get("type") == "payment":
-            summary["payment_total"] += amount
-            summary["net_change"] -= amount
-        elif txn.get("type") == "purchase_return":
-            summary["adjustment_total"] += amount
-            summary["net_change"] -= amount
-
-        summary["transaction_count"] += 1
-        summary["transactions"].append(txn)
+        summaries[did] = summary
 
     items = []
     total_purchases = 0.0
