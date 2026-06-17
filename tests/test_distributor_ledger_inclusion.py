@@ -285,6 +285,7 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         purchase_rows = [row for row in result["transactions"] if row.get("type") == "purchase"]
         self.assertEqual(len(purchase_rows), 1)
         self.assertEqual(purchase_rows[0]["purchase_order_id"], "po-100")
+        self.assertEqual(purchase_rows[0]["items"], [{"name": "Med"}])
         self.assertEqual(purchase_rows[0]["running_balance"], 123.46)
         self.assertEqual(result["total_purchases"], 123.46)
         self.assertEqual(result["total_paid"], 23.46)
@@ -306,6 +307,42 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual([row["id"] for row in result["transactions"]], ["p1", "p2"])
         self.assertEqual([row["running_balance"] for row in result["transactions"]], [50, 100])
         self.assertEqual(result["total_purchases"], 100)
+
+    async def test_payments_with_same_invoice_identity_are_not_deduped(self):
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+            [
+                {"id": "p1", "distributor_id": "d1", "type": "purchase", "amount": 100,
+                 "invoice_no": "INV-PAY", "created_at": "2026-05-10"},
+                {"id": "pay-1", "distributor_id": "d1", "type": "payment", "amount": 25,
+                 "receipt_invoice_no": "INV-PAY", "created_at": "2026-05-11"},
+                {"id": "pay-2", "distributor_id": "d1", "type": "payment", "amount": 25,
+                 "receipt_invoice_no": "INV-PAY", "created_at": "2026-05-11"},
+            ],
+            [],
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["p1", "pay-1", "pay-2"])
+        self.assertEqual(result["total_paid"], 50)
+        self.assertEqual(result["balance"], 50)
+
+    async def test_po_metadata_dedupe_preserves_existing_ledger_amount_when_amounts_differ(self):
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+            [
+                {"id": "txn-purchase", "distributor_id": "d1", "type": "purchase", "amount": 99.99,
+                 "purchase_order_id": "po-amount", "created_at": "2026-05-10"},
+            ],
+            [
+                {"id": "po-amount", "distributor_id": "d1", "po_no": "PO-AMOUNT",
+                 "grand_total": 100.01, "po_date": "2026-05-10", "items": [{"name": "Med"}]},
+            ],
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["purchase-order-po-amount"])
+        self.assertEqual(result["transactions"][0]["items"], [{"name": "Med"}])
+        self.assertEqual(result["transactions"][0]["amount"], 99.99)
+        self.assertEqual(result["balance"], 99.99)
 
     async def test_monthly_summary_keeps_previous_non_ledger_deduped_purchase_set(self):
         fake_db = SimpleNamespace(
