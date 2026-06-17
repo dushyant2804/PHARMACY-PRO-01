@@ -5644,6 +5644,267 @@ def _with_distributor_ledger_debug_fields(txn: dict, distributor_id: str | None 
     return debugged
 
 
+FORENSIC_DISTRIBUTOR_NAMES = (
+    "ABHI ENTERPRISES",
+    "ARORA MEDICOSE",
+    "BALAJI PHARMA",
+    "KAPIL MEDICOSE",
+    "KISSAN MEDICAL AGENCY",
+    "MIDHA DISTRIBUTORS",
+    "R K PHARMA",
+    "VISHAL SURGICAL",
+)
+
+
+def _forensic_row_identity(txn: dict) -> str:
+    return "|".join(str(txn.get(field) or "") for field in (
+        "backend_row_source", "source", "transaction_id", "id",
+        "purchase_order_id", "purchase_order_object_id",
+    ))
+
+
+def _forensic_row(txn: dict, distributor_id: str | None = None) -> dict:
+    row = _with_distributor_ledger_debug_fields(txn, distributor_id)
+    row_date = _distributor_transaction_date(row)
+    invoice_variants = _debug_purchase_invoice_identity(row)
+    return _json_safe_ledger_transaction({
+        "date": row_date.isoformat() if row_date else None,
+        "type": row.get("type"),
+        "amount": row.get("amount"),
+        "invoice_ref": (
+            row.get("invoice_number") or row.get("invoice_no") or row.get("invoice_ref")
+            or row.get("bill_number") or row.get("bill_no") or row.get("reference_number")
+            or row.get("reference")
+        ),
+        "source": row.get("backend_row_source") or row.get("source"),
+        "is_synthetic": bool(row.get("is_synthetic")),
+        "transaction_id": _serializable_transaction_id(row.get("transaction_id") or row.get("id")),
+        "purchase_order_id": _serializable_transaction_id(
+            row.get("purchase_order_id") or row.get("po_id") or row.get("matched_purchase_order_id")
+        ),
+        "opening_balance": bool(row.get("is_opening_balance") or _is_explicit_opening_balance_transaction(row, distributor_id)),
+        "generated_synthetic": bool(row.get("is_system_generated") or row.get("is_synthetic")),
+        "dedupe_key": _debug_purchase_invoice_dedupe_key(row, distributor_id),
+        "invoice_identity_variants": invoice_variants,
+        "raw_id": _serializable_transaction_id(row.get("id")),
+        "skip_reason": row.get("synthetic_purchase_order_skip_reason") or row.get("_debug_skip_reason"),
+    }, include_items=False)
+
+
+def _forensic_duplicate_fingerprint(row: dict) -> tuple:
+    if row.get("dedupe_key"):
+        return ("purchase_identity", tuple(row.get("dedupe_key") or []))
+    return (
+        row.get("type"),
+        row.get("date"),
+        _round_ledger_money(row.get("amount")),
+        tuple(row.get("invoice_identity_variants") or []),
+        row.get("invoice_ref"),
+    )
+
+
+def _forensic_removed_reason(before: dict, after_rows: list[dict], distributor_id: str) -> dict:
+    after_keys = {
+        key
+        for row in after_rows
+        for key in _purchase_invoice_identity_keys(row, distributor_id)
+    }
+    before_keys = set(_purchase_invoice_identity_keys(before, distributor_id))
+    if before_keys & after_keys:
+        return {
+            "rule": "display purchase invoice dedupe",
+            "duplicate_reason": "shared distributor/invoice/date/amount or purchase_order_id identity with retained row",
+            "correctness": "needs human review against live source documents",
+        }
+    if _is_duplicate_opening_balance_row(before, {"id": distributor_id}, None):
+        return {
+            "rule": "opening balance duplicate suppression",
+            "duplicate_reason": "row was labelled as opening balance and matched opening-balance amount/reference/date",
+            "correctness": "correct if this is a legacy opening-balance mirror row",
+        }
+    return {
+        "rule": "unknown/non-display removal",
+        "duplicate_reason": "row is absent after canonicalization but no forensic rule matched",
+        "correctness": "incorrect until proven otherwise",
+    }
+
+
+def _admin_debug_distributor_ledger_row(txn: dict, distributor_id: str | None = None) -> dict:
+    row = _with_distributor_ledger_debug_fields(txn, distributor_id)
+    row_date = _distributor_transaction_date(row)
+    return _json_safe_ledger_transaction({
+        "date": row_date.isoformat() if row_date else None,
+        "type": row.get("type"),
+        "amount": row.get("amount"),
+        "invoice_no": row.get("invoice_no") or row.get("invoice_number"),
+        "invoice_ref": row.get("invoice_ref") or row.get("invoice_number"),
+        "bill_no": row.get("bill_no") or row.get("bill_number"),
+        "reference_no": row.get("reference_no") or row.get("reference_number") or row.get("reference"),
+        "source": row.get("backend_row_source") or row.get("source"),
+        "is_synthetic": bool(row.get("is_synthetic")),
+        "transaction_id": _serializable_transaction_id(row.get("transaction_id") or row.get("id")),
+        "purchase_order_id": _serializable_transaction_id(
+            row.get("purchase_order_id") or row.get("po_id") or row.get("matched_purchase_order_id")
+        ),
+        "dedupe_key": _debug_purchase_invoice_dedupe_key(row, distributor_id),
+        "opening_balance": bool(
+            row.get("is_opening_balance")
+            or _is_explicit_opening_balance_transaction(row, distributor_id)
+        ),
+        "created_at": row.get("created_at"),
+    }, include_items=False)
+
+
+async def _admin_distributor_ledger_debug_report(distributor_id: str) -> dict:
+    dist = await db.distributors.find_one({"id": distributor_id}, {"_id": 0})
+    if not dist:
+        candidates = await db.distributors.find({}).to_list(5000)
+        dist = next((row for row in candidates if distributor_id in _distributor_identity_values(row)), None)
+    if not dist:
+        raise HTTPException(status_code=404, detail="Distributor not found")
+    if dist.get("_id") is not None:
+        dist["_legacy_object_id"] = str(dist.pop("_id"))
+
+    identity_values = _distributor_identity_values(dist, distributor_id)
+    names = {
+        str(dist.get(field)).strip().casefold()
+        for field in ("name", "distributor_name")
+        if dist.get(field) and str(dist.get(field)).strip()
+    }
+    raw_transactions = await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000)
+    raw_purchase_orders = (
+        await db.purchase_orders.find({}, {"_id": 0}).to_list(10000)
+        if hasattr(db, "purchase_orders")
+        else []
+    )
+    matching_transactions = [
+        txn for txn in raw_transactions
+        if _belongs_to_distributor(txn, identity_values, names)
+    ]
+    matching_purchase_orders = [
+        po for po in raw_purchase_orders
+        if _belongs_to_distributor(po, identity_values, names)
+    ]
+
+    canonical_rows = await _canonical_distributor_ledger_transactions(
+        dist,
+        distributor_id,
+        raw_transactions=raw_transactions,
+        purchase_orders=raw_purchase_orders,
+    )
+    final_rows = _dedupe_distributor_purchase_invoice_rows(
+        canonical_rows,
+        str(dist.get("id") or distributor_id),
+    )
+    final_identities = {_forensic_row_identity(row) for row in final_rows}
+    removed_rows = [
+        row for row in canonical_rows
+        if _forensic_row_identity(row) not in final_identities
+    ]
+
+    synthetic_po_rows = [
+        row for row in canonical_rows
+        if row.get("backend_row_source") == "purchase_orders" and row.get("is_synthetic")
+    ]
+
+    return {
+        "distributor": {
+            "id": dist.get("id") or distributor_id,
+            "name": dist.get("name") or dist.get("distributor_name"),
+        },
+        "counts": {
+            "raw_distributor_transactions": len(matching_transactions),
+            "raw_purchase_orders": len(matching_purchase_orders),
+            "synthetic_po_rows_generated": len(synthetic_po_rows),
+            "rows_removed_by_dedupe": len(removed_rows),
+            "final_rows_returned": len(final_rows),
+        },
+        "rows_before_dedupe": [
+            _admin_debug_distributor_ledger_row(row, str(dist.get("id") or distributor_id))
+            for row in canonical_rows
+        ],
+        "synthetic_po_rows_generated": [
+            _admin_debug_distributor_ledger_row(row, str(dist.get("id") or distributor_id))
+            for row in synthetic_po_rows
+        ],
+        "rows_removed_by_dedupe": [
+            _admin_debug_distributor_ledger_row(row, str(dist.get("id") or distributor_id))
+            for row in removed_rows
+        ],
+        "final_rows_returned": [
+            _admin_debug_distributor_ledger_row(row, str(dist.get("id") or distributor_id))
+            for row in final_rows
+        ],
+    }
+
+
+@api_router.get("/admin/distributor-ledger-debug/{distributor_id}")
+async def admin_distributor_ledger_debug(
+    distributor_id: str,
+    user: dict = Depends(require_role("admin")),
+):
+    return await _admin_distributor_ledger_debug_report(distributor_id)
+
+
+async def _distributor_ledger_forensic_audit_for_dist(dist: dict, requested_id: str | None = None) -> dict:
+    did = str(dist.get("id") or requested_id or "")
+    before = await _canonical_distributor_ledger_transactions(dist, requested_id)
+    after = _dedupe_distributor_purchase_invoice_rows(before, did)
+    before_report = [_forensic_row(row, did) for row in before]
+    after_report = [_forensic_row(row, did) for row in after]
+    after_identities = {_forensic_row_identity(row) for row in after}
+
+    removed = []
+    for row in before:
+        if _forensic_row_identity(row) in after_identities:
+            continue
+        report_row = _forensic_row(row, did)
+        report_row["removal_analysis"] = _forensic_removed_reason(row, after, did)
+        removed.append(report_row)
+
+    grouped: dict[tuple, list[dict]] = defaultdict(list)
+    for row in after_report:
+        grouped[_forensic_duplicate_fingerprint(row)].append(row)
+    surviving_duplicates = [
+        {
+            "fingerprint": [str(part) for part in fingerprint],
+            "rows": rows,
+            "explanation": (
+                "purchase rows survived because they do not share a purchase invoice dedupe key"
+                if fingerprint and fingerprint[0] == "purchase_identity"
+                else "non-purchase rows survive because display dedupe intentionally only collapses purchase/sale invoice identities"
+            ),
+        }
+        for fingerprint, rows in grouped.items()
+        if len(rows) > 1
+    ]
+
+    return {
+        "distributor": {"id": did, "name": dist.get("name") or dist.get("distributor_name")},
+        "before_dedupe": before_report,
+        "after_dedupe": after_report,
+        "removed_rows": removed,
+        "surviving_duplicate_pairs": surviving_duplicates,
+        "counts": {
+            "before": len(before_report),
+            "after": len(after_report),
+            "removed": len(removed),
+            "surviving_duplicate_groups": len(surviving_duplicates),
+        },
+    }
+
+
+@api_router.get("/ledger/distributor-forensic-audit")
+async def distributor_ledger_forensic_audit(user: dict = Depends(require_role("admin"))):
+    distributors = await db.distributors.find({}, {"_id": 0}).to_list(10000)
+    wanted = {name.casefold() for name in FORENSIC_DISTRIBUTOR_NAMES}
+    reports = []
+    for dist in distributors:
+        if str(dist.get("name") or dist.get("distributor_name") or "").strip().casefold() in wanted:
+            reports.append(await _distributor_ledger_forensic_audit_for_dist(dist, dist.get("id")))
+    return {"distributors": reports}
+
+
 def _distributor_ledger_totals(transactions: list[dict]) -> dict:
     balance = 0.0
     totals = {"total_purchases": 0.0, "total_paid": 0.0, "total_adjustments": 0.0, "balance": 0.0}

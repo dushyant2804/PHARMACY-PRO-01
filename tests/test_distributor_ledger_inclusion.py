@@ -6,7 +6,11 @@ from unittest.mock import patch
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "pharmacy_test")
 
-from server import distributor_ledger
+from server import (
+    distributor_ledger,
+    _admin_distributor_ledger_debug_report,
+    _distributor_ledger_forensic_audit_for_dist,
+)
 
 
 class Cursor:
@@ -77,6 +81,67 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(sum(row["type"] == "purchase" for row in rows), 1)
         self.assertEqual(sum(row["type"] == "payment" for row in rows), 1)
+
+    async def test_forensic_audit_reports_before_after_removed_purchase_duplicate_and_surviving_payments(self):
+        dist = {"id": "d1", "name": "Supplier", "opening_balance": 0}
+        fake_db = SimpleNamespace(
+            distributors=Collection([dist]),
+            distributor_transactions=Collection([
+                {"id": "txn-po", "distributor_id": "d1", "type": "purchase", "amount": 125,
+                 "invoice_number": "(Q) 4557", "created_at": "2026-04-01"},
+                {"id": "txn-import", "distributor_id": "d1", "type": "purchase", "amount": 125,
+                 "bill_number": "4557", "created_at": "2026-04-01"},
+                {"id": "pay-1", "distributor_id": "d1", "type": "payment", "amount": 50,
+                 "reference_number": "ALLOC", "created_at": "2026-04-02"},
+                {"id": "pay-2", "distributor_id": "d1", "type": "payment", "amount": 50,
+                 "reference_number": "ALLOC", "created_at": "2026-04-02"},
+            ]),
+            purchase_orders=Collection([
+                {"id": "po-1", "distributor_id": "d1", "po_no": "PO-1",
+                 "invoice_ref": "4557", "grand_total": 125, "po_date": "2026-04-01"},
+            ]),
+        )
+        with patch("server.db", fake_db):
+            report = await _distributor_ledger_forensic_audit_for_dist(dist, "d1")
+
+        self.assertEqual(report["counts"]["before"], 4)
+        self.assertEqual(report["counts"]["after"], 3)
+        self.assertEqual(report["removed_rows"][0]["removal_analysis"]["rule"], "display purchase invoice dedupe")
+        payment_duplicate = next(
+            group for group in report["surviving_duplicate_pairs"]
+            if group["rows"][0]["type"] == "payment"
+        )
+        self.assertIn("display dedupe intentionally only collapses purchase", payment_duplicate["explanation"])
+
+    async def test_admin_distributor_ledger_debug_reports_raw_counts_and_rows(self):
+        fake_db = SimpleNamespace(
+            distributors=Collection([{"id": "d1", "name": "Supplier", "opening_balance": 0}]),
+            distributor_transactions=Collection([
+                {"id": "txn-po", "distributor_id": "d1", "type": "purchase", "amount": 125,
+                 "invoice_number": "(Q) 4557", "created_at": "2026-04-01"},
+                {"id": "txn-import", "distributor_id": "d1", "type": "purchase", "amount": 125,
+                 "bill_number": "4557", "created_at": "2026-04-01"},
+                {"id": "pay-1", "distributor_id": "d1", "type": "payment", "amount": 50,
+                 "reference_number": "ALLOC", "created_at": "2026-04-02"},
+            ]),
+            purchase_orders=Collection([
+                {"id": "po-1", "distributor_id": "d1", "po_no": "PO-1",
+                 "invoice_ref": "4557", "grand_total": 125, "po_date": "2026-04-01"},
+                {"id": "po-2", "distributor_id": "d1", "po_no": "PO-2",
+                 "invoice_ref": "NEW", "grand_total": 75, "po_date": "2026-04-03"},
+            ]),
+        )
+        with patch("server.db", fake_db):
+            report = await _admin_distributor_ledger_debug_report("d1")
+
+        self.assertEqual(report["counts"]["raw_distributor_transactions"], 3)
+        self.assertEqual(report["counts"]["raw_purchase_orders"], 2)
+        self.assertEqual(report["counts"]["synthetic_po_rows_generated"], 1)
+        self.assertEqual(report["counts"]["rows_removed_by_dedupe"], 1)
+        self.assertEqual(report["counts"]["final_rows_returned"], 3)
+        self.assertEqual(report["rows_removed_by_dedupe"][0]["source"], "distributor_transactions")
+        self.assertEqual(report["synthetic_po_rows_generated"][0]["source"], "purchase_orders")
+        self.assertIn("dedupe_key", report["final_rows_returned"][0])
 
     async def test_filters_apply_only_when_explicitly_provided(self):
         args = (
