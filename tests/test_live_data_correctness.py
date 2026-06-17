@@ -194,8 +194,8 @@ class LiveDataCorrectnessTests(unittest.IsolatedAsyncioTestCase):
 from server import distributor_ledger
 
 
-class DistributorCanonicalAccountingRegressionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_midha_style_list_and_ledger_balances_match_after_po_dedupe(self):
+class DistributorListBalanceRestorationRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_distributor_list_balance_uses_transaction_logic_not_ledger_po_rows(self):
         db = SimpleNamespace(
             distributors=Collection([{"id": "midha", "name": "MIDHA DISTRIBUTORS"}]),
             distributor_transactions=Collection([
@@ -213,19 +213,18 @@ class DistributorCanonicalAccountingRegressionTests(unittest.IsolatedAsyncioTest
             listed = await list_distributors(user={})
             ledger = await distributor_ledger("midha", user={})
 
-        self.assertEqual(listed[0]["current_balance"], ledger["balance"])
-        self.assertEqual(listed[0]["outstanding_balance"], ledger["balance"])
+        self.assertEqual(listed[0]["current_balance"], 13772.01)
+        self.assertEqual(listed[0]["outstanding_balance"], 13772.01)
+        self.assertEqual(listed[0]["total_purchases"], 35037.01)
         self.assertEqual(ledger["total_purchases"], 35037.01)
         self.assertEqual(ledger["total_paid"], 21265)
         self.assertEqual(ledger["balance"], 13772.01)
         self.assertEqual(ledger["transactions"][-1]["running_balance"], ledger["balance"])
 
-    async def test_abhi_style_list_and_ledger_balances_match_after_po_dedupe(self):
+    async def test_distributor_list_balance_is_not_recalculated_from_ledger_bottom_summary(self):
         db = SimpleNamespace(
             distributors=Collection([{"id": "abhi", "name": "ABHI ENTERPRISES"}]),
             distributor_transactions=Collection([
-                {"id": "t-inv", "distributor_id": "abhi", "type": "purchase", "amount": 50254,
-                 "invoice_no": "A-100", "created_at": "2026-05-01"},
                 {"id": "pay", "distributor_id": "abhi", "type": "payment", "amount": 36649,
                  "created_at": "2026-05-02"},
             ]),
@@ -238,8 +237,9 @@ class DistributorCanonicalAccountingRegressionTests(unittest.IsolatedAsyncioTest
             listed = await list_distributors(user={})
             ledger = await distributor_ledger("abhi", user={})
 
-        self.assertEqual(listed[0]["current_balance"], ledger["balance"])
-        self.assertEqual(listed[0]["outstanding_balance"], ledger["balance"])
+        self.assertEqual(listed[0]["current_balance"], -36649)
+        self.assertEqual(listed[0]["outstanding_balance"], -36649)
+        self.assertEqual(listed[0]["total_purchases"], 0)
         self.assertEqual(ledger["total_purchases"], 50254)
         self.assertEqual(ledger["total_paid"], 36649)
         self.assertEqual(ledger["balance"], 13605)

@@ -307,7 +307,7 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual([row["running_balance"] for row in result["transactions"]], [50, 100])
         self.assertEqual(result["total_purchases"], 100)
 
-    async def test_monthly_summary_uses_deduped_purchase_invoice_set(self):
+    async def test_monthly_summary_keeps_previous_non_ledger_deduped_purchase_set(self):
         fake_db = SimpleNamespace(
             distributors=Collection([{"id": "d1", "name": "Supplier", "opening_balance": 0}]),
             distributor_transactions=Collection([
@@ -324,7 +324,7 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         with patch("server.db", fake_db):
             result = await _distributor_monthly_summary_data("2026-05", "d1")
 
-        self.assertEqual(result["purchase_total"], 80)
+        self.assertEqual(result["purchase_total"], 160)
         self.assertEqual(result["payment_total"], 30)
-        self.assertEqual(result["net_change"], 50)
-        self.assertEqual(result["items"][0]["transaction_count"], 2)
+        self.assertEqual(result["net_change"], 130)
+        self.assertEqual(result["items"][0]["transaction_count"], 3)
