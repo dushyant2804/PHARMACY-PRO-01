@@ -387,6 +387,54 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(result["total_purchases"], 1250)
         self.assertEqual(result["balance"], 1250)
 
+    async def test_abhi_synthetic_po_duplicate_opening_balance_is_removed_from_display_only(self):
+        distributors = [{
+            "id": "abhi",
+            "name": "ABHI ENTERPRISES",
+            "opening_balance": 7043,
+            "opening_balance_date": "2025-12-11",
+            "opening_balance_invoice_number": "(Q) 4557",
+        }]
+        transactions = [{
+            "id": "opening-balance-abhi",
+            "distributor_id": "abhi",
+            "type": "opening_balance",
+            "amount": 7043,
+            "invoice_number": "(Q) 4557",
+            "source": "opening_balance",
+            "is_synthetic": True,
+            "created_at": "2025-12-11",
+        }]
+        purchase_orders = [{
+            "id": "3abb878c-98d5-4c91-8aab-9d78336ca2f8",
+            "distributor_id": "abhi",
+            "invoice_ref": "(Q)4557",
+            "grand_total": 7043,
+            "po_date": "2025-12-11",
+            "items": [{"name": "Med"}],
+        }]
+
+        result = await self.ledger(distributors, transactions, purchase_orders, did="abhi")
+        self.assertEqual([row["type"] for row in result["transactions"]], ["opening_balance"])
+        self.assertEqual(result["transactions"][0]["invoice_number"], "(Q) 4557")
+        self.assertFalse(any(row.get("purchase_order_id") == "3abb878c-98d5-4c91-8aab-9d78336ca2f8" for row in result["transactions"]))
+        self.assertEqual(result["balance"], 7043)
+        self.assertEqual(result["total_purchases"], 7043)
+
+        fake_db = SimpleNamespace(
+            distributors=Collection(distributors),
+            distributor_transactions=Collection(transactions),
+            purchase_orders=Collection(purchase_orders),
+        )
+        with patch("server.db", fake_db):
+            report = await _admin_distributor_ledger_debug_report("abhi")
+
+        self.assertEqual(report["counts"]["synthetic_po_rows_generated"], 1)
+        self.assertEqual(report["counts"]["rows_removed_by_dedupe"], 1)
+        self.assertEqual(report["rows_removed_by_dedupe"][0]["source"], "purchase_orders")
+        self.assertEqual(report["rows_removed_by_dedupe"][0]["purchase_order_id"], "3abb878c-98d5-4c91-8aab-9d78336ca2f8")
+        self.assertEqual(report["final_rows_returned"][0]["type"], "opening_balance")
+
     async def test_same_date_and_amount_with_different_invoice_refs_remain_separate(self):
         result = await self.ledger(
             [{"id": "d1", "name": "Supplier", "opening_balance": 0}],

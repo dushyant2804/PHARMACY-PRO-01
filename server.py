@@ -5365,6 +5365,34 @@ def _canonical_purchase_invoice_display_row(existing: dict, candidate: dict) -> 
     return canonical
 
 
+
+def _synthetic_po_matches_opening_balance_display_row(candidate: dict, opening_row: dict, distributor_id: str | None = None) -> bool:
+    """Display-only guard for PO rows that mirror a generated opening balance."""
+    if not isinstance(candidate, dict) or not isinstance(opening_row, dict):
+        return False
+    if str(candidate.get("type") or "").strip().lower() != "purchase":
+        return False
+    if not (candidate.get("is_synthetic") and candidate.get("backend_row_source") == "purchase_orders"):
+        return False
+    opening_distributor_id = str(distributor_id or opening_row.get("distributor_id") or "").strip()
+    candidate_distributor_id = str(distributor_id or candidate.get("distributor_id") or "").strip()
+    if opening_distributor_id != candidate_distributor_id:
+        return False
+    if not (opening_row.get("is_opening_balance") or _is_explicit_opening_balance_transaction(opening_row, opening_distributor_id)):
+        return False
+    if _distributor_transaction_date(candidate) != _distributor_transaction_date(opening_row):
+        return False
+    if _ledger_amount_key(candidate.get("amount")) != _ledger_amount_key(opening_row.get("amount")):
+        return False
+    return bool(_purchase_invoice_reference_values(candidate) & _purchase_invoice_reference_values(opening_row))
+
+
+def _synthetic_po_opening_balance_skip_reason(candidate: dict, transactions: list[dict], distributor_id: str | None = None) -> str | None:
+    for opening_row in transactions:
+        if _synthetic_po_matches_opening_balance_display_row(candidate, opening_row, distributor_id):
+            return "matched synthetic/generated opening balance by distributor, date, rounded amount, and normalized invoice identity"
+    return None
+
 def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distributor_id: str | None = None) -> list[dict]:
     """Keep one purchase ledger row per distributor invoice identity; never dedupe payments."""
     selected_by_group: dict[int, dict] = {}
@@ -5373,6 +5401,12 @@ def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distribu
     next_group = 0
 
     for txn in transactions:
+        opening_balance_skip_reason = _synthetic_po_opening_balance_skip_reason(txn, transactions, distributor_id)
+        if opening_balance_skip_reason:
+            txn["synthetic_purchase_order_skipped"] = True
+            txn["synthetic_purchase_order_skip_reason"] = opening_balance_skip_reason
+            continue
+
         keys = _purchase_invoice_identity_keys(txn, distributor_id)
         if not keys:
             group_order.append(("row", txn))
