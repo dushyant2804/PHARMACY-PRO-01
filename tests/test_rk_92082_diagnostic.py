@@ -33,7 +33,9 @@ class RK92082DiagnosticTests(unittest.TestCase):
             "distributor_id": "rk",
             "amount": 92082,
             "type": "purchase",
+            "source_type": "purchase_order",
             "entry_source": "distributor_ledger",
+            "created_by": "admin-id",
             "reference": "Opening Balance",
             "invoice_ref": "INV-RK",
             "bill_ref": "BILL-RK",
@@ -49,6 +51,8 @@ class RK92082DiagnosticTests(unittest.TestCase):
 
         self.assertEqual(output["_id"], "mongo-id")
         self.assertEqual(output["distributor_name"], "R K PHARMA")
+        self.assertEqual(output["source_type"], "purchase_order")
+        self.assertEqual(output["created_by"], "admin-id")
         self.assertEqual(output["raw_json"], row)
         self.assertEqual(
             output["opening_balance_fields_or_metadata"],

@@ -491,10 +491,8 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         with patch("server.db", fake_db):
             report = await _admin_distributor_ledger_debug_report("abhi")
 
-        self.assertEqual(report["counts"]["synthetic_po_rows_generated"], 1)
-        self.assertEqual(report["counts"]["rows_removed_by_dedupe"], 1)
-        self.assertEqual(report["rows_removed_by_dedupe"][0]["source"], "purchase_orders")
-        self.assertEqual(report["rows_removed_by_dedupe"][0]["purchase_order_id"], "3abb878c-98d5-4c91-8aab-9d78336ca2f8")
+        self.assertEqual(report["counts"]["synthetic_po_rows_generated"], 0)
+        self.assertEqual(report["counts"]["rows_removed_by_dedupe"], 0)
         self.assertEqual(report["final_rows_returned"][0]["type"], "opening_balance")
 
     async def test_arora_opening_balance_duplicate_po_is_removed_despite_amount_difference(self):
@@ -741,6 +739,36 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         )
         self.assertEqual(result["transactions"][0]["backend_row_source"], "distributor_transactions")
         self.assertFalse(result["transactions"][0]["is_synthetic"])
+        self.assertEqual(result["total_purchases"], 92082)
+        self.assertEqual(result["balance"], 92082)
+
+    async def test_rk_opening_balance_05261_excludes_synthetic_in05261_purchase(self):
+        result = await self.ledger(
+            [{
+                "id": "rk",
+                "name": "R K PHARMA",
+                "opening_balance": 92082,
+                "opening_balance_date": "2026-04-01",
+                "opening_balance_invoice_number": "05261",
+            }],
+            [],
+            [{
+                "id": "po-rk-in05261",
+                "distributor_id": "rk",
+                "po_no": "PO-RK-05261",
+                "invoice_ref": "IN05261",
+                "grand_total": 92082,
+                "po_date": "2026-04-01",
+                "created_at": "2026-04-01T12:00:00+00:00",
+            }],
+            did="rk",
+        )
+
+        self.assertEqual(
+            [row["id"] for row in result["transactions"]],
+            ["opening-balance-rk"],
+        )
+        self.assertEqual(result["transactions"][0]["type"], "opening_balance")
         self.assertEqual(result["total_purchases"], 92082)
         self.assertEqual(result["balance"], 92082)
 

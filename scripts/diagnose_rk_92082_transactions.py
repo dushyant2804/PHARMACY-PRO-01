@@ -143,7 +143,14 @@ def diagnostic_row(
         "amount": json_safe(row.get("amount")),
         "transaction_type": json_safe(row.get("transaction_type")),
         "type": json_safe(row.get("type")),
+        "source_type": json_safe(row.get("source_type")),
         "entry_source": json_safe(row.get("entry_source")),
+        "created_by": json_safe(
+            row.get("created_by")
+            or row.get("created_by_user")
+            or row.get("user_id")
+            or row.get("created_by_id")
+        ),
         "reference": json_safe(row.get("reference")),
         "reference_number": json_safe(row.get("reference_number")),
         "invoice_ref": json_safe(row.get("invoice_ref")),
@@ -222,7 +229,32 @@ async def run_diagnostic(
                 "matching_row_count": len(rows),
                 "matching_rows": rows,
             })
-        return {"read_only": True, "rk_distributors": reports}
+
+        purchase_orders = await database.purchase_orders.find({}).to_list(length=None)
+        matching_purchase_orders = []
+        for distributor in rk_distributors:
+            identities = distributor_identity_values(distributor)
+            names = {
+                normalized(distributor.get(field))
+                for field in ("name", "distributor_name")
+                if distributor.get(field)
+            }
+            for purchase_order in purchase_orders:
+                if not belongs_to_distributor(purchase_order, identities, names):
+                    continue
+                reasons = row_matches(purchase_order, requested_references)
+                if reasons:
+                    matching_purchase_orders.append({
+                        "match_reasons": reasons,
+                        "distributor_name": distributor.get("name"),
+                        "raw_json": json_safe(purchase_order),
+                    })
+
+        return {
+            "read_only": True,
+            "rk_distributors": reports,
+            "matching_purchase_orders": matching_purchase_orders,
+        }
     finally:
         client.close()
 
