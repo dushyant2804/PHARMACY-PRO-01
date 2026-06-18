@@ -5310,6 +5310,17 @@ def _distributor_opening_balance_deduped_transactions(
     ):
         deduped.append(opening_txn or _opening_balance_transaction(distributor))
     deduped.extend(non_opening_txns)
+    # Purchase orders are projected into the ledger as synthetic purchase rows.
+    # Suppress a PO mirror here, before any accounting consumer calculates
+    # balances, when its normalized invoice identity belongs to the opening
+    # balance.  Keeping this guard in the canonical opening-balance path also
+    # protects monthly summaries and rebuild/report callers that do not run the
+    # endpoint's later display-only purchase dedupe.
+    deduped = [
+        txn
+        for txn in deduped
+        if not _synthetic_po_opening_balance_skip_reason(txn, deduped, distributor_id)
+    ]
     return _dedupe_distributor_opening_balance_rows(deduped, distributor_id)
 
 
