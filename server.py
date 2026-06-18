@@ -5280,7 +5280,7 @@ def _ledger_invoice_identity_variants(value) -> set[str]:
     # one source and as the bare invoice number in another. Preserve the raw
     # normalized identity while adding the narrowly stripped canonical form.
     without_invoice_prefix = re.sub(
-        r"^(?:i\s*[\.\-]?\s*n\s*[\.\-]?|invoice|inv)\s*[:#.\-]?\s*",
+        r"^(?:invoice|inv|i\s*[\.\-]?\s*n\s*[\.\-]?)\s*[:#.\-]?\s*",
         "",
         normalized,
         flags=re.IGNORECASE,

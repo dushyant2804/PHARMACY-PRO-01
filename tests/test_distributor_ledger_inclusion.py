@@ -10,6 +10,9 @@ from server import (
     distributor_ledger,
     _admin_distributor_ledger_debug_report,
     _distributor_ledger_forensic_audit_for_dist,
+    _ledger_invoice_identity_variants,
+    _normalize_ledger_invoice_identity_value,
+    _purchase_invoice_identity_keys,
 )
 
 
@@ -597,6 +600,44 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual([row["id"] for row in result["transactions"]], [
             "txn-05287", "txn-05317", "txn-A000419",
         ])
+
+    def test_rk_invoice_prefixes_include_bare_canonical_identity_and_dedupe_key(self):
+        for invoice in (
+            "05287",
+            "IN 05287",
+            "I.N. 05287",
+            "IN05287",
+            "Invoice 05287",
+            "INV 05287",
+        ):
+            with self.subTest(invoice=invoice):
+                self.assertIn("05287", _ledger_invoice_identity_variants(invoice))
+
+        for invoice in ("A000419", "IN A000419", "I.N. A000419"):
+            with self.subTest(invoice=invoice):
+                self.assertIn("a000419", _ledger_invoice_identity_variants(invoice))
+
+        persisted = {
+            "distributor_id": "rk",
+            "type": "purchase",
+            "amount": 102,
+            "invoice_no": "05317",
+            "created_at": "2026-05-01",
+        }
+        synthetic = {
+            "distributor_id": "rk",
+            "type": "purchase",
+            "amount": 102,
+            "invoice_ref": "IN 05317",
+            "created_at": "2026-05-01",
+        }
+        self.assertEqual(_normalize_ledger_invoice_identity_value("IN 05317"), "in 05317")
+        shared_keys = (
+            set(_purchase_invoice_identity_keys(persisted, "rk"))
+            & set(_purchase_invoice_identity_keys(synthetic, "rk"))
+        )
+        self.assertEqual(len(shared_keys), 1)
+        self.assertEqual(next(iter(shared_keys))[:3], ("rk", "ref", "05317"))
 
     async def test_vishal_series_typo_and_date_tolerance_remove_synthetic_po_rows(self):
         result = await self.ledger(
