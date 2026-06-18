@@ -772,6 +772,60 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(result["total_purchases"], 92082)
         self.assertEqual(result["balance"], 92082)
 
+    async def test_rk_92082_debug_flag_exposes_mirror_rule_inputs_without_changing_ledger(self):
+        result = await self.ledger(
+            [{
+                "id": "rk",
+                "name": "R K PHARMA",
+                "opening_balance": 92082,
+                "opening_balance_date": "2026-04-01",
+                "opening_balance_invoice_number": "05261",
+            }],
+            [],
+            [{
+                "id": "po-rk-in05261",
+                "distributor_id": "rk",
+                "po_no": "PO-RK-05261",
+                "invoice_ref": "IN05261",
+                "grand_total": "92082.00",
+                "po_date": "2026-04-01",
+            }],
+            did="rk",
+            financial_year="All",
+            debug_rk_92082=True,
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["opening-balance-rk"])
+        debug = result["debug_rk_92082"]
+        self.assertTrue(debug["enabled"])
+        self.assertEqual(len(debug["all_opening_balance_candidates"]), 1)
+        self.assertEqual(len(debug["all_purchase_order_synthetic_candidates"]), 1)
+        po_row = next(row for row in debug["rows"] if row["source_collection"] == "purchase_orders")
+        self.assertEqual(po_row["source_id"], "po-rk-in05261")
+        self.assertEqual(po_row["amount_raw"], 92082)
+        self.assertEqual(po_row["amount_normalized"], 92082)
+        self.assertEqual(po_row["date_normalized"], "2026-04-01")
+        self.assertEqual(po_row["invoice_ref_raw"], "IN05261")
+        self.assertEqual(po_row["invoice_ref_normalized"], "in05261")
+        self.assertTrue(po_row["matched_opening_balance_mirror_rule"])
+        self.assertFalse(po_row["included_in_ledger"])
+        self.assertFalse(po_row["included_in_balance"])
+        self.assertTrue(all(
+            check["matched"]
+            for comparison in po_row["exclusion_checks"]
+            for check in comparison["checks"]
+        ))
+
+    async def test_rk_92082_debug_flag_is_not_returned_for_other_distributors(self):
+        result = await self.ledger(
+            [{"id": "other", "name": "OTHER PHARMA", "opening_balance": 0}],
+            [],
+            [],
+            did="other",
+            debug_rk_92082=True,
+        )
+        self.assertNotIn("debug_rk_92082", result)
+
     def test_rk_invoice_prefixes_include_bare_canonical_identity_and_dedupe_key(self):
         for invoice in (
             "05287",
