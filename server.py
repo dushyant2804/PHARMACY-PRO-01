@@ -5382,16 +5382,56 @@ def _synthetic_po_matches_opening_balance_display_row(candidate: dict, opening_r
         return False
     if _distributor_transaction_date(candidate) != _distributor_transaction_date(opening_row):
         return False
-    if _ledger_amount_key(candidate.get("amount")) != _ledger_amount_key(opening_row.get("amount")):
-        return False
-    return bool(_purchase_invoice_reference_values(candidate) & _purchase_invoice_reference_values(opening_row))
+    candidate_refs = _purchase_invoice_reference_values(candidate)
+    opening_refs = _purchase_invoice_reference_values(opening_row)
+    if candidate_refs and opening_refs:
+        return bool(candidate_refs & opening_refs)
+    return _ledger_amount_key(candidate.get("amount")) == _ledger_amount_key(opening_row.get("amount"))
 
 
 def _synthetic_po_opening_balance_skip_reason(candidate: dict, transactions: list[dict], distributor_id: str | None = None) -> str | None:
     for opening_row in transactions:
         if _synthetic_po_matches_opening_balance_display_row(candidate, opening_row, distributor_id):
-            return "matched synthetic/generated opening balance by distributor, date, rounded amount, and normalized invoice identity"
+            return "matched synthetic/generated opening balance by distributor, date, and normalized invoice identity (amount fallback only when invoice identity is missing)"
     return None
+
+
+def _synthetic_po_persisted_transaction_skip_reason(
+    candidate: dict,
+    transactions: list[dict],
+    distributor_id: str | None = None,
+) -> str | None:
+    """Prefer a persisted purchase row over its display-only synthetic PO mirror."""
+    if not isinstance(candidate, dict):
+        return None
+    if str(candidate.get("type") or "").strip().lower() != "purchase":
+        return None
+    if not (candidate.get("is_synthetic") and candidate.get("backend_row_source") == "purchase_orders"):
+        return None
+
+    candidate_distributor_id = str(distributor_id or candidate.get("distributor_id") or "").strip()
+    candidate_date = _distributor_transaction_date(candidate)
+    candidate_refs = _purchase_invoice_reference_values(candidate)
+    for persisted in transactions:
+        if persisted is candidate or persisted.get("backend_row_source") != "distributor_transactions":
+            continue
+        if str(persisted.get("type") or "").strip().lower() not in {"purchase", "sale"}:
+            continue
+        persisted_distributor_id = str(distributor_id or persisted.get("distributor_id") or "").strip()
+        if persisted_distributor_id != candidate_distributor_id:
+            continue
+        if _distributor_transaction_date(persisted) != candidate_date:
+            continue
+
+        persisted_refs = _purchase_invoice_reference_values(persisted)
+        if candidate_refs and persisted_refs:
+            if candidate_refs & persisted_refs:
+                return "matched persisted distributor transaction by distributor, date, and normalized invoice identity"
+            continue
+        if _ledger_amount_key(candidate.get("amount")) == _ledger_amount_key(persisted.get("amount")):
+            return "matched persisted distributor transaction by distributor, date, and rounded amount because invoice identity is missing"
+    return None
+
 
 def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distributor_id: str | None = None) -> list[dict]:
     """Keep one purchase ledger row per distributor invoice identity; never dedupe payments."""
@@ -5405,6 +5445,15 @@ def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distribu
         if opening_balance_skip_reason:
             txn["synthetic_purchase_order_skipped"] = True
             txn["synthetic_purchase_order_skip_reason"] = opening_balance_skip_reason
+            continue
+        persisted_skip_reason = _synthetic_po_persisted_transaction_skip_reason(
+            txn,
+            transactions,
+            distributor_id,
+        )
+        if persisted_skip_reason:
+            txn["synthetic_purchase_order_skipped"] = True
+            txn["synthetic_purchase_order_skip_reason"] = persisted_skip_reason
             continue
 
         keys = _purchase_invoice_identity_keys(txn, distributor_id)

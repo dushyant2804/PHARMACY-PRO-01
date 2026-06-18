@@ -435,6 +435,119 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(report["rows_removed_by_dedupe"][0]["purchase_order_id"], "3abb878c-98d5-4c91-8aab-9d78336ca2f8")
         self.assertEqual(report["final_rows_returned"][0]["type"], "opening_balance")
 
+    async def test_arora_opening_balance_duplicate_po_is_removed_despite_amount_difference(self):
+        result = await self.ledger(
+            [{
+                "id": "arora",
+                "name": "ARORA MEDICOSE",
+                "opening_balance": 9654,
+                "opening_balance_date": "2025-12-13",
+                "opening_balance_invoice_number": "(C) 3128",
+            }],
+            [{
+                "id": "opening-balance-arora",
+                "distributor_id": "arora",
+                "type": "opening_balance",
+                "amount": 9654,
+                "invoice_number": "(C) 3128",
+                "source": "opening_balance",
+                "created_at": "2025-12-13",
+            }],
+            [{
+                "id": "po-c-3128",
+                "distributor_id": "arora",
+                "invoice_ref": "(C) 3128",
+                "grand_total": 8631,
+                "po_date": "2025-12-13",
+            }],
+            did="arora",
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["opening-balance-arora"])
+        self.assertEqual(result["transactions"][0]["amount"], 9654)
+        self.assertEqual(result["total_purchases"], 9654)
+        self.assertEqual(result["balance"], 9654)
+
+    async def test_arora_persisted_purchase_duplicate_po_is_removed_despite_rounding_difference(self):
+        result = await self.ledger(
+            [{"id": "arora", "name": "ARORA MEDICOSE", "opening_balance": 0}],
+            [{
+                "id": "txn-c-3216",
+                "distributor_id": "arora",
+                "type": "purchase",
+                "amount": 1424,
+                "invoice_number": "(C) 3216",
+                "created_at": "2025-12-18",
+            }],
+            [{
+                "id": "po-c-3216",
+                "distributor_id": "arora",
+                "invoice_ref": "(C) 3216",
+                "grand_total": 1425,
+                "po_date": "2025-12-18",
+            }],
+            did="arora",
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["txn-c-3216"])
+        self.assertEqual(result["transactions"][0]["amount"], 1424)
+        self.assertEqual(result["total_purchases"], 1424)
+        self.assertEqual(result["balance"], 1424)
+
+    async def test_same_date_different_invoice_refs_keep_persisted_and_synthetic_purchases(self):
+        result = await self.ledger(
+            [{"id": "arora", "name": "ARORA MEDICOSE", "opening_balance": 0}],
+            [{
+                "id": "txn-c-3216",
+                "distributor_id": "arora",
+                "type": "purchase",
+                "amount": 1424,
+                "invoice_number": "(C) 3216",
+                "created_at": "2025-12-18",
+            }],
+            [{
+                "id": "po-c-3217",
+                "distributor_id": "arora",
+                "invoice_ref": "(C) 3217",
+                "grand_total": 1425,
+                "po_date": "2025-12-18",
+            }],
+            did="arora",
+        )
+
+        self.assertCountEqual(
+            [row["id"] for row in result["transactions"]],
+            ["txn-c-3216", "purchase-order-po-c-3217"],
+        )
+        self.assertEqual(result["total_purchases"], 2849)
+
+    async def test_same_invoice_on_different_date_keeps_persisted_and_synthetic_purchases(self):
+        result = await self.ledger(
+            [{"id": "arora", "name": "ARORA MEDICOSE", "opening_balance": 0}],
+            [{
+                "id": "txn-c-3216",
+                "distributor_id": "arora",
+                "type": "purchase",
+                "amount": 1424,
+                "invoice_number": "(C) 3216",
+                "created_at": "2025-12-18",
+            }],
+            [{
+                "id": "po-c-3216-later",
+                "distributor_id": "arora",
+                "invoice_ref": "(C) 3216",
+                "grand_total": 1425,
+                "po_date": "2025-12-20",
+            }],
+            did="arora",
+        )
+
+        self.assertEqual(
+            [row["id"] for row in result["transactions"]],
+            ["txn-c-3216", "purchase-order-po-c-3216-later"],
+        )
+        self.assertEqual(result["total_purchases"], 2849)
+
     async def test_same_date_and_amount_with_different_invoice_refs_remain_separate(self):
         result = await self.ledger(
             [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
