@@ -5458,13 +5458,20 @@ def _synthetic_po_matches_opening_balance_display_row(candidate: dict, opening_r
         return False
     if not (opening_row.get("is_opening_balance") or _is_explicit_opening_balance_transaction(opening_row, opening_distributor_id)):
         return False
-    if _distributor_transaction_date(candidate) != _distributor_transaction_date(opening_row):
+    candidate_date = _distributor_transaction_date(candidate)
+    opening_date = _distributor_transaction_date(opening_row)
+    if not candidate_date or not opening_date or abs((candidate_date - opening_date).days) > 1:
         return False
     candidate_refs = _purchase_invoice_reference_values(candidate)
     opening_refs = _purchase_invoice_reference_values(opening_row)
-    if candidate_refs and opening_refs:
-        return bool(candidate_refs & opening_refs)
-    return _ledger_amount_key(candidate.get("amount")) == _ledger_amount_key(opening_row.get("amount"))
+    date_difference_days = abs((candidate_date - opening_date).days)
+    same_normalized_amount = (
+        _ledger_amount_key(candidate.get("amount")) == _ledger_amount_key(opening_row.get("amount"))
+    )
+    return (
+        bool(candidate_refs & opening_refs)
+        and (date_difference_days == 0 or same_normalized_amount)
+    )
 
 
 def _synthetic_po_opening_balance_skip_reason(candidate: dict, transactions: list[dict], distributor_id: str | None = None) -> str | None:
@@ -5495,6 +5502,14 @@ def _rk_opening_balance_mirror_check(candidate: dict, opening_row: dict, distrib
     opening_date = _distributor_transaction_date(opening_row)
     candidate_refs = _purchase_invoice_reference_values(candidate)
     opening_refs = _purchase_invoice_reference_values(opening_row)
+    date_difference_days = (
+        abs((candidate_date - opening_date).days)
+        if candidate_date and opening_date
+        else None
+    )
+    same_normalized_amount = (
+        _ledger_amount_key(candidate.get("amount")) == _ledger_amount_key(opening_row.get("amount"))
+    )
 
     conditions = [
         check("candidate_is_purchase", candidate_type == "purchase", candidate_type, "purchase"),
@@ -5520,26 +5535,26 @@ def _rk_opening_balance_mirror_check(candidate: dict, opening_row: dict, distrib
             "opening_balance",
         ),
         check(
-            "same_normalized_date",
-            candidate_date == opening_date,
-            candidate_date.isoformat() if candidate_date else None,
-            opening_date.isoformat() if opening_date else None,
-        ),
-    ]
-    if candidate_refs and opening_refs:
-        conditions.append(check(
             "normalized_reference_intersection",
             bool(candidate_refs & opening_refs),
             sorted(candidate_refs),
             sorted(opening_refs),
-        ))
-    else:
-        conditions.append(check(
-            "rounded_amount_fallback",
-            _ledger_amount_key(candidate.get("amount")) == _ledger_amount_key(opening_row.get("amount")),
-            _ledger_amount_key(candidate.get("amount")),
-            _ledger_amount_key(opening_row.get("amount")),
-        ))
+        ),
+        check(
+            "same_date_or_adjacent_date_with_matching_amount",
+            date_difference_days is not None
+            and date_difference_days <= 1
+            and (date_difference_days == 0 or same_normalized_amount),
+            {
+                "date_difference_days": date_difference_days,
+                "same_normalized_amount": same_normalized_amount,
+            },
+            {
+                "same_date": True,
+                "or": {"date_difference_days": "<= 1", "same_normalized_amount": True},
+            },
+        ),
+    ]
 
     matched = all(conditions)
     failed = [item["check"] for item in checks if not item["matched"]]
