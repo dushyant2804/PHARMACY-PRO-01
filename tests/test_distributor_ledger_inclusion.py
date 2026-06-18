@@ -772,6 +772,51 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(result["total_purchases"], 92082)
         self.assertEqual(result["balance"], 92082)
 
+    async def test_rk_opening_balance_mirror_allows_one_day_purchase_order_offset(self):
+        result = await self.ledger(
+            [{
+                "id": "rk",
+                "name": "R K PHARMA",
+                "opening_balance": 92082,
+                "opening_balance_date": "2025-12-05",
+                "opening_balance_invoice_number": "05261",
+            }],
+            [],
+            [{
+                "id": "po-rk-in05261",
+                "distributor_id": "rk",
+                "po_no": "PO-RK-05261",
+                "invoice_ref": "IN05261",
+                "grand_total": 92081.996975,
+                "po_date": "2025-12-04",
+            }],
+            did="rk",
+            financial_year="All",
+            debug_rk_92082=True,
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["opening-balance-rk"])
+        self.assertEqual(result["transactions"][0]["type"], "opening_balance")
+        self.assertEqual(result["total_purchases"], 92082)
+        self.assertEqual(result["balance"], 92082)
+
+        po_row = next(
+            row for row in result["debug_rk_92082"]["rows"]
+            if row["source_collection"] == "purchase_orders"
+        )
+        self.assertTrue(po_row["matched_opening_balance_mirror_rule"])
+        self.assertFalse(po_row["included_in_ledger"])
+        checks = {
+            check["check"]: check
+            for comparison in po_row["exclusion_checks"]
+            for check in comparison["checks"]
+        }
+        date_amount_check = checks["same_date_or_adjacent_date_with_matching_amount"]
+        self.assertEqual(date_amount_check["actual"]["date_difference_days"], 1)
+        self.assertTrue(date_amount_check["actual"]["same_normalized_amount"])
+        self.assertTrue(date_amount_check["matched"])
+        self.assertTrue(checks["normalized_reference_intersection"]["matched"])
+
     async def test_rk_92082_debug_flag_exposes_mirror_rule_inputs_without_changing_ledger(self):
         result = await self.ledger(
             [{
