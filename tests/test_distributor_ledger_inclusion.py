@@ -104,8 +104,8 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", fake_db):
             report = await _distributor_ledger_forensic_audit_for_dist(dist, "d1")
 
-        self.assertEqual(report["counts"]["before"], 4)
-        self.assertEqual(report["counts"]["after"], 3)
+        self.assertEqual(report["counts"]["before"], 5)
+        self.assertEqual(report["counts"]["after"], 4)
         self.assertEqual(report["removed_rows"][0]["removal_analysis"]["rule"], "display purchase invoice dedupe")
         payment_duplicate = next(
             group for group in report["surviving_duplicate_pairs"]
@@ -136,10 +136,10 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(report["counts"]["raw_distributor_transactions"], 3)
         self.assertEqual(report["counts"]["raw_purchase_orders"], 2)
-        self.assertEqual(report["counts"]["synthetic_po_rows_generated"], 1)
+        self.assertEqual(report["counts"]["synthetic_po_rows_generated"], 2)
         self.assertEqual(report["counts"]["rows_removed_by_dedupe"], 1)
-        self.assertEqual(report["counts"]["final_rows_returned"], 3)
-        self.assertEqual(report["rows_removed_by_dedupe"][0]["source"], "distributor_transactions")
+        self.assertEqual(report["counts"]["final_rows_returned"], 4)
+        self.assertEqual(report["rows_removed_by_dedupe"][0]["source"], "purchase_orders")
         self.assertEqual(report["synthetic_po_rows_generated"][0]["source"], "purchase_orders")
         self.assertIn("dedupe_key", report["final_rows_returned"][0])
 
@@ -563,6 +563,91 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual([row["id"] for row in result["transactions"]], ["p1", "p2"])
         self.assertEqual([row["running_balance"] for row in result["transactions"]], [50, 100])
         self.assertEqual(result["total_purchases"], 100)
+
+    async def test_midha_same_invoice_amount_with_date_tolerance_removes_only_synthetic_po(self):
+        result = await self.ledger(
+            [{"id": "midha", "name": "MIDHA", "opening_balance": 0}],
+            [{"id": "txn-1216", "distributor_id": "midha", "type": "purchase", "amount": 2113,
+              "invoice_no": "1216", "created_at": "2026-05-04"}],
+            [{"id": "po-1216", "distributor_id": "midha", "invoice_ref": "1216",
+              "grand_total": 2113, "po_date": "2026-04-05"}],
+            did="midha",
+        )
+        self.assertEqual([row["id"] for row in result["transactions"]], ["txn-1216"])
+
+    async def test_rk_pharma_invoice_prefixes_match_bare_persisted_invoice(self):
+        transactions = [
+            {"id": f"txn-{invoice}", "distributor_id": "rk", "type": "purchase", "amount": amount,
+             "invoice_no": invoice, "created_at": "2026-05-01"}
+            for invoice, amount in (("05287", 101), ("05317", 102), ("A000419", 103))
+        ]
+        purchase_orders = [
+            {"id": f"po-{index}", "distributor_id": "rk", "invoice_ref": invoice,
+             "grand_total": amount, "po_date": "2026-05-01"}
+            for index, (invoice, amount) in enumerate(
+                (("I.N. 05287", 101), ("IN 05317", 102), ("IN A000419", 103))
+            )
+        ]
+        result = await self.ledger(
+            [{"id": "rk", "name": "R K PHARMA", "opening_balance": 0}],
+            transactions,
+            purchase_orders,
+            did="rk",
+        )
+        self.assertEqual([row["id"] for row in result["transactions"]], [
+            "txn-05287", "txn-05317", "txn-A000419",
+        ])
+
+    async def test_vishal_series_typo_and_date_tolerance_remove_synthetic_po_rows(self):
+        result = await self.ledger(
+            [{"id": "vishal", "name": "VISHAL", "opening_balance": 0}],
+            [
+                {"id": "txn-1834", "distributor_id": "vishal", "type": "purchase", "amount": 494,
+                 "invoice_no": "VS26-27/1834", "created_at": "2026-05-23"},
+                {"id": "txn-652", "distributor_id": "vishal", "type": "purchase", "amount": 415,
+                 "invoice_no": "VS26-27/652", "created_at": "2026-04-23"},
+            ],
+            [
+                {"id": "po-1834", "distributor_id": "vishal", "invoice_ref": "V26-27/1834",
+                 "grand_total": 494, "po_date": "2026-05-23"},
+                {"id": "po-652", "distributor_id": "vishal", "invoice_ref": "VS26-27/652",
+                 "grand_total": 415, "po_date": "2026-04-20"},
+            ],
+            did="vishal",
+        )
+        self.assertEqual([row["id"] for row in result["transactions"]], ["txn-652", "txn-1834"])
+
+    async def test_display_dedupe_safety_boundaries(self):
+        result = await self.ledger(
+            [{"id": "safe", "name": "SAFE", "opening_balance": 0}],
+            [
+                {"id": "txn-different-ref", "distributor_id": "safe", "type": "purchase", "amount": 50,
+                 "invoice_no": "INV-A", "created_at": "2026-05-01"},
+                {"id": "txn-different-amount", "distributor_id": "safe", "type": "purchase", "amount": 60,
+                 "invoice_no": "INV-B", "created_at": "2026-05-01"},
+                {"id": "txn-old", "distributor_id": "safe", "type": "purchase", "amount": 70,
+                 "invoice_no": "INV-C", "created_at": "2026-01-01"},
+                {"id": "txn-persisted-1", "distributor_id": "safe", "type": "purchase", "amount": 80,
+                 "invoice_no": "INV-D", "created_at": "2026-05-01"},
+                {"id": "txn-persisted-2", "distributor_id": "safe", "type": "purchase", "amount": 80,
+                 "invoice_no": "INV-D", "created_at": "2026-05-01"},
+            ],
+            [
+                {"id": "po-ref", "distributor_id": "safe", "invoice_ref": "INV-X",
+                 "grand_total": 50, "po_date": "2026-05-01"},
+                {"id": "po-amount", "distributor_id": "safe", "invoice_ref": "INV-B",
+                 "grand_total": 600, "po_date": "2026-05-01"},
+                {"id": "po-gap", "distributor_id": "safe", "invoice_ref": "INV-C",
+                 "grand_total": 70, "po_date": "2026-03-01"},
+            ],
+            did="safe",
+        )
+        ids = [row["id"] for row in result["transactions"]]
+        self.assertIn("purchase-order-po-ref", ids)
+        self.assertIn("purchase-order-po-amount", ids)
+        self.assertIn("purchase-order-po-gap", ids)
+        self.assertIn("txn-persisted-1", ids)
+        self.assertIn("txn-persisted-2", ids)
 
     async def test_payments_with_same_invoice_identity_are_not_deduped(self):
         result = await self.ledger(
