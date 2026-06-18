@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "pharmacy_test")
 
@@ -10,7 +12,9 @@ from server import (
     distributor_ledger,
     _admin_distributor_ledger_debug_report,
     _distributor_ledger_forensic_audit_for_dist,
+    _financial_year_date_range,
     _ledger_invoice_identity_variants,
+    _normalize_distributor_ledger_financial_year,
     _normalize_ledger_invoice_identity_value,
     _purchase_invoice_identity_keys,
 )
@@ -67,6 +71,61 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["type"] for row in rows], ["purchase", "purchase", "payment"])
         self.assertEqual([row["running_balance"] for row in rows], [100, 170, 120])
         self.assertEqual(result["balance"], 120)
+
+    async def test_all_financial_year_sentinels_and_empty_values_return_every_year(self):
+        transactions = [
+            {"id": "fy-2025", "distributor_id": "d1", "type": "purchase", "amount": 25,
+             "created_at": "2025-06-01"},
+            {"id": "fy-2026", "distributor_id": "d1", "type": "purchase", "amount": 30,
+             "created_at": "2026-06-01"},
+        ]
+
+        for financial_year in ("All", "all", "ALL", "", None):
+            with self.subTest(financial_year=financial_year):
+                result = await self.ledger(
+                    [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+                    transactions,
+                    [],
+                    financial_year=financial_year,
+                )
+                self.assertEqual(
+                    [row["id"] for row in result["transactions"] if not row.get("is_opening_balance")],
+                    ["fy-2025", "fy-2026"],
+                )
+
+    async def test_specific_financial_year_filters_normally(self):
+        transactions = [
+            {"id": "fy-2025", "distributor_id": "d1", "type": "purchase", "amount": 25,
+             "created_at": "2025-06-01"},
+            {"id": "fy-2026", "distributor_id": "d1", "type": "purchase", "amount": 30,
+             "created_at": "2026-06-01"},
+        ]
+
+        for financial_year, expected_id in (("2025-26", "fy-2025"), ("2026-27", "fy-2026")):
+            with self.subTest(financial_year=financial_year):
+                result = await self.ledger(
+                    [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+                    transactions,
+                    [],
+                    financial_year=financial_year,
+                )
+                self.assertEqual(
+                    [row["id"] for row in result["transactions"] if not row.get("is_opening_balance")],
+                    [expected_id],
+                )
+
+    def test_financial_year_normalization_keeps_invalid_values_for_validation(self):
+        self.assertIsNone(_normalize_distributor_ledger_financial_year(None))
+        self.assertIsNone(_normalize_distributor_ledger_financial_year(""))
+        self.assertIsNone(_normalize_distributor_ledger_financial_year(" All "))
+        self.assertEqual(_normalize_distributor_ledger_financial_year("2025-26"), "2025-26")
+
+        for invalid_value in ("everything", "2025", "2025-27"):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaises(HTTPException):
+                    _financial_year_date_range(
+                        _normalize_distributor_ledger_financial_year(invalid_value)
+                    )
 
     async def test_legacy_ids_and_name_only_fallback_match_without_duplicate_purchase(self):
         result = await self.ledger(
