@@ -702,6 +702,48 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(result["net_balance_for_selected_period"], expected_total)
         self.assertEqual(result["carried_forward_balance"], expected_total)
 
+    async def test_rk_manual_92082_transaction_wins_over_opening_balance_duplicate(self):
+        result = await self.ledger(
+            [{
+                "id": "rk",
+                "name": "R K PHARMA",
+                "opening_balance": 92082,
+                "opening_balance_date": "2026-04-01",
+                "opening_balance_reference_number": "RK-OPENING-92082",
+            }],
+            [
+                {
+                    "id": "rk-opening-duplicate-92082",
+                    "distributor_id": "rk",
+                    "type": "opening_balance",
+                    "amount": 92082,
+                    "reference_number": "RK-OPENING-92082",
+                    "notes": "Opening Balance",
+                    "created_at": "2026-04-01",
+                },
+                {
+                    "id": "rk-manual-ledger-92082",
+                    "distributor_id": "rk",
+                    "type": "purchase",
+                    "amount": 92082,
+                    "reference_number": "RK-OPENING-92082",
+                    "notes": "Added through Distributor Ledger",
+                    "created_at": "2026-04-01",
+                },
+            ],
+            [],
+            did="rk",
+        )
+
+        self.assertEqual(
+            [row["id"] for row in result["transactions"]],
+            ["rk-manual-ledger-92082"],
+        )
+        self.assertEqual(result["transactions"][0]["backend_row_source"], "distributor_transactions")
+        self.assertFalse(result["transactions"][0]["is_synthetic"])
+        self.assertEqual(result["total_purchases"], 92082)
+        self.assertEqual(result["balance"], 92082)
+
     def test_rk_invoice_prefixes_include_bare_canonical_identity_and_dedupe_key(self):
         for invoice in (
             "05287",
