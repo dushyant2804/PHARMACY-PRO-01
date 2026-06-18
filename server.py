@@ -4565,6 +4565,35 @@ def _is_explicit_opening_balance_transaction(txn: dict, distributor_id: str | No
     )
 
 
+def _opening_balance_row_duplicates_manual_ledger_transaction(
+    opening_txn: dict,
+    candidate: dict,
+    distributor_id: str | None = None,
+) -> bool:
+    """Prefer a manually entered debit over an opening-balance copy of that debit."""
+    if not _is_explicit_opening_balance_transaction(opening_txn, distributor_id):
+        return False
+    if not _has_opening_balance_metadata(opening_txn):
+        return False
+    if _is_explicit_opening_balance_transaction(candidate, distributor_id):
+        return False
+    if _has_opening_balance_metadata(candidate):
+        return False
+    if str(candidate.get("type") or "").strip().lower() not in {"purchase", "sale"}:
+        return False
+    if _ledger_amount_key(opening_txn.get("amount")) != _ledger_amount_key(candidate.get("amount")):
+        return False
+
+    opening_date = _distributor_transaction_date(opening_txn)
+    candidate_date = _distributor_transaction_date(candidate)
+    if not opening_date or opening_date != candidate_date:
+        return False
+
+    opening_refs = _ledger_reference_match_values(opening_txn)
+    candidate_refs = _ledger_reference_match_values(candidate)
+    return not opening_refs or not candidate_refs or bool(opening_refs & candidate_refs)
+
+
 async def _find_distributor_opening_balance_transaction(distributor: dict):
     distributor_id = distributor.get("id")
     if not distributor_id:
@@ -5247,13 +5276,26 @@ def _distributor_opening_balance_deduped_transactions(
     distributor: dict,
     transactions: list[dict],
 ) -> list[dict]:
-    """Return distributor transactions with one opening balance and no legacy duplicate row."""
+    """Return transactions without an opening-balance copy of a manual ledger debit."""
     distributor_id = str(distributor.get("id") or "")
     opening_txn = None
+    opening_balance_covered_by_manual_txn = False
     non_opening_txns = []
+    manual_txns = [
+        txn for txn in transactions
+        if not _is_explicit_opening_balance_transaction(txn, distributor_id)
+    ]
 
     for txn in transactions:
         if _is_explicit_opening_balance_transaction(txn, distributor_id):
+            if any(
+                _opening_balance_row_duplicates_manual_ledger_transaction(
+                    txn, manual_txn, distributor_id
+                )
+                for manual_txn in manual_txns
+            ):
+                opening_balance_covered_by_manual_txn = True
+                continue
             if opening_txn is None:
                 opening_txn = _normalize_opening_balance_transaction(txn, distributor)
             continue
@@ -5262,7 +5304,10 @@ def _distributor_opening_balance_deduped_transactions(
         non_opening_txns.append(txn)
 
     deduped = []
-    if opening_txn is not None or _safe_float(distributor.get("opening_balance", 0)) != 0:
+    if (
+        not opening_balance_covered_by_manual_txn
+        and (opening_txn is not None or _safe_float(distributor.get("opening_balance", 0)) != 0)
+    ):
         deduped.append(opening_txn or _opening_balance_transaction(distributor))
     deduped.extend(non_opening_txns)
     return _dedupe_distributor_opening_balance_rows(deduped, distributor_id)
@@ -6558,6 +6603,7 @@ async def add_purchase(
         "type": "purchase",
         "amount": p.amount,
         "created_at": txn_date,
+        "entry_source": "distributor_ledger",
         **_distributor_transaction_metadata(p),
     }
 
@@ -6611,6 +6657,7 @@ async def add_dist_payment(
         "type": "payment",
         "amount": p.amount,
         "created_at": p.date or datetime.now(timezone.utc).isoformat(),
+        "entry_source": "distributor_ledger",
         **_distributor_transaction_metadata(p),
     }
     await db.distributor_transactions.insert_one(txn)
