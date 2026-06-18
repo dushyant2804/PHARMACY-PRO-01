@@ -5611,6 +5611,34 @@ def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distribu
     return deduped
 
 
+def _final_distributor_ledger_rows(
+    transactions: list[dict],
+    distributor_id: str,
+) -> list[dict]:
+    """Return the authoritative post-dedupe rows for display and accounting."""
+    persisted_transactions = [
+        txn for txn in transactions
+        if txn.get("backend_row_source") == "distributor_transactions"
+    ]
+    candidates = []
+    for txn in transactions:
+        if txn.get("is_synthetic") and txn.get("backend_row_source") == "purchase_orders":
+            matched, persisted, reason = _po_synthetic_matches_persisted_distributor_transaction(
+                txn,
+                persisted_transactions,
+                distributor_id,
+            )
+            if matched:
+                if persisted is not None:
+                    persisted.setdefault("matched_purchase_order_id", txn.get("purchase_order_id"))
+                    persisted.setdefault("matched_purchase_order_object_id", txn.get("purchase_order_object_id"))
+                    persisted.setdefault("synthetic_purchase_order_skipped", True)
+                    persisted.setdefault("synthetic_purchase_order_skip_reason", reason)
+                continue
+        candidates.append(txn)
+    return _dedupe_distributor_purchase_invoice_rows(candidates, distributor_id)
+
+
 def _ledger_row_persisted_id(txn: dict) -> str | None:
     if not isinstance(txn, dict):
         return None
@@ -6182,8 +6210,18 @@ async def distributor_ledger(
     if opening_balance_date:
         dist["opening_balance_date"] = opening_balance_date
 
-    ledger_txns = _dedupe_distributor_purchase_invoice_rows(
-        await _canonical_distributor_ledger_transactions(dist, did),
+    # Materialize the same complete candidate set used by the admin/debug
+    # endpoint, then make the post-dedupe rows the sole source for display,
+    # running balances, period totals, and financial-year carry metadata.
+    # Pre-skipping matched PO mirrors here creates a separate accounting path
+    # from rows_removed_by_dedupe and can leave synthetic purchase_orders rows
+    # in the normal ledger totals when only the final dedupe recognizes them.
+    ledger_txns = _final_distributor_ledger_rows(
+        await _canonical_distributor_ledger_transactions(
+            dist,
+            did,
+            include_matched_synthetic_po_rows=True,
+        ),
         str(dist.get("id") or did),
     )
     available_financial_years = _available_financial_years(ledger_txns)
