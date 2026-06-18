@@ -4719,6 +4719,17 @@ def _current_financial_year() -> str:
     return _financial_year_for_date(datetime.now(timezone.utc).date())
 
 
+def _normalize_distributor_ledger_financial_year(financial_year: str | None) -> str | None:
+    """Normalize all-year sentinels while preserving strict FY validation."""
+    if financial_year is None:
+        return None
+
+    normalized = financial_year.strip()
+    if not normalized or normalized.casefold() == "all":
+        return None
+    return normalized
+
+
 def _financial_year_date_range(financial_year: str):
     try:
         start_text, end_text = financial_year.split("-", 1)
@@ -6197,6 +6208,8 @@ async def distributor_ledger(
     amount: Optional[float] = None,
     user: dict = Depends(get_current_user),
 ):
+    financial_year = _normalize_distributor_ledger_financial_year(financial_year)
+
     dist = await db.distributors.find_one({"id": did}, {"_id": 0})
     if not dist:
         candidates = await db.distributors.find({}).to_list(5000)
