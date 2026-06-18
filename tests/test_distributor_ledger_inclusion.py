@@ -601,6 +601,48 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
             "txn-05287", "txn-05317", "txn-A000419",
         ])
 
+    async def test_rk_pharma_twelve_deduped_po_rows_are_excluded_from_rows_and_all_totals(self):
+        transactions = [
+            {
+                "id": f"txn-{index}",
+                "distributor_id": "rk",
+                "type": "purchase",
+                "amount": 100 + index,
+                "invoice_no": f"{5260 + index:05d}",
+                "created_at": "2025-06-15",
+            }
+            for index in range(12)
+        ]
+        purchase_orders = [
+            {
+                "id": f"po-{index}",
+                "distributor_id": "rk",
+                "invoice_ref": f"I.N. {5260 + index:05d}",
+                "grand_total": 100 + index,
+                "po_date": "2025-06-15",
+            }
+            for index in range(12)
+        ]
+        expected_total = sum(100 + index for index in range(12))
+
+        result = await self.ledger(
+            [{"id": "rk", "name": "R K PHARMA", "opening_balance": 0}],
+            transactions,
+            purchase_orders,
+            did="rk",
+            financial_year="2025-26",
+        )
+
+        self.assertEqual(len(result["transactions"]), 12)
+        self.assertFalse(any(row.get("backend_row_source") == "purchase_orders"
+                             for row in result["transactions"]))
+        self.assertEqual(result["transactions"][-1]["running_balance"], expected_total)
+        self.assertEqual(result["total_purchases"], expected_total)
+        self.assertEqual(result["balance"], expected_total)
+        self.assertEqual(result["balance_for_selected_period"], expected_total)
+        self.assertEqual(result["net_balance_for_selected_period"], expected_total)
+        self.assertEqual(result["carried_forward_balance"], expected_total)
+
     def test_rk_invoice_prefixes_include_bare_canonical_identity_and_dedupe_key(self):
         for invoice in (
             "05287",
