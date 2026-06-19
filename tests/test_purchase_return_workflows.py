@@ -218,34 +218,60 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated["purchase_rate"], 12.0)
         self.assertEqual(updated["return_amount"], 24.0)
 
-    async def test_settled_or_ledger_adjusted_return_cannot_be_edited(self):
-        for settlement in (
-            {"settlement_status": "settled_by_po", "settled_by_po": "po-1"},
-            {"settlement_status": "ledger_adjusted", "ledger_adjusted": True},
-        ):
-            self.fake_db.purchase_returns.rows[0].update(settlement)
-            with patch("server.db", self.fake_db):
-                with self.assertRaises(HTTPException) as caught:
-                    await update_purchase_return("return-1", PurchaseReturnUpdate(notes="unsafe"), {"id": "user"})
-            self.assertEqual(caught.exception.status_code, 409)
-            self.assertIn("cannot be edited", caught.exception.detail)
-            self.fake_db.purchase_returns.rows[0] = dict(self.return_row)
+    async def test_settled_return_cannot_be_edited(self):
+        self.fake_db.purchase_returns.rows[0].update({"settlement_status": "settled_by_po", "settled_by_po": "po-1"})
+        with patch("server.db", self.fake_db):
+            with self.assertRaises(HTTPException) as caught:
+                await update_purchase_return("return-1", PurchaseReturnUpdate(notes="unsafe"), {"id": "user"})
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("cannot be edited", caught.exception.detail)
 
-    async def test_void_restores_stock_preserves_history_and_linked_return_is_blocked(self):
+    async def test_edit_ledger_adjusted_return_updates_linked_transaction_without_duplicate(self):
+        self.fake_db.purchase_returns.rows[0].update({
+            "distributor_id": "dist-1", "distributor": "Old Dist",
+            "ledger_adjusted": True, "adjust_distributor_ledger": True,
+            "ledger_transaction_id": "txn-1", "settlement_status": "ledger_adjusted",
+            "created_at": "2026-06-01T00:00:00+00:00",
+        })
+        self.fake_db.distributor_transactions.rows.append({
+            "id": "txn-1", "return_id": "return-1", "amount": 20, "distributor_id": "dist-1",
+        })
+        async def fallback_only(operation, fallback):
+            return await fallback()
+        payload = PurchaseReturnUpdate(
+            return_date="2026-06-03", purchase_rate=15, return_quantity=1,
+            distributor="New Dist", distributor_id="dist-2", adjust_distributor_ledger=True,
+        )
+        with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
+            updated = await update_purchase_return("return-1", payload, {"id": "user"})
+        self.assertEqual(updated["ledger_transaction_id"], "txn-1")
+        self.assertEqual(len(self.fake_db.distributor_transactions.rows), 1)
+        txn = self.fake_db.distributor_transactions.rows[0]
+        self.assertEqual(txn["id"], "txn-1")
+        self.assertEqual(txn["amount"], 15.0)
+        self.assertEqual(txn["distributor_id"], "dist-2")
+        self.assertEqual(txn["transaction_date"], "2026-06-03")
+        self.assertEqual(self.fake_db.medicines.rows[0]["purchase_return_units"], 1)
+
+    async def test_delete_restores_stock_soft_deletes_and_linked_return_is_blocked(self):
         async def fallback_only(operation, fallback):
             return await fallback()
         with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
             response = await delete_purchase_return("return-1", {"id": "user"})
-        self.assertEqual(response["message"], "Purchase return voided")
+        self.assertTrue(response["success"])
+        self.assertEqual(response["message"], "Purchase return deleted")
         self.assertEqual(self.fake_db.medicines.rows[0]["purchase_return_units"], 0)
         self.assertEqual(len(self.fake_db.purchase_returns.rows), 1)
-        self.assertEqual(self.fake_db.purchase_returns.rows[0]["settlement_status"], "voided")
+        self.assertEqual(self.fake_db.purchase_returns.rows[0]["settlement_status"], "deleted")
         self.assertEqual(self.fake_db.purchase_returns.rows[0]["return_quantity"], 2)
         self.assertEqual(self.fake_db.purchase_returns.rows[0]["reason"], "Expired")
-        self.assertIn("voided_at", self.fake_db.purchase_returns.rows[0])
+        self.assertIn("deleted_at", self.fake_db.purchase_returns.rows[0])
 
         linked = {
-            **{key: value for key, value in self.return_row.items() if not key.startswith("voided_")},
+            "id": "return-1", "medicine_id": "med-1", "return_date": "2026-06-01",
+            "return_quantity": 2, "purchase_rate": 10, "return_amount": 20,
+            "reason": "Expired", "notes": "", "adjust_distributor_ledger": False,
+            "ledger_adjusted": False, "ledger_transaction_id": None,
             "settlement_status": "settled_by_po", "settled_by_po": "po-1",
         }
         self.fake_db.purchase_returns.rows[:] = [linked]
@@ -253,9 +279,9 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as caught:
                 await delete_purchase_return("return-1", {"id": "user"})
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertIn("cannot be voided", caught.exception.detail)
+        self.assertIn("cannot be deleted", caught.exception.detail)
 
-    async def test_void_ledger_adjusted_return_keeps_voided_ledger_history(self):
+    async def test_delete_ledger_adjusted_return_removes_linked_ledger_transaction(self):
         self.fake_db.purchase_returns.rows[0].update({
             "ledger_adjusted": True, "adjust_distributor_ledger": True,
             "ledger_transaction_id": "txn-1", "settlement_status": "ledger_adjusted",
@@ -269,10 +295,10 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
             await delete_purchase_return("return-1", {"name": "Admin"})
 
-        self.assertEqual(len(self.fake_db.distributor_transactions.rows), 1)
-        self.assertEqual(self.fake_db.distributor_transactions.rows[0]["voided_by"], "Admin")
-        self.assertIn("voided_at", self.fake_db.distributor_transactions.rows[0])
+        self.assertEqual(len(self.fake_db.distributor_transactions.rows), 0)
         self.assertFalse(self.fake_db.purchase_returns.rows[0]["ledger_adjusted"])
+        self.assertIsNone(self.fake_db.purchase_returns.rows[0]["ledger_transaction_id"])
+        self.assertEqual(self.fake_db.purchase_returns.rows[0]["settlement_status"], "deleted")
 
 
 class PurchaseReturnStockBackfillTests(unittest.IsolatedAsyncioTestCase):

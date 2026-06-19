@@ -829,12 +829,6 @@ class UserCreateByAdmin(UserRegister):
     role: Literal["admin", "cashier", "pharmacist"] = "cashier"
 
 
-class StaleSoldUnitsClearRequest(BaseModel):
-    medicine_id: str
-    batch_no: str
-    confirm: bool = False
-
-
 class UserLogin(BaseModel):
     email: Optional[EmailStr] = None
     mobile: Optional[str] = None
@@ -1458,6 +1452,8 @@ class PurchaseReturnUpdate(BaseModel):
     return_quantity: Optional[float] = None
     purchase_rate: Optional[float] = None
     notes: Optional[str] = None
+    distributor: Optional[str] = None
+    distributor_id: Optional[str] = None
     adjust_distributor_ledger: Optional[bool] = None
 
     @field_validator("return_date")
@@ -6828,6 +6824,9 @@ def _purchase_return_query(
             {"notes": {"$regex": search, "$options": "i"}},
         ]
 
+    query["deleted_at"] = {"$exists": False}
+    query["voided_at"] = {"$exists": False}
+    query["settlement_status"] = {"$ne": "deleted"}
     return query
 
 
@@ -6903,7 +6902,9 @@ def _purchase_return_ledger_transaction(return_doc: dict) -> dict:
             f"Qty {return_doc.get('return_quantity', 0)}, "
             f"Reason: {return_doc.get('reason', '')}"
         ),
-        "created_at": return_doc["created_at"],
+        "created_at": return_doc.get("return_date") or return_doc.get("created_at"),
+        "transaction_date": return_doc.get("return_date") or return_doc.get("created_at"),
+        "date": return_doc.get("return_date") or return_doc.get("created_at"),
     }
 
 
@@ -7029,7 +7030,7 @@ async def recalculate_purchase_return_stock(tenant_id: Optional[str] = None) -> 
     matched_returns = 0
 
     for return_doc in purchase_returns:
-        if return_doc.get("voided_at"):
+        if return_doc.get("voided_at") or return_doc.get("deleted_at") or return_doc.get("settlement_status") == "deleted":
             continue
         medicine = _match_purchase_return_medicine(return_doc, medicines, tenant_id)
         if not medicine:
@@ -7182,75 +7183,6 @@ def _stale_sold_units_repair_row(medicine: dict, invoice_backed_sold_units: floa
     }
 
 
-@api_router.get("/admin/inventory/stale-sold-units")
-async def list_stale_sold_units(user: dict = Depends(require_role("admin"))):
-    rows = []
-    async for medicine in db.medicines.find({}, {"_id": 0}):
-        sold_units = _stock_quantity(medicine, "sold_units", "sold_quantity")
-        if sold_units <= 0:
-            continue
-        invoice_backed = await _invoice_backed_sold_units_for_medicine_batch(medicine)
-        if invoice_backed > 0:
-            continue
-        rows.append(_stale_sold_units_repair_row(medicine, invoice_backed))
-    return {"items": rows, "count": len(rows)}
-
-
-@api_router.post("/admin/inventory/stale-sold-units/clear")
-async def clear_stale_sold_units(
-    payload: StaleSoldUnitsClearRequest,
-    user: dict = Depends(require_role("admin")),
-):
-    if payload.confirm is not True:
-        raise HTTPException(status_code=400, detail="confirm must be true")
-    medicine_query = {"id": payload.medicine_id, "batch_no": payload.batch_no}
-    medicine = await db.medicines.find_one(medicine_query, {"_id": 0})
-    if not medicine:
-        medicine_query = {"medicine_key": payload.medicine_id, "batch_no": payload.batch_no}
-        medicine = await db.medicines.find_one(medicine_query, {"_id": 0})
-    if not medicine:
-        raise HTTPException(status_code=404, detail="Medicine batch not found")
-    old_sold_units = _stock_quantity(medicine, "sold_units", "sold_quantity")
-    if old_sold_units <= 0:
-        raise HTTPException(status_code=400, detail="No sold_units to clear for this batch")
-    invoice_backed = await _invoice_backed_sold_units_for_medicine_batch(medicine)
-    if invoice_backed > 0:
-        raise HTTPException(status_code=409, detail="Invoice-backed sold_units exist; refusing to clear")
-
-    old_stock = _available_stock(medicine)
-    refreshed = {**medicine, "sold_units": 0, "sold_quantity": 0}
-    new_stock = _available_stock(refreshed)
-    status = _return_status(refreshed)
-    update = {
-        "sold_units": 0,
-        "available_stock": new_stock,
-        "current_stock": new_stock,
-        "quantity_units": new_stock,
-        "return_status": status,
-        "status": status,
-    }
-    result = await db.medicines.update_one(
-        medicine_query, {"$set": update}
-    )
-    if not result or result.modified_count != 1:
-        raise HTTPException(status_code=409, detail="Medicine batch changed; retry the repair")
-
-    audit = {
-        "id": str(uuid.uuid4()),
-        "action": "clear_stale_sold_units",
-        "medicine_id": medicine.get("id") or payload.medicine_id,
-        "medicine_name": medicine.get("name") or medicine.get("medicine_name") or "",
-        "batch_no": medicine.get("batch_no") or payload.batch_no,
-        "old_sold_units": old_sold_units,
-        "new_sold_units": 0,
-        "old_stock": old_stock,
-        "new_stock": new_stock,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "performed_by": user.get("name") or user.get("email") or user.get("id") or "Unknown",
-        "reason": "No invoice-backed deduction found",
-    }
-    await db.audit_logs.insert_one(audit)
-    return {"success": True, "item": _stale_sold_units_repair_row({**medicine, **update}, 0), "audit_log": audit}
 
 
 @api_router.post("/admin/recalculate-purchase-return-stock")
@@ -7428,11 +7360,13 @@ async def _sync_purchase_return_ledger(old: dict, updated: dict, session=None):
     transaction = _purchase_return_ledger_transaction(updated)
     if existing_id:
         transaction["id"] = existing_id
-        await db.distributor_transactions.update_one(
+        result = await db.distributor_transactions.update_one(
             {"id": existing_id, "return_id": old["id"]},
             {"$set": transaction},
             session=session,
         )
+        if not result or (getattr(result, "matched_count", result.modified_count) != 1 and result.modified_count != 1):
+            await db.distributor_transactions.insert_one(transaction, session=session)
         return existing_id
     await db.distributor_transactions.insert_one(transaction, session=session)
     return transaction["id"]
@@ -7448,12 +7382,10 @@ async def update_purchase_return(
     if not current:
         raise HTTPException(status_code=404, detail="Purchase return not found")
     status = _purchase_return_settlement_status(current)
-    if status == "voided" or current.get("voided_at"):
-        raise HTTPException(status_code=409, detail="Voided purchase returns cannot be edited")
+    if status in {"voided", "deleted"} or current.get("voided_at") or current.get("deleted_at"):
+        raise HTTPException(status_code=409, detail="Deleted purchase returns cannot be edited")
     if status == "settled_by_po":
         raise HTTPException(status_code=409, detail="Purchase return is settled in a purchase order and cannot be edited")
-    if status == "ledger_adjusted":
-        raise HTTPException(status_code=409, detail="Ledger-adjusted purchase returns cannot be edited; void the ledger adjustment first")
 
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
@@ -7506,25 +7438,20 @@ async def delete_purchase_return(
     if not current:
         raise HTTPException(status_code=404, detail="Purchase return not found")
     status = _purchase_return_settlement_status(current)
-    if status == "voided" or current.get("voided_at"):
-        raise HTTPException(status_code=409, detail="Purchase return is already voided")
+    if status in {"voided", "deleted"} or current.get("voided_at") or current.get("deleted_at"):
+        raise HTTPException(status_code=409, detail="Purchase return is already deleted")
     if status == "settled_by_po":
-        raise HTTPException(status_code=409, detail="Purchase return is settled in a purchase order and cannot be voided")
+        raise HTTPException(status_code=409, detail="Purchase return is settled in a purchase order and cannot be deleted")
 
     quantity = float(current.get("return_quantity", 0) or 0)
     stock_restored = False
 
     async def write(session=None):
         nonlocal stock_restored
-        voided_at = datetime.now(timezone.utc).isoformat()
+        deleted_at = datetime.now(timezone.utc).isoformat()
         if current.get("ledger_transaction_id"):
-            await db.distributor_transactions.update_one(
+            await db.distributor_transactions.delete_one(
                 {"id": current["ledger_transaction_id"], "return_id": return_id},
-                {"$set": {
-                    "voided_at": voided_at,
-                    "voided_by": user.get("name") or user.get("id", ""),
-                    "void_reason": "Purchase return voided",
-                }},
                 session=session,
             )
         await _set_purchase_return_stock_delta(current["medicine_id"], -quantity, session=session)
@@ -7532,16 +7459,17 @@ async def delete_purchase_return(
         result = await db.purchase_returns.update_one({
             "id": return_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]
         }, {"$set": {
-            "voided_at": voided_at,
-            "voided_by": user.get("name") or user.get("id", ""),
-            "settlement_status": "voided",
+            "deleted_at": deleted_at,
+            "deleted_by": user.get("name") or user.get("id", ""),
+            "settlement_status": "deleted",
             "ledger_adjusted": False,
             "adjust_distributor_ledger": False,
+            "ledger_transaction_id": None,
             "settled_return_value": 0.0,
         }}, session=session)
         if result.modified_count != 1:
             raise HTTPException(status_code=409, detail="Purchase return changed or was applied to a purchase order")
-        return {"message": "Purchase return voided", "id": return_id}
+        return {"success": True, "message": "Purchase return deleted", "id": return_id}
 
     async def transaction_operation(session):
         return await write(session=session)
@@ -8931,8 +8859,8 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
     for item in returns:
         if item.get("distributor_id") and item.get("distributor_id") != payload.distributor_id:
             raise HTTPException(status_code=400, detail="Purchase return distributor does not match purchase order distributor")
-        if item.get("voided_at"):
-            raise HTTPException(status_code=409, detail="Voided purchase return credit cannot be applied to a purchase order")
+        if item.get("voided_at") or item.get("deleted_at") or item.get("settlement_status") == "deleted":
+            raise HTTPException(status_code=409, detail="Deleted purchase return credit cannot be applied to a purchase order")
         assigned_po = item.get("po_adjustment_id")
         if assigned_po and assigned_po != allow_po_id:
             raise HTTPException(status_code=409, detail="Purchase return credit is already assigned to another purchase order")
@@ -8985,7 +8913,7 @@ async def eligible_po_purchase_returns(distributor_id: str, user: dict = Depends
     returns = await db.purchase_returns.find({"distributor_id": distributor_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]}, {"_id": 0}).sort("return_date", -1).to_list(1000)
     result = []
     for item in returns:
-        if item.get("voided_at") or item.get("ledger_adjusted") or item.get("adjust_distributor_ledger"):
+        if item.get("voided_at") or item.get("deleted_at") or item.get("settlement_status") == "deleted" or item.get("ledger_adjusted") or item.get("adjust_distributor_ledger"):
             continue
         medicine = await db.medicines.find_one({"id": item.get("medicine_id")}, {"_id": 0}) if item.get("medicine_id") else None
         medicine = medicine or {}
