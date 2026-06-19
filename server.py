@@ -7372,6 +7372,7 @@ async def _sync_purchase_return_ledger(old: dict, updated: dict, session=None):
     return transaction["id"]
 
 
+@api_router.patch("/purchase-returns/{return_id}")
 @api_router.put("/purchase-returns/{return_id}")
 async def update_purchase_return(
     return_id: str,
