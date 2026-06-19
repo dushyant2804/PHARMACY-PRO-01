@@ -3563,6 +3563,8 @@ async def _build_fifo_stock_plan(
 
         plan.append({
             "medicine_id": batch["id"],
+            "medicine_key": batch.get("medicine_key"),
+            "batch_no": batch.get("batch_no"),
             "medicine_name": medicine_name,
             "deduct": round_qty(deduct),
             "sold_units_before": _stock_quantity(batch, "sold_units", "sold_quantity"),
@@ -3658,6 +3660,8 @@ def _stock_deductions_from_steps(steps: list[dict]) -> list[dict]:
             "medicine_id": step["medicine_id"],
             "medicine_name": step.get("medicine_name", ""),
             "deduct": round_qty(step.get("deduct", 0)),
+            **({"batch_no": step.get("batch_no")} if step.get("batch_no") else {}),
+            **({"medicine_key": step.get("medicine_key")} if step.get("medicine_key") else {}),
         }
         for step in steps
         if round_qty(step.get("deduct", 0)) > 0
@@ -4097,10 +4101,11 @@ async def create_invoice(
                     })
 
     async def transaction_operation(session):
-        await _apply_fifo_stock_requests(
+        applied = await _apply_fifo_stock_requests(
             stock_requests,
             session=session
         )
+        invoice["stock_deductions"] = _stock_deductions_from_steps(applied)
         await write_invoice_records(session=session)
         return invoice
 
@@ -4112,6 +4117,7 @@ async def create_invoice(
                 stock_requests,
                 applied=applied
             )
+            invoice["stock_deductions"] = _stock_deductions_from_steps(applied)
             rollback_log = []
             await write_invoice_records(rollback_log=rollback_log)
         except Exception:
@@ -9598,15 +9604,32 @@ async def rebuild_inventory():
         if key:
             existing_medicines[key] = old
 
-    # Invoice lines are the source of truth for future sales rebuilds. Legacy
-    # batches without matching invoice history retain their existing sold value.
+    # Invoice stock deductions are the source of truth for rebuild sales.
+    # Legacy/manual sold values are intentionally not preserved here: if a batch
+    # has no invoice-backed deduction, rebuild must not carry stale sold_units.
     invoice_sold_by_id = defaultdict(float)
     invoice_sold_by_key = defaultdict(float)
     invoices_collection = getattr(db, "invoices", None)
     if invoices_collection is not None:
         async for invoice in invoices_collection.find({}):
+            deductions = invoice.get("stock_deductions") or []
+            if deductions:
+                for deduction in deductions:
+                    quantity = round_qty(deduction.get("deduct", deduction.get("quantity", 0)))
+                    if quantity <= 0:
+                        continue
+                    if deduction.get("medicine_id"):
+                        invoice_sold_by_id[deduction["medicine_id"]] += quantity
+                    if deduction.get("medicine_key"):
+                        invoice_sold_by_key[deduction["medicine_key"]] += quantity
+                continue
+
+            # Legacy invoices without stock_deductions can still support rebuild
+            # only when they identify the exact batch by stored medicine id/key.
             for item in invoice.get("items", []):
-                quantity = round_qty(item.get("quantity_units", item.get("quantity", 0)))
+                quantity = round_qty(item.get("units_dispensed", item.get("quantity_units", item.get("quantity", 0))))
+                if quantity <= 0:
+                    continue
                 if item.get("medicine_id"):
                     invoice_sold_by_id[item["medicine_id"]] += quantity
                 if item.get("medicine_key"):
@@ -9690,16 +9713,12 @@ async def rebuild_inventory():
                     # PURCHASE STOCK FROM PO
                     "purchased_units": 0,
 
-                    # Prefer invoice-derived sales; preserve legacy/manual data
-                    # only when no matching invoice history is available.
+                    # Rebuild sold stock only from invoice-backed evidence.
                     "sold_units":
                         round_qty(
                             invoice_sold_by_id.get(existing.get("id"))
                             if existing and existing.get("id") in invoice_sold_by_id
-                            else invoice_sold_by_key.get(key)
-                            if key in invoice_sold_by_key
-                            else _safe_legacy_sold_stock(existing)
-                            if existing else 0
+                            else invoice_sold_by_key.get(key, 0)
                         ),
 
                     # PURCHASE RETURNS PRESERVED
