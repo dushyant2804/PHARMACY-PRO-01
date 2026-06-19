@@ -954,6 +954,13 @@ class LowStockThresholdUnlock(BaseModel):
 
 class PrivacyPasswordUpdate(BaseModel):
     privacy_password: str
+
+    @field_validator("privacy_password")
+    @classmethod
+    def _privacy_password_not_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("Privacy password is required")
+        return value
     
 # Keep migration-only types separate so they can be removed from the normal
 # workflow without changing the permanent adjustment types. Existing records
@@ -2093,22 +2100,28 @@ async def set_privacy_password(
 ):
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    _validate_password_strength(payload.privacy_password)
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db.settings.update_one(
-        _privacy_settings_filter(user),
-        {
-            "$set": {
-                "key": "privacy_password",
-                "tenant_id": user.get("tenant_id"),
-                "privacy_password_hash": hash_password(payload.privacy_password),
-                "updated_at": now_iso,
-                "updated_by": user.get("id") or user.get("email"),
+    try:
+        await db.settings.update_one(
+            _privacy_settings_filter(user),
+            {
+                "$set": {
+                    "privacy_password_hash": hash_password(payload.privacy_password),
+                    "updated_at": now_iso,
+                    "updated_by": user.get("id") or user.get("email"),
+                },
+                "$setOnInsert": {
+                    "key": "privacy_password",
+                    "tenant_id": user.get("tenant_id"),
+                    "shop_id": user.get("shop_id") or user.get("tenant_id"),
+                    "created_at": now_iso,
+                },
             },
-            "$setOnInsert": {"created_at": now_iso},
-        },
-        upsert=True,
-    )
+            upsert=True,
+        )
+    except PyMongoError as exc:
+        logger.exception("Failed to save privacy password setting")
+        raise HTTPException(status_code=503, detail="Unable to save privacy password") from exc
     return {"ok": True, "privacy_password_configured": True, "updated_at": now_iso}
 
 

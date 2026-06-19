@@ -52,6 +52,7 @@ class _Collection:
         return _UpdateResult()
 
 
+
 class LowStockWorkflowTest(unittest.IsolatedAsyncioTestCase):
     async def test_update_status_persists_without_changing_stock(self):
         medicine = {"id": "med-1", "purchased_units": 10, "sold_units": 3, "low_stock_status": "low_stock"}
@@ -167,6 +168,25 @@ class LowStockWorkflowTest(unittest.IsolatedAsyncioTestCase):
         saved_hash = settings.records[0]["privacy_password_hash"]
         self.assertNotEqual(saved_hash, "Private1234")
         self.assertTrue(verify_password("Private1234", saved_hash))
+
+
+    async def test_privacy_password_save_accepts_requested_test_password(self):
+        from server import set_privacy_password, verify_password
+
+        settings = _Collection([])
+        fake_db = SimpleNamespace(settings=settings)
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1"}
+
+        with patch("server.db", fake_db):
+            response = await set_privacy_password(PrivacyPasswordUpdate(privacy_password="test password"), user=admin)
+
+        self.assertEqual(response["ok"], True)
+        self.assertEqual(response["privacy_password_configured"], True)
+        self.assertNotIn("privacy_password", response)
+        self.assertNotIn("privacy_password_hash", response)
+        saved_hash = settings.records[0]["privacy_password_hash"]
+        self.assertNotEqual(saved_hash, "test password")
+        self.assertTrue(verify_password("test password", saved_hash))
 
     async def test_non_admin_cannot_unlock_or_edit_unlocked_threshold(self):
         from server import LowStockThresholdUpdate, LowStockThresholdUnlock, PrivacyPasswordUpdate, set_privacy_password, update_low_stock_threshold, unlock_low_stock_threshold
