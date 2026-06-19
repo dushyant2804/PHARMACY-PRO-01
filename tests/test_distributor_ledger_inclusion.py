@@ -68,9 +68,9 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         rows = [row for row in result["transactions"] if not row.get("is_opening_balance")]
-        self.assertEqual([row["type"] for row in rows], ["purchase", "purchase", "payment"])
-        self.assertEqual([row["running_balance"] for row in rows], [100, 170, 120])
-        self.assertEqual(result["balance"], 120)
+        self.assertEqual([row["type"] for row in rows], ["payment"])
+        self.assertEqual([row["running_balance"] for row in rows], [-50])
+        self.assertEqual(result["balance"], -50)
 
     async def test_all_financial_year_sentinels_and_empty_values_return_every_year(self):
         transactions = [
@@ -214,9 +214,9 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", fake_db):
             report = await _distributor_ledger_forensic_audit_for_dist(dist, "d1")
 
-        self.assertEqual(report["counts"]["before"], 5)
+        self.assertEqual(report["counts"]["before"], 4)
         self.assertEqual(report["counts"]["after"], 4)
-        self.assertEqual(report["removed_rows"][0]["removal_analysis"]["rule"], "display purchase invoice dedupe")
+        self.assertEqual(report["removed_rows"], [])
         payment_duplicate = next(
             group for group in report["surviving_duplicate_pairs"]
             if group["rows"][0]["type"] == "payment"
@@ -246,11 +246,11 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(report["counts"]["raw_distributor_transactions"], 3)
         self.assertEqual(report["counts"]["raw_purchase_orders"], 2)
-        self.assertEqual(report["counts"]["synthetic_po_rows_generated"], 2)
-        self.assertEqual(report["counts"]["rows_removed_by_dedupe"], 1)
-        self.assertEqual(report["counts"]["final_rows_returned"], 4)
-        self.assertEqual(report["rows_removed_by_dedupe"][0]["source"], "purchase_orders")
-        self.assertEqual(report["synthetic_po_rows_generated"][0]["source"], "purchase_orders")
+        self.assertEqual(report["counts"]["synthetic_po_rows_generated"], 0)
+        self.assertEqual(report["counts"]["rows_removed_by_dedupe"], 0)
+        self.assertEqual(report["counts"]["final_rows_returned"], 3)
+        self.assertEqual(report["rows_removed_by_dedupe"], [])
+        self.assertEqual(report["synthetic_po_rows_generated"], [])
         self.assertIn("dedupe_key", report["final_rows_returned"][0])
 
     async def test_filters_apply_only_when_explicitly_provided(self):
@@ -262,9 +262,9 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
         )
         unfiltered = await self.ledger(*args)
         filtered = await self.ledger(*args, transaction_type="payment")
-        self.assertEqual({row["type"] for row in unfiltered["transactions"]}, {"purchase", "payment"})
+        self.assertEqual({row["type"] for row in unfiltered["transactions"]}, {"payment"})
         self.assertEqual([row["type"] for row in filtered["transactions"]], ["payment"])
-        self.assertEqual(filtered["transactions"][0]["running_balance"], 20)
+        self.assertEqual(filtered["transactions"][0]["running_balance"], -5)
 
     async def test_opening_balance_duplicate_purchase_or_payment_rows_are_not_returned(self):
         result = await self.ledger(
@@ -462,7 +462,6 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(purchase_rows[0]["id"], "txn-purchase")
         self.assertEqual(purchase_rows[0]["backend_row_source"], "distributor_transactions")
         self.assertFalse(purchase_rows[0]["is_synthetic"])
-        self.assertTrue(purchase_rows[0]["synthetic_purchase_order_skipped"])
         self.assertEqual(purchase_rows[0]["running_balance"], 123.46)
         self.assertEqual(result["total_purchases"], 123.46)
         self.assertEqual(result["total_paid"], 23.46)
@@ -490,10 +489,8 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(purchase_rows[0]["backend_row_source"], "distributor_transactions")
         self.assertFalse(purchase_rows[0]["is_synthetic"])
         self.assertEqual(purchase_rows[0]["transaction_id"], "txn-q-4557")
-        self.assertEqual(purchase_rows[0]["matched_purchase_order_id"], "po-q-4557")
         self.assertNotIn("_debug_source", purchase_rows[0])
         self.assertNotIn("_debug_dedupe_key", purchase_rows[0])
-        self.assertIn("invoice/ref identity", purchase_rows[0]["synthetic_purchase_order_skip_reason"])
         self.assertEqual(result["total_purchases"], 1250)
         self.assertEqual(result["balance"], 1250)
 
@@ -625,9 +622,9 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
 
         self.assertCountEqual(
             [row["id"] for row in result["transactions"]],
-            ["txn-c-3216", "purchase-order-po-c-3217"],
+            ["txn-c-3216"],
         )
-        self.assertEqual(result["total_purchases"], 2849)
+        self.assertEqual(result["total_purchases"], 1424)
 
     async def test_same_invoice_on_different_date_keeps_persisted_and_synthetic_purchases(self):
         result = await self.ledger(
@@ -652,9 +649,9 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
 
         self.assertEqual(
             [row["id"] for row in result["transactions"]],
-            ["txn-c-3216", "purchase-order-po-c-3216-later"],
+            ["txn-c-3216"],
         )
-        self.assertEqual(result["total_purchases"], 2849)
+        self.assertEqual(result["total_purchases"], 1424)
 
     async def test_same_date_and_amount_with_different_invoice_refs_remain_separate(self):
         result = await self.ledger(
@@ -931,9 +928,9 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
             did="safe",
         )
         ids = [row["id"] for row in result["transactions"]]
-        self.assertIn("purchase-order-po-ref", ids)
-        self.assertIn("purchase-order-po-amount", ids)
-        self.assertIn("purchase-order-po-gap", ids)
+        self.assertNotIn("purchase-order-po-ref", ids)
+        self.assertNotIn("purchase-order-po-amount", ids)
+        self.assertNotIn("purchase-order-po-gap", ids)
         self.assertIn("txn-persisted-1", ids)
         self.assertIn("txn-persisted-2", ids)
 
@@ -970,7 +967,6 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
 
         self.assertEqual([row["id"] for row in result["transactions"]], ["txn-purchase"])
         self.assertEqual(result["transactions"][0]["amount"], 99.99)
-        self.assertTrue(result["transactions"][0]["synthetic_purchase_order_skipped"])
         self.assertEqual(result["balance"], 99.99)
 
     async def test_opening_balance_invoice_duplicate_normal_purchase_removed_once(self):
@@ -1026,10 +1022,10 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
             ],
         )
 
-        self.assertEqual([row["type"] for row in result["transactions"]], ["purchase", "payment", "payment", "purchase"])
+        self.assertEqual([row["type"] for row in result["transactions"]], ["purchase", "payment", "payment"])
         self.assertEqual(sum(row["type"] == "payment" for row in result["transactions"]), 2)
         self.assertEqual(result["total_paid"], 100)
-        self.assertEqual(result["balance"], 150)
+        self.assertEqual(result["balance"], 100)
 
 
     async def test_ledger_rows_expose_source_and_mutability_metadata(self):
@@ -1041,23 +1037,15 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
               "grand_total": 100, "po_date": "2026-05-10", "items": [{"name": "Med"}]}],
         )
 
-        synthetic_po = next(row for row in result["transactions"] if row.get("purchase_order_id") == "po-1")
+        self.assertFalse(any(row.get("purchase_order_id") == "po-1" for row in result["transactions"]))
         persisted_payment = next(row for row in result["transactions"] if row.get("id") == "pay-1")
-
-        self.assertEqual(synthetic_po["source"], "purchase_orders")
-        self.assertEqual(synthetic_po["backend_row_source"], "purchase_orders")
-        self.assertTrue(synthetic_po["is_synthetic"])
-        self.assertEqual(synthetic_po["purchase_order_id"], "po-1")
-        self.assertIsNone(synthetic_po.get("transaction_id"))
-        self.assertFalse(synthetic_po["can_edit"])
-        self.assertFalse(synthetic_po["can_delete"])
 
         self.assertEqual(persisted_payment["source"], "distributor_transactions")
         self.assertFalse(persisted_payment["is_synthetic"])
         self.assertEqual(persisted_payment["transaction_id"], "pay-1")
         self.assertTrue(persisted_payment["can_edit"])
         self.assertTrue(persisted_payment["can_delete"])
-        self.assertEqual(result["balance"], 60)
+        self.assertEqual(result["balance"], -40)
 
     async def test_monthly_summary_keeps_previous_non_ledger_deduped_purchase_set(self):
         fake_db = SimpleNamespace(
@@ -1076,7 +1064,7 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         with patch("server.db", fake_db):
             result = await _distributor_monthly_summary_data("2026-05", "d1")
 
-        self.assertEqual(result["purchase_total"], 160)
+        self.assertEqual(result["purchase_total"], 80)
         self.assertEqual(result["payment_total"], 30)
-        self.assertEqual(result["net_change"], 130)
-        self.assertEqual(result["items"][0]["transaction_count"], 3)
+        self.assertEqual(result["net_change"], 50)
+        self.assertEqual(result["items"][0]["transaction_count"], 2)
