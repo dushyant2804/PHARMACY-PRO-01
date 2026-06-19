@@ -935,6 +935,25 @@ class MedicineCreate(BaseModel):
 
 class LowStockStatusUpdate(BaseModel):
     status: Literal["low_stock", "reordered", "abandoned", "restocked"]
+
+
+class LowStockThresholdUpdate(BaseModel):
+    threshold: int
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_threshold_name(cls, data):
+        if isinstance(data, dict) and "threshold" not in data and "low_stock_threshold" in data:
+            return {**data, "threshold": data["low_stock_threshold"]}
+        return data
+
+
+class LowStockThresholdUnlock(BaseModel):
+    privacy_password: str
+
+
+class PrivacyPasswordUpdate(BaseModel):
+    privacy_password: str
     
 # Keep migration-only types separate so they can be removed from the normal
 # workflow without changing the permanent adjustment types. Existing records
@@ -2065,6 +2084,33 @@ async def reset_password(payload: ResetPasswordRequest):
     return {"ok": True, "password_changed_at": changed_at}
 
 
+@api_router.post("/settings/privacy-password")
+@api_router.patch("/settings/privacy-password")
+async def set_privacy_password(
+    payload: PrivacyPasswordUpdate,
+    user: dict = Depends(require_role("admin")),
+):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    _validate_password_strength(payload.privacy_password)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.settings.update_one(
+        _privacy_settings_filter(user),
+        {
+            "$set": {
+                "key": "privacy_password",
+                "tenant_id": user.get("tenant_id"),
+                "privacy_password_hash": hash_password(payload.privacy_password),
+                "updated_at": now_iso,
+                "updated_by": user.get("id") or user.get("email"),
+            },
+            "$setOnInsert": {"created_at": now_iso},
+        },
+        upsert=True,
+    )
+    return {"ok": True, "privacy_password_configured": True, "updated_at": now_iso}
+
+
 # ---------------- Medicines ----------------
 def _medicine_identity_filter(medicine_id: str) -> dict:
     return {
@@ -2073,6 +2119,26 @@ def _medicine_identity_filter(medicine_id: str) -> dict:
             {"medicine_key": medicine_id},
         ]
     }
+
+
+def _threshold_response(medicine: dict) -> dict:
+    return {
+        "medicine_id": medicine.get("id") or medicine.get("medicine_key"),
+        "low_stock_threshold": medicine.get("low_stock_threshold"),
+        "threshold_locked": bool(medicine.get("threshold_locked")),
+        "threshold_unlocked": bool(medicine.get("threshold_unlocked")),
+        "threshold_updated_at": medicine.get("threshold_updated_at"),
+        "threshold_set_by": medicine.get("threshold_set_by"),
+    }
+
+
+def _privacy_settings_filter(user: dict) -> dict:
+    return {"key": "privacy_password", "tenant_id": user.get("tenant_id")}
+
+
+async def _privacy_password_hash(user: dict) -> Optional[str]:
+    settings = await db.settings.find_one(_privacy_settings_filter(user), {"_id": 0})
+    return (settings or {}).get("privacy_password_hash")
 
 
 def _fifo_expiry_key(batch: dict) -> tuple:
@@ -2344,6 +2410,7 @@ async def list_medicines(
         m["status"] = return_status
         m["stock_status"] = _inventory_stock_status(m, today)
         m["low_stock_status"] = _low_stock_status(m)
+        m.update(_threshold_response(m))
         m.update(_inventory_category(m.get("category")))
 
         # EXPIRY WARNING SYSTEM
@@ -2380,6 +2447,18 @@ async def list_medicines(
 
                 "low_stock_status":
                     _low_stock_status(m),
+
+                "threshold_locked":
+                    bool(m.get("threshold_locked")),
+
+                "threshold_unlocked":
+                    bool(m.get("threshold_unlocked")),
+
+                "threshold_updated_at":
+                    m.get("threshold_updated_at"),
+
+                "threshold_set_by":
+                    m.get("threshold_set_by"),
 
                 "sold_units":
                     0,
@@ -2524,6 +2603,18 @@ async def list_medicines(
             "low_stock_status":
                 _low_stock_status(m),
 
+            "threshold_locked":
+                bool(m.get("threshold_locked")),
+
+            "threshold_unlocked":
+                bool(m.get("threshold_unlocked")),
+
+            "threshold_updated_at":
+                m.get("threshold_updated_at"),
+
+            "threshold_set_by":
+                m.get("threshold_set_by"),
+
             "batch_no":
                 m.get("batch_no"),
 
@@ -2653,34 +2744,81 @@ async def update_low_stock_status(
 
 
 @api_router.put("/medicines/{medicine_id}/threshold")
-async def update_threshold(
+@api_router.patch("/inventory/{medicine_id}/low-stock-threshold")
+async def update_low_stock_threshold(
     medicine_id: str,
-    payload: dict,
-    user: dict = Depends(require_role("admin", "pharmacist"))
+    payload: LowStockThresholdUpdate,
+    user: dict = Depends(require_role("admin", "pharmacist")),
 ):
-
     medicine_filter = _medicine_identity_filter(medicine_id)
+    existing = await db.medicines.find_one(medicine_filter, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Medicine not found")
 
+    locked = bool(existing.get("threshold_locked"))
+    unlocked = bool(existing.get("threshold_unlocked"))
+    if locked and not unlocked:
+        raise HTTPException(status_code=403, detail="Low stock threshold is locked; admin privacy unlock required")
+    if locked and unlocked and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can edit unlocked low stock thresholds")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
     result = await db.medicines.update_one(
         medicine_filter,
         {
             "$set": {
-                "low_stock_threshold": int(payload["low_stock_threshold"])
+                "low_stock_threshold": int(payload.threshold),
+                "threshold_locked": True,
+                "threshold_unlocked": False,
+                "threshold_updated_at": now_iso,
+                "threshold_set_by": user.get("id") or user.get("email"),
             }
-        }
+        },
     )
-
-    # IMPORTANT: verify update happened
     if result.matched_count == 0:
         raise HTTPException(404, "Medicine not found")
 
-    # return fresh value
-    updated = await db.medicines.find_one(medicine_filter)
+    updated = await db.medicines.find_one(medicine_filter, {"_id": 0})
+    return {"message": "threshold updated", **_threshold_response(updated)}
 
-    return {
-        "message": "threshold updated",
-        "low_stock_threshold": updated.get("low_stock_threshold")
-    }
+
+async def update_threshold(
+    medicine_id: str,
+    payload: dict,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    threshold = payload.get("threshold", payload.get("low_stock_threshold"))
+    return await update_low_stock_threshold(
+        medicine_id,
+        LowStockThresholdUpdate(threshold=threshold),
+        user=user,
+    )
+
+
+@api_router.post("/inventory/{medicine_id}/low-stock-threshold/unlock")
+async def unlock_low_stock_threshold(
+    medicine_id: str,
+    payload: LowStockThresholdUnlock,
+    user: dict = Depends(require_role("admin")),
+):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    stored_hash = await _privacy_password_hash(user)
+    if not stored_hash:
+        raise HTTPException(status_code=400, detail="Privacy password is not configured")
+    if not verify_password(payload.privacy_password, stored_hash):
+        raise HTTPException(status_code=403, detail="Invalid privacy password")
+
+    medicine_filter = _medicine_identity_filter(medicine_id)
+    result = await db.medicines.update_one(
+        medicine_filter,
+        {"$set": {"threshold_unlocked": True}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Medicine not found")
+
+    updated = await db.medicines.find_one(medicine_filter, {"_id": 0})
+    return {"message": "threshold unlocked", **_threshold_response(updated)}
 
 def _manual_sold_capacity(batch: dict) -> float:
     purchased = max(0.0, _purchased_stock(batch) + _stock_adjustment_stock(batch))
