@@ -5396,17 +5396,6 @@ def _distributor_opening_balance_deduped_transactions(
     ):
         deduped.append(opening_txn or _opening_balance_transaction(distributor))
     deduped.extend(non_opening_txns)
-    # Purchase orders are projected into the ledger as synthetic purchase rows.
-    # Suppress a PO mirror here, before any accounting consumer calculates
-    # balances, when its normalized invoice identity belongs to the opening
-    # balance.  Keeping this guard in the canonical opening-balance path also
-    # protects monthly summaries and rebuild/report callers that do not run the
-    # endpoint's later display-only purchase dedupe.
-    deduped = [
-        txn
-        for txn in deduped
-        if not _synthetic_po_opening_balance_skip_reason(txn, deduped, distributor_id)
-    ]
     return _dedupe_distributor_opening_balance_rows(deduped, distributor_id)
 
 
@@ -5486,14 +5475,11 @@ def _purchase_invoice_identity_keys(txn: dict, distributor_id: str | None = None
 
 
 def _purchase_invoice_row_score(txn: dict) -> tuple[int, int, int, int]:
-    """Prefer richer canonical purchase rows, especially purchase-order-backed rows."""
+    """Prefer richer canonical persisted purchase rows when duplicate invoices exist."""
     if not isinstance(txn, dict):
         return (0, 0, 0, 0)
     has_po_id = int(bool(txn.get("purchase_order_id") or txn.get("po_id")))
-    is_po_source = int(
-        txn.get("source") == "purchase_order"
-        or str(txn.get("id") or "").startswith("purchase-order-")
-    )
+    is_po_source = int(txn.get("source") == "purchase_order")
     metadata_fields = (
         "items", "bill_amount", "paid_amount", "due_amount", "invoice_number",
         "invoice_no", "bill_number", "bill_no", "reference_number", "reference", "notes",
@@ -5530,242 +5516,6 @@ def _canonical_purchase_invoice_display_row(existing: dict, candidate: dict) -> 
 
 
 
-def _synthetic_po_matches_opening_balance_display_row(candidate: dict, opening_row: dict, distributor_id: str | None = None) -> bool:
-    """Display-only guard for PO rows that mirror a generated opening balance."""
-    if not isinstance(candidate, dict) or not isinstance(opening_row, dict):
-        return False
-    if str(candidate.get("type") or "").strip().lower() != "purchase":
-        return False
-    if not (candidate.get("is_synthetic") and candidate.get("backend_row_source") == "purchase_orders"):
-        return False
-    opening_distributor_id = str(distributor_id or opening_row.get("distributor_id") or "").strip()
-    candidate_distributor_id = str(distributor_id or candidate.get("distributor_id") or "").strip()
-    if opening_distributor_id != candidate_distributor_id:
-        return False
-    if not (opening_row.get("is_opening_balance") or _is_explicit_opening_balance_transaction(opening_row, opening_distributor_id)):
-        return False
-    candidate_date = _distributor_transaction_date(candidate)
-    opening_date = _distributor_transaction_date(opening_row)
-    if not candidate_date or not opening_date or abs((candidate_date - opening_date).days) > 1:
-        return False
-    candidate_refs = _purchase_invoice_reference_values(candidate)
-    opening_refs = _purchase_invoice_reference_values(opening_row)
-    date_difference_days = abs((candidate_date - opening_date).days)
-    same_normalized_amount = (
-        _ledger_amount_key(candidate.get("amount")) == _ledger_amount_key(opening_row.get("amount"))
-    )
-    return (
-        bool(candidate_refs & opening_refs)
-        and (date_difference_days == 0 or same_normalized_amount)
-    )
-
-
-def _synthetic_po_opening_balance_skip_reason(candidate: dict, transactions: list[dict], distributor_id: str | None = None) -> str | None:
-    for opening_row in transactions:
-        if _synthetic_po_matches_opening_balance_display_row(candidate, opening_row, distributor_id):
-            return "matched_opening_balance_invoice_identity"
-    return None
-
-
-def _rk_opening_balance_mirror_check(candidate: dict, opening_row: dict, distributor_id: str) -> dict:
-    """Explain every condition in the existing display-only opening-balance rule."""
-    checks = []
-
-    def check(name: str, matched: bool, actual=None, expected=None):
-        checks.append({
-            "check": name,
-            "matched": matched,
-            "actual": _json_safe_ledger_value(actual),
-            "expected": _json_safe_ledger_value(expected),
-        })
-        return matched
-
-    candidate_type = str(candidate.get("type") or "").strip().lower()
-    candidate_source = candidate.get("backend_row_source")
-    candidate_distributor_id = str(candidate.get("distributor_id") or distributor_id).strip()
-    opening_distributor_id = str(opening_row.get("distributor_id") or distributor_id).strip()
-    candidate_date = _distributor_transaction_date(candidate)
-    opening_date = _distributor_transaction_date(opening_row)
-    candidate_refs = _purchase_invoice_reference_values(candidate)
-    opening_refs = _purchase_invoice_reference_values(opening_row)
-    date_difference_days = (
-        abs((candidate_date - opening_date).days)
-        if candidate_date and opening_date
-        else None
-    )
-    same_normalized_amount = (
-        _ledger_amount_key(candidate.get("amount")) == _ledger_amount_key(opening_row.get("amount"))
-    )
-
-    conditions = [
-        check("candidate_is_purchase", candidate_type == "purchase", candidate_type, "purchase"),
-        check(
-            "candidate_is_synthetic_purchase_order",
-            bool(candidate.get("is_synthetic")) and candidate_source == "purchase_orders",
-            {"is_synthetic": bool(candidate.get("is_synthetic")), "source": candidate_source},
-            {"is_synthetic": True, "source": "purchase_orders"},
-        ),
-        check(
-            "same_distributor",
-            candidate_distributor_id == opening_distributor_id,
-            candidate_distributor_id,
-            opening_distributor_id,
-        ),
-        check(
-            "row_is_opening_balance",
-            bool(
-                opening_row.get("is_opening_balance")
-                or _is_explicit_opening_balance_transaction(opening_row, opening_distributor_id)
-            ),
-            opening_row.get("type"),
-            "opening_balance",
-        ),
-        check(
-            "normalized_reference_intersection",
-            bool(candidate_refs & opening_refs),
-            sorted(candidate_refs),
-            sorted(opening_refs),
-        ),
-        check(
-            "same_date_or_adjacent_date_with_matching_amount",
-            date_difference_days is not None
-            and date_difference_days <= 1
-            and (date_difference_days == 0 or same_normalized_amount),
-            {
-                "date_difference_days": date_difference_days,
-                "same_normalized_amount": same_normalized_amount,
-            },
-            {
-                "same_date": True,
-                "or": {"date_difference_days": "<= 1", "same_normalized_amount": True},
-            },
-        ),
-    ]
-
-    matched = all(conditions)
-    failed = [item["check"] for item in checks if not item["matched"]]
-    return {
-        "opening_balance_row_id": _serializable_transaction_id(opening_row.get("id")),
-        "matched": matched,
-        "reason": "matched_opening_balance_invoice_identity" if matched else "failed: " + ", ".join(failed),
-        "checks": checks,
-    }
-
-
-def _synthetic_po_persisted_transaction_skip_reason(
-    candidate: dict,
-    transactions: list[dict],
-    distributor_id: str | None = None,
-) -> str | None:
-    """Prefer a persisted purchase row over its display-only synthetic PO mirror."""
-    if not isinstance(candidate, dict):
-        return None
-    if str(candidate.get("type") or "").strip().lower() != "purchase":
-        return None
-    if not (candidate.get("is_synthetic") and candidate.get("backend_row_source") == "purchase_orders"):
-        return None
-
-    candidate_distributor_id = str(distributor_id or candidate.get("distributor_id") or "").strip()
-    candidate_date = _distributor_transaction_date(candidate)
-    candidate_refs = _purchase_invoice_reference_values(candidate)
-    for persisted in transactions:
-        if persisted is candidate or persisted.get("backend_row_source") != "distributor_transactions":
-            continue
-        if str(persisted.get("type") or "").strip().lower() not in {"purchase", "sale"}:
-            continue
-        persisted_distributor_id = str(distributor_id or persisted.get("distributor_id") or "").strip()
-        if persisted_distributor_id != candidate_distributor_id:
-            continue
-        persisted_date = _distributor_transaction_date(persisted)
-        persisted_refs = _purchase_invoice_reference_values(persisted)
-        if candidate_refs and persisted_refs:
-            if candidate_refs & persisted_refs:
-                if (
-                    _ledger_amount_key(candidate.get("amount"))
-                    != _ledger_amount_key(persisted.get("amount"))
-                ):
-                    continue
-                if not candidate_date or not persisted_date:
-                    continue
-                date_gap = abs((candidate_date - persisted_date).days)
-                if date_gap > 45:
-                    continue
-                raw_candidate_refs = {
-                    _normalize_ledger_invoice_identity_value(candidate.get(field))
-                    for field in ("invoice_no", "invoice_number", "invoice_ref")
-                    if candidate.get(field)
-                }
-                raw_persisted_refs = {
-                    _normalize_ledger_invoice_identity_value(persisted.get(field))
-                    for field in ("invoice_no", "invoice_number", "invoice_ref")
-                    if persisted.get(field)
-                }
-                if raw_candidate_refs & raw_persisted_refs:
-                    return (
-                        "matched_persisted_transaction_invoice_identity"
-                        if date_gap == 0
-                        else "matched_invoice_identity_with_date_tolerance"
-                    )
-                return "matched_normalized_invoice_prefix"
-            continue
-        if (
-            candidate_date == persisted_date
-            and _ledger_amount_key(candidate.get("amount"))
-            == _ledger_amount_key(persisted.get("amount"))
-        ):
-            return "matched persisted distributor transaction by distributor, date, and rounded amount because invoice identity is missing"
-    return None
-
-
-def _vishal_series_typo_identity(refs: set[str]) -> set[str]:
-    identities = set()
-    for ref in refs:
-        match = re.fullmatch(r"(vs?)(\d{2}-\d{2}/)(\d+)", ref, flags=re.IGNORECASE)
-        if match:
-            identities.add((match.group(2).casefold(), match.group(3)))
-    return identities
-
-
-def _synthetic_po_vishal_series_typo_skip_reason(
-    candidate: dict,
-    transactions: list[dict],
-    distributor_id: str | None = None,
-) -> str | None:
-    if not (
-        isinstance(candidate, dict)
-        and str(candidate.get("type") or "").strip().lower() == "purchase"
-        and candidate.get("is_synthetic")
-        and candidate.get("backend_row_source") == "purchase_orders"
-    ):
-        return None
-    candidate_refs = _purchase_invoice_reference_values(candidate)
-    candidate_series = _vishal_series_typo_identity(candidate_refs)
-    candidate_date = _distributor_transaction_date(candidate)
-    candidate_distributor_id = str(distributor_id or candidate.get("distributor_id") or "").strip()
-    if not candidate_series or not candidate_date:
-        return None
-    for persisted in transactions:
-        if persisted is candidate or persisted.get("backend_row_source") != "distributor_transactions":
-            continue
-        if str(persisted.get("type") or "").strip().lower() not in {"purchase", "sale", "opening_balance"}:
-            continue
-        if str(distributor_id or persisted.get("distributor_id") or "").strip() != candidate_distributor_id:
-            continue
-        persisted_date = _distributor_transaction_date(persisted)
-        if (
-            not persisted_date
-            or abs((candidate_date - persisted_date).days) > 45
-            or _ledger_amount_key(candidate.get("amount")) != _ledger_amount_key(persisted.get("amount"))
-        ):
-            continue
-        persisted_refs = _purchase_invoice_reference_values(persisted)
-        if candidate_series & _vishal_series_typo_identity(persisted_refs):
-            candidate_prefixes = {ref[:2] for ref in candidate_refs if re.match(r"^vs?\d", ref)}
-            persisted_prefixes = {ref[:2] for ref in persisted_refs if re.match(r"^vs?\d", ref)}
-            if candidate_prefixes != persisted_prefixes:
-                return "matched_vishal_series_typo"
-    return None
-
 
 def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distributor_id: str | None = None) -> list[dict]:
     """Keep one purchase ledger row per distributor invoice identity; never dedupe payments."""
@@ -5775,28 +5525,6 @@ def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distribu
     next_group = 0
 
     for txn in transactions:
-        opening_balance_skip_reason = _synthetic_po_opening_balance_skip_reason(txn, transactions, distributor_id)
-        if opening_balance_skip_reason:
-            txn["synthetic_purchase_order_skipped"] = True
-            txn["synthetic_purchase_order_skip_reason"] = opening_balance_skip_reason
-            continue
-        persisted_skip_reason = _synthetic_po_persisted_transaction_skip_reason(
-            txn,
-            transactions,
-            distributor_id,
-        )
-        if persisted_skip_reason:
-            txn["synthetic_purchase_order_skipped"] = True
-            txn["synthetic_purchase_order_skip_reason"] = persisted_skip_reason
-            continue
-        vishal_skip_reason = _synthetic_po_vishal_series_typo_skip_reason(
-            txn, transactions, distributor_id
-        )
-        if vishal_skip_reason:
-            txn["synthetic_purchase_order_skipped"] = True
-            txn["synthetic_purchase_order_skip_reason"] = vishal_skip_reason
-            continue
-
         # Persisted rows are accounting records, not display artifacts. Never
         # collapse two distributor_transactions rows against each other.
         if not (
@@ -5861,27 +5589,7 @@ def _final_distributor_ledger_rows(
     distributor_id: str,
 ) -> list[dict]:
     """Return the authoritative post-dedupe rows for display and accounting."""
-    persisted_transactions = [
-        txn for txn in transactions
-        if txn.get("backend_row_source") == "distributor_transactions"
-    ]
-    candidates = []
-    for txn in transactions:
-        if txn.get("is_synthetic") and txn.get("backend_row_source") == "purchase_orders":
-            matched, persisted, reason = _po_synthetic_matches_persisted_distributor_transaction(
-                txn,
-                persisted_transactions,
-                distributor_id,
-            )
-            if matched:
-                if persisted is not None:
-                    persisted.setdefault("matched_purchase_order_id", txn.get("purchase_order_id"))
-                    persisted.setdefault("matched_purchase_order_object_id", txn.get("purchase_order_object_id"))
-                    persisted.setdefault("synthetic_purchase_order_skipped", True)
-                    persisted.setdefault("synthetic_purchase_order_skip_reason", reason)
-                continue
-        candidates.append(txn)
-    return _dedupe_distributor_purchase_invoice_rows(candidates, distributor_id)
+    return _dedupe_distributor_purchase_invoice_rows(transactions, distributor_id)
 
 
 def _ledger_row_persisted_id(txn: dict) -> str | None:
@@ -5910,72 +5618,6 @@ def _annotate_distributor_transaction_source(txn: dict) -> dict:
     return annotated
 
 
-def _purchase_order_synthetic_duplicate_reason(candidate: dict, persisted: dict, distributor_id: str) -> str | None:
-    candidate_keys = set(_purchase_invoice_identity_keys(candidate, distributor_id))
-    persisted_keys = set(_purchase_invoice_identity_keys(persisted, distributor_id))
-    shared_keys = candidate_keys & persisted_keys
-    if not shared_keys:
-        candidate_raw_refs = {
-            _normalize_ledger_invoice_identity_value(candidate.get(field))
-            for field in ("invoice_no", "invoice_number", "invoice_ref")
-            if candidate.get(field)
-        }
-        persisted_raw_refs = {
-            _normalize_ledger_invoice_identity_value(persisted.get(field))
-            for field in ("invoice_no", "invoice_number", "invoice_ref")
-            if persisted.get(field)
-        }
-        if (
-            candidate_raw_refs & persisted_raw_refs
-            and any(ref.startswith("(") for ref in candidate_raw_refs & persisted_raw_refs)
-            and _distributor_transaction_date(candidate) == _distributor_transaction_date(persisted)
-            and abs(
-                _ledger_amount_key(candidate.get("amount"))
-                - _ledger_amount_key(persisted.get("amount"))
-            ) <= 1.01
-        ):
-            return "matched persisted distributor transaction by existing ARORA series and rounding rule"
-        return None
-
-    has_invoice_identity = any(key[1] == "ref" for key in shared_keys if len(key) > 1)
-    has_po_identity = any(key[1] == "po" for key in shared_keys if len(key) > 1)
-    if has_invoice_identity:
-        return "matched persisted distributor transaction by distributor, invoice/ref identity, date, and rounded amount"
-    if has_po_identity:
-        return "matched persisted distributor transaction by distributor and purchase_order_id/po_id"
-    return "matched persisted distributor transaction by strong invoice identity"
-
-
-def _po_synthetic_matches_persisted_distributor_transaction(candidate: dict, persisted_transactions: list[dict], distributor_id: str) -> tuple[bool, dict | None, str | None]:
-    for persisted in persisted_transactions:
-        persisted_type = str(persisted.get("type") or "").strip().lower()
-        if persisted_type not in {"purchase", "sale", "opening_balance"}:
-            continue
-        reason = _purchase_order_synthetic_duplicate_reason(candidate, persisted, distributor_id)
-        if reason:
-            return True, persisted, reason
-    reason = _synthetic_po_persisted_transaction_skip_reason(
-        candidate, persisted_transactions, distributor_id
-    )
-    if reason:
-        for persisted in persisted_transactions:
-            if (
-                persisted.get("backend_row_source") == "distributor_transactions"
-                and str(persisted.get("type") or "").strip().lower() in {"purchase", "sale", "opening_balance"}
-                and str(persisted.get("distributor_id") or distributor_id).strip() == str(distributor_id).strip()
-            ):
-                persisted_refs = _purchase_invoice_reference_values(persisted)
-                if persisted_refs & _purchase_invoice_reference_values(candidate):
-                    return True, persisted, reason
-    reason = _synthetic_po_vishal_series_typo_skip_reason(
-        candidate, persisted_transactions, distributor_id
-    )
-    if reason:
-        candidate_series = _vishal_series_typo_identity(_purchase_invoice_reference_values(candidate))
-        for persisted in persisted_transactions:
-            if candidate_series & _vishal_series_typo_identity(_purchase_invoice_reference_values(persisted)):
-                return True, persisted, reason
-    return False, None, None
 
 def _current_distributor_balance(distributor: dict, transactions: list[dict]) -> float:
     balance = 0.0
@@ -6016,49 +5658,6 @@ def _belongs_to_distributor(row: dict, identity_values: set[str], names: set[str
     return bool(row_names & names)
 
 
-def _purchase_order_ledger_transaction(po: dict, distributor_id: str) -> dict:
-    transaction_date = po.get("po_date") or po.get("created_at")
-    purchase_order_id = po.get("id") or po.get("_id")
-    return {
-        "id": f"purchase-order-{purchase_order_id or po.get('po_no') or po.get('invoice_ref')}",
-        "purchase_order_id": purchase_order_id,
-        "purchase_order_object_id": str(po.get("_id")) if po.get("_id") is not None else None,
-        "distributor_id": distributor_id,
-        "type": "purchase",
-        "display_type": "Purchase",
-        "amount": _safe_float(po.get("grand_total", po.get("total", 0))),
-        "invoice_number": po.get("invoice_ref"),
-        "invoice_ref": po.get("invoice_ref"),
-        "bill_number": po.get("po_no"),
-        "bill_no": po.get("po_no"),
-        "po_no": po.get("po_no"),
-        "reference_number": po.get("invoice_ref") or po.get("po_no"),
-        "items": po.get("items") or [],
-        "notes": po.get("notes"),
-        "created_at": transaction_date,
-        "transaction_date": transaction_date,
-        "date": transaction_date,
-        "is_system_generated": True,
-        "is_synthetic": True,
-        "source": "purchase_orders",
-        "backend_row_source": "purchase_orders",
-        "transaction_id": None,
-        "can_edit": False,
-        "can_delete": False,
-    }
-
-
-def _purchase_transaction_matches_po(txn: dict, po: dict) -> bool:
-    if str(txn.get("type") or "").lower() not in {"purchase", "sale"}:
-        return False
-    po_ids = {str(value) for value in (po.get("id"), po.get("po_no"), po.get("invoice_ref")) if value}
-    txn_refs = {
-        str(txn.get(field))
-        for field in ("purchase_order_id", "po_id", "reference", "reference_number",
-                      "invoice_number", "bill_number", "id")
-        if txn.get(field)
-    }
-    return bool(po_ids & txn_refs)
 
 
 
@@ -6067,7 +5666,6 @@ async def _canonical_distributor_ledger_transactions(
     requested_id: str | None = None,
     raw_transactions: list[dict] | None = None,
     purchase_orders: list[dict] | None = None,
-    include_matched_synthetic_po_rows: bool = False,
 ) -> list[dict]:
     """Build the single canonical transaction set used for distributor accounting.
 
@@ -6085,36 +5683,14 @@ async def _canonical_distributor_ledger_transactions(
 
     if raw_transactions is None:
         raw_transactions = await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000)
-    if purchase_orders is None:
-        purchase_orders = (
-            await db.purchase_orders.find({}, {"_id": 0}).to_list(10000)
-            if hasattr(db, "purchase_orders")
-            else []
-        )
-
+    # Purchase Orders are inventory documents only. Do not project purchase_orders
+    # into Distributor Ledger; payable balances must be based solely on persisted
+    # distributor_transactions plus opening-balance normalization.
     txns = [
         _annotate_distributor_transaction_source(txn)
         for txn in raw_transactions
         if _belongs_to_distributor(txn, identity_values, names)
     ]
-    for po in purchase_orders:
-        if not _belongs_to_distributor(po, identity_values, names):
-            continue
-        synthetic_po_txn = _purchase_order_ledger_transaction(po, did)
-        if not include_matched_synthetic_po_rows:
-            matched, persisted, reason = _po_synthetic_matches_persisted_distributor_transaction(
-                synthetic_po_txn,
-                txns,
-                did,
-            )
-            if matched:
-                if persisted is not None:
-                    persisted.setdefault("matched_purchase_order_id", synthetic_po_txn.get("purchase_order_id"))
-                    persisted.setdefault("matched_purchase_order_object_id", synthetic_po_txn.get("purchase_order_object_id"))
-                    persisted.setdefault("synthetic_purchase_order_skipped", True)
-                    persisted.setdefault("synthetic_purchase_order_skip_reason", reason)
-                continue
-        txns.append(synthetic_po_txn)
 
     canonical = _distributor_opening_balance_deduped_transactions(distributor, txns)
     canonical.sort(key=_distributor_fifo_sort_key)
@@ -6296,7 +5872,6 @@ async def _admin_distributor_ledger_debug_report(distributor_id: str) -> dict:
         distributor_id,
         raw_transactions=raw_transactions,
         purchase_orders=raw_purchase_orders,
-        include_matched_synthetic_po_rows=True,
     )
     final_rows = _dedupe_distributor_purchase_invoice_rows(
         canonical_rows,
@@ -6355,7 +5930,7 @@ async def admin_distributor_ledger_debug(
 async def _distributor_ledger_forensic_audit_for_dist(dist: dict, requested_id: str | None = None) -> dict:
     did = str(dist.get("id") or requested_id or "")
     before = await _canonical_distributor_ledger_transactions(
-        dist, requested_id, include_matched_synthetic_po_rows=True
+        dist, requested_id
     )
     after = _dedupe_distributor_purchase_invoice_rows(before, did)
     before_report = [_forensic_row(row, did) for row in before]
@@ -6457,16 +6032,12 @@ async def distributor_ledger(
     if opening_balance_date:
         dist["opening_balance_date"] = opening_balance_date
 
-    # Materialize the same complete candidate set used by the admin/debug
-    # endpoint, then make the post-dedupe rows the sole source for display,
-    # running balances, period totals, and financial-year carry metadata.
-    # Pre-skipping matched PO mirrors here creates a separate accounting path
-    # from rows_removed_by_dedupe and can leave synthetic purchase_orders rows
-    # in the normal ledger totals when only the final dedupe recognizes them.
+    # Materialize persisted distributor ledger rows only, then make the
+    # post-dedupe rows the sole source for display, running balances, period
+    # totals, and financial-year carry metadata.
     canonical_txns = await _canonical_distributor_ledger_transactions(
             dist,
             did,
-            include_matched_synthetic_po_rows=True,
         )
     ledger_txns = _final_distributor_ledger_rows(
         canonical_txns,
@@ -7721,8 +7292,6 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
 
     distributors = await db.distributors.find(distributor_query, {"_id": 0}).to_list(1000)
     all_txns = await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000)
-    purchase_orders = await db.purchase_orders.find({}, {"_id": 0}).to_list(10000)
-
     summaries = {}
     for distributor in distributors:
         did = distributor.get("id")
@@ -7733,9 +7302,6 @@ async def _distributor_monthly_summary_data(month: str, distributor_id: Optional
             if distributor.get(field) and str(distributor.get(field)).strip()
         }
         dist_txns = [txn for txn in all_txns if _belongs_to_distributor(txn, identity_values, names)]
-        matching_pos = [po for po in purchase_orders if _belongs_to_distributor(po, identity_values, names)]
-        for po in matching_pos:
-            dist_txns.append(_purchase_order_ledger_transaction(po, str(did or distributor_id or "")))
 
         ledger_txns = _distributor_opening_balance_deduped_transactions(distributor, dist_txns)
         month_txns = [
