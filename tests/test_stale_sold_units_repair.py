@@ -138,6 +138,104 @@ class StaleSoldUnitsRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backed["sold_units"], 3)
         self.assertEqual(self.fake_db.audit_logs.rows, [])
 
+
+    async def test_legacy_null_id_row_with_broad_invoice_item_fallback_is_stale_and_clearable(self):
+        crocin = {
+            "medicine_key": "crocin drops::NC25011",
+            "name": "CROCIN DROPS",
+            "batch_no": "NC25011",
+            "purchased_units": 3,
+            "sold_units": 3,
+            "purchase_return_units": 0,
+            "stock_adjustment_units": 0,
+            "available_stock": 0,
+            "medicine_id": None,
+        }
+        fake_db = SimpleNamespace(
+            medicines=Collection([crocin]),
+            invoices=Collection([{
+                "id": "legacy-inv-1",
+                "items": [{
+                    "name": "CROCIN DROPS",
+                    "medicine_key": "crocin drops::NC25011",
+                    "quantity": 3,
+                }],
+            }]),
+            audit_logs=Collection(),
+        )
+
+        with patch("server.db", fake_db):
+            result = await list_stale_sold_units(self.admin)
+            clear_result = await clear_stale_sold_units(
+                StaleSoldUnitsClearRequest(
+                    medicine_id="crocin drops::NC25011",
+                    batch_no="NC25011",
+                    confirm=True,
+                ),
+                self.admin,
+            )
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["items"][0]["medicine_id"], "crocin drops::NC25011")
+        self.assertEqual(result["items"][0]["stale_sold_units"], 3)
+        self.assertTrue(clear_result["success"])
+        self.assertEqual(crocin["sold_units"], 0)
+        self.assertEqual(crocin["available_stock"], 3)
+
+    async def test_legacy_null_id_row_with_exact_invoice_item_batch_is_excluded(self):
+        crocin = {
+            "medicine_key": "crocin drops::NC25011",
+            "name": "CROCIN DROPS",
+            "batch_no": "NC25011",
+            "purchased_units": 3,
+            "sold_units": 3,
+            "medicine_id": None,
+        }
+        fake_db = SimpleNamespace(
+            medicines=Collection([crocin]),
+            invoices=Collection([{
+                "id": "legacy-inv-2",
+                "items": [{
+                    "medicine_key": "crocin drops::NC25011",
+                    "batch_no": "NC25011",
+                    "quantity": 3,
+                }],
+            }]),
+            audit_logs=Collection(),
+        )
+
+        with patch("server.db", fake_db):
+            result = await list_stale_sold_units(self.admin)
+
+        self.assertEqual(result["count"], 0)
+
+    async def test_exact_stock_deduction_still_excludes_legacy_null_id_row(self):
+        crocin = {
+            "medicine_key": "crocin drops::NC25011",
+            "name": "CROCIN DROPS",
+            "batch_no": "NC25011",
+            "purchased_units": 3,
+            "sold_units": 3,
+            "medicine_id": None,
+        }
+        fake_db = SimpleNamespace(
+            medicines=Collection([crocin]),
+            invoices=Collection([{
+                "id": "inv-deduction",
+                "stock_deductions": [{
+                    "medicine_key": "crocin drops::NC25011",
+                    "batch_no": "NC25011",
+                    "deduct": 3,
+                }],
+            }]),
+            audit_logs=Collection(),
+        )
+
+        with patch("server.db", fake_db):
+            result = await list_stale_sold_units(self.admin)
+
+        self.assertEqual(result["count"], 0)
+
     async def test_confirm_true_is_required(self):
         with patch("server.db", self.fake_db):
             with self.assertRaises(HTTPException) as caught:

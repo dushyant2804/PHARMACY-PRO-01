@@ -7115,7 +7115,7 @@ def _invoice_item_quantity(row: dict) -> float:
     return round_qty(row.get("deduct", row.get("quantity", row.get("units_dispensed", row.get("quantity_units", 0)))))
 
 
-def _invoice_row_matches_medicine_batch(row: dict, medicine: dict) -> bool:
+def _invoice_row_matches_medicine_batch(row: dict, medicine: dict, *, conservative_missing_batch: bool = True) -> bool:
     row_id = str(row.get("medicine_id") or "").strip()
     med_id = str(medicine.get("id") or "").strip()
     row_key = _normalized_stock_match_value(row.get("medicine_key"))
@@ -7126,9 +7126,17 @@ def _invoice_row_matches_medicine_batch(row: dict, medicine: dict) -> bool:
     identity_matches = bool((row_id and med_id and row_id == med_id) or (row_key and med_key and row_key == med_key))
     if not identity_matches:
         return False
-    # If an invoice row with this exact medicine identity lacks batch metadata, treat it
-    # as invoice-backed so the temporary repair tool cannot clear a possible real sale.
-    return not row_batch or not med_batch or row_batch == med_batch
+    if row_batch and med_batch:
+        return row_batch == med_batch
+    # If a real medicine id matches, missing legacy batch metadata may still be the
+    # only invoice evidence available. Legacy inventory rows without an id are more
+    # ambiguous, so callers can require an explicit batch match to avoid protecting
+    # manual sold_units with broad invoice item fallbacks.
+    return conservative_missing_batch and bool(row_id and med_id and row_id == med_id)
+
+
+def _invoice_item_can_conservatively_match_medicine(row: dict, medicine: dict) -> bool:
+    return bool(str(row.get("medicine_id") or "").strip() and str(medicine.get("id") or "").strip())
 
 
 async def _invoice_backed_sold_units_for_medicine_batch(medicine: dict) -> float:
@@ -7138,10 +7146,16 @@ async def _invoice_backed_sold_units_for_medicine_batch(medicine: dict) -> float
         return 0.0
     async for invoice in invoices_collection.find({}):
         deductions = invoice.get("stock_deductions") or []
-        rows = deductions if deductions else (invoice.get("items") or [])
-        for row in rows:
+        for row in deductions:
             quantity = _invoice_item_quantity(row)
             if quantity > 0 and _invoice_row_matches_medicine_batch(row, medicine):
+                total += quantity
+        if deductions:
+            continue
+        for row in invoice.get("items") or []:
+            quantity = _invoice_item_quantity(row)
+            conservative = _invoice_item_can_conservatively_match_medicine(row, medicine)
+            if quantity > 0 and _invoice_row_matches_medicine_batch(row, medicine, conservative_missing_batch=conservative):
                 total += quantity
     return round_qty(total)
 
@@ -7189,9 +7203,11 @@ async def clear_stale_sold_units(
 ):
     if payload.confirm is not True:
         raise HTTPException(status_code=400, detail="confirm must be true")
-    medicine = await db.medicines.find_one(
-        {"id": payload.medicine_id, "batch_no": payload.batch_no}, {"_id": 0}
-    )
+    medicine_query = {"id": payload.medicine_id, "batch_no": payload.batch_no}
+    medicine = await db.medicines.find_one(medicine_query, {"_id": 0})
+    if not medicine:
+        medicine_query = {"medicine_key": payload.medicine_id, "batch_no": payload.batch_no}
+        medicine = await db.medicines.find_one(medicine_query, {"_id": 0})
     if not medicine:
         raise HTTPException(status_code=404, detail="Medicine batch not found")
     old_sold_units = _stock_quantity(medicine, "sold_units", "sold_quantity")
@@ -7214,7 +7230,7 @@ async def clear_stale_sold_units(
         "status": status,
     }
     result = await db.medicines.update_one(
-        {"id": payload.medicine_id, "batch_no": payload.batch_no}, {"$set": update}
+        medicine_query, {"$set": update}
     )
     if not result or result.modified_count != 1:
         raise HTTPException(status_code=409, detail="Medicine batch changed; retry the repair")
