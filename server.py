@@ -829,6 +829,12 @@ class UserCreateByAdmin(UserRegister):
     role: Literal["admin", "cashier", "pharmacist"] = "cashier"
 
 
+class StaleSoldUnitsClearRequest(BaseModel):
+    medicine_id: str
+    batch_no: str
+    confirm: bool = False
+
+
 class UserLogin(BaseModel):
     email: Optional[EmailStr] = None
     mobile: Optional[str] = None
@@ -7103,6 +7109,132 @@ async def _run_startup_purchase_return_stock_recalculation() -> None:
         logger.info("Purchase return stock recalculation completed")
     except Exception:
         logger.exception("Purchase return stock recalculation failed during startup")
+
+
+def _invoice_item_quantity(row: dict) -> float:
+    return round_qty(row.get("deduct", row.get("quantity", row.get("units_dispensed", row.get("quantity_units", 0)))))
+
+
+def _invoice_row_matches_medicine_batch(row: dict, medicine: dict) -> bool:
+    row_id = str(row.get("medicine_id") or "").strip()
+    med_id = str(medicine.get("id") or "").strip()
+    row_key = _normalized_stock_match_value(row.get("medicine_key"))
+    med_key = _normalized_stock_match_value(medicine.get("medicine_key"))
+    row_batch = _normalized_stock_match_value(row.get("batch_no") or row.get("batch_number"))
+    med_batch = _normalized_stock_match_value(medicine.get("batch_no") or medicine.get("batch_number"))
+
+    identity_matches = bool((row_id and med_id and row_id == med_id) or (row_key and med_key and row_key == med_key))
+    if not identity_matches:
+        return False
+    # If an invoice row with this exact medicine identity lacks batch metadata, treat it
+    # as invoice-backed so the temporary repair tool cannot clear a possible real sale.
+    return not row_batch or not med_batch or row_batch == med_batch
+
+
+async def _invoice_backed_sold_units_for_medicine_batch(medicine: dict) -> float:
+    total = 0.0
+    invoices_collection = getattr(db, "invoices", None)
+    if invoices_collection is None:
+        return 0.0
+    async for invoice in invoices_collection.find({}):
+        deductions = invoice.get("stock_deductions") or []
+        rows = deductions if deductions else (invoice.get("items") or [])
+        for row in rows:
+            quantity = _invoice_item_quantity(row)
+            if quantity > 0 and _invoice_row_matches_medicine_batch(row, medicine):
+                total += quantity
+    return round_qty(total)
+
+
+def _stale_sold_units_repair_row(medicine: dict, invoice_backed_sold_units: float) -> dict:
+    sold_units = _stock_quantity(medicine, "sold_units", "sold_quantity")
+    current_stock = _available_stock(medicine)
+    without_stale = {**medicine, "sold_units": 0, "sold_quantity": 0}
+    return {
+        "medicine_id": medicine.get("id") or medicine.get("medicine_key"),
+        "medicine_name": medicine.get("name") or medicine.get("medicine_name") or "",
+        "batch_no": medicine.get("batch_no") or medicine.get("batch_number") or "",
+        "expiry": medicine.get("expiry_date") or medicine.get("expiry") or "",
+        "purchased_units": _purchased_stock(medicine),
+        "sold_units": sold_units,
+        "purchase_return_units": _purchase_return_stock(medicine),
+        "stock_adjustment_units": _stock_adjustment_stock(medicine),
+        "current_stock": current_stock,
+        "available_stock": current_stock,
+        "invoice_backed_sold_units": invoice_backed_sold_units,
+        "stale_sold_units": sold_units,
+        "calculated_stock_if_sold_units_removed": _available_stock(without_stale),
+        "reason": "No invoice-backed deduction found",
+    }
+
+
+@api_router.get("/admin/inventory/stale-sold-units")
+async def list_stale_sold_units(user: dict = Depends(require_role("admin"))):
+    rows = []
+    async for medicine in db.medicines.find({}, {"_id": 0}):
+        sold_units = _stock_quantity(medicine, "sold_units", "sold_quantity")
+        if sold_units <= 0:
+            continue
+        invoice_backed = await _invoice_backed_sold_units_for_medicine_batch(medicine)
+        if invoice_backed > 0:
+            continue
+        rows.append(_stale_sold_units_repair_row(medicine, invoice_backed))
+    return {"items": rows, "count": len(rows)}
+
+
+@api_router.post("/admin/inventory/stale-sold-units/clear")
+async def clear_stale_sold_units(
+    payload: StaleSoldUnitsClearRequest,
+    user: dict = Depends(require_role("admin")),
+):
+    if payload.confirm is not True:
+        raise HTTPException(status_code=400, detail="confirm must be true")
+    medicine = await db.medicines.find_one(
+        {"id": payload.medicine_id, "batch_no": payload.batch_no}, {"_id": 0}
+    )
+    if not medicine:
+        raise HTTPException(status_code=404, detail="Medicine batch not found")
+    old_sold_units = _stock_quantity(medicine, "sold_units", "sold_quantity")
+    if old_sold_units <= 0:
+        raise HTTPException(status_code=400, detail="No sold_units to clear for this batch")
+    invoice_backed = await _invoice_backed_sold_units_for_medicine_batch(medicine)
+    if invoice_backed > 0:
+        raise HTTPException(status_code=409, detail="Invoice-backed sold_units exist; refusing to clear")
+
+    old_stock = _available_stock(medicine)
+    refreshed = {**medicine, "sold_units": 0, "sold_quantity": 0}
+    new_stock = _available_stock(refreshed)
+    status = _return_status(refreshed)
+    update = {
+        "sold_units": 0,
+        "available_stock": new_stock,
+        "current_stock": new_stock,
+        "quantity_units": new_stock,
+        "return_status": status,
+        "status": status,
+    }
+    result = await db.medicines.update_one(
+        {"id": payload.medicine_id, "batch_no": payload.batch_no}, {"$set": update}
+    )
+    if not result or result.modified_count != 1:
+        raise HTTPException(status_code=409, detail="Medicine batch changed; retry the repair")
+
+    audit = {
+        "id": str(uuid.uuid4()),
+        "action": "clear_stale_sold_units",
+        "medicine_id": medicine.get("id") or payload.medicine_id,
+        "medicine_name": medicine.get("name") or medicine.get("medicine_name") or "",
+        "batch_no": medicine.get("batch_no") or payload.batch_no,
+        "old_sold_units": old_sold_units,
+        "new_sold_units": 0,
+        "old_stock": old_stock,
+        "new_stock": new_stock,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "performed_by": user.get("name") or user.get("email") or user.get("id") or "Unknown",
+        "reason": "No invoice-backed deduction found",
+    }
+    await db.audit_logs.insert_one(audit)
+    return {"success": True, "item": _stale_sold_units_repair_row({**medicine, **update}, 0), "audit_log": audit}
 
 
 @api_router.post("/admin/recalculate-purchase-return-stock")
