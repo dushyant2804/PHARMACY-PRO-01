@@ -8,7 +8,8 @@ from pydantic import ValidationError
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "test_pharmacy")
 
-from server import LowStockStatusUpdate, dashboard_summary, list_medicines, update_low_stock_status
+from fastapi import HTTPException
+from server import LowStockStatusUpdate, PrivacyPasswordUpdate, dashboard_summary, list_medicines, update_low_stock_status
 
 
 class _Cursor:
@@ -30,10 +31,24 @@ class _Collection:
     def find(self, query=None, projection=None):
         return _Cursor(self.records)
 
-    async def update_one(self, query, update):
-        identity = query.get("id") or query["$or"][0]["id"]
-        target = next(row for row in self.records if row.get("id") == identity)
+    async def find_one(self, query, projection=None):
+        if "$or" in query:
+            identity = query["$or"][0]["id"]
+            return next((row for row in self.records if row.get("id") == identity or row.get("medicine_key") == identity), None)
+        return next((row for row in self.records if all(row.get(k) == v for k, v in query.items())), None)
+
+    async def update_one(self, query, update, upsert=False):
+        target = await self.find_one(query)
+        if target is None and upsert:
+            target = dict(query)
+            self.records.append(target)
+        if target is None:
+            result = _UpdateResult()
+            result.matched_count = 0
+            return result
         target.update(update["$set"])
+        if "$setOnInsert" in update:
+            target.update(update["$setOnInsert"])
         return _UpdateResult()
 
 
@@ -87,6 +102,54 @@ class LowStockWorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_name["Two"]["medicine_id"], "legacy-med-2")
         self.assertEqual(by_name["Two"]["id"], "legacy-med-2")
         self.assertEqual(by_name["Two"]["_id"], "legacy-med-2")
+
+
+    async def test_low_stock_threshold_locks_unlocks_and_relocks(self):
+        from server import LowStockThresholdUpdate, LowStockThresholdUnlock, set_privacy_password, update_low_stock_threshold, unlock_low_stock_threshold
+        medicine = {"id": "med-1", "low_stock_threshold": 10}
+        medicines = _Collection([medicine])
+        settings = _Collection([])
+        fake_db = SimpleNamespace(medicines=medicines, settings=settings)
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1"}
+
+        with patch("server.db", fake_db):
+            first = await update_low_stock_threshold("med-1", LowStockThresholdUpdate(threshold=6), user=admin)
+            self.assertEqual(first["low_stock_threshold"], 6)
+            self.assertTrue(first["threshold_locked"])
+            self.assertFalse(first["threshold_unlocked"])
+
+            with self.assertRaisesRegex(Exception, "locked"):
+                await update_low_stock_threshold("med-1", LowStockThresholdUpdate(threshold=7), user=admin)
+
+            password_response = await set_privacy_password(PrivacyPasswordUpdate(privacy_password="Private1234"), user=admin)
+            self.assertTrue(password_response["privacy_password_configured"])
+            self.assertNotIn("privacy_password", password_response)
+            self.assertNotEqual(settings.records[0]["privacy_password_hash"], "Private1234")
+
+            unlocked = await unlock_low_stock_threshold("med-1", LowStockThresholdUnlock(privacy_password="Private1234"), user=admin)
+            self.assertTrue(unlocked["threshold_unlocked"])
+
+            updated = await update_low_stock_threshold("med-1", LowStockThresholdUpdate(threshold=8), user=admin)
+            self.assertEqual(updated["low_stock_threshold"], 8)
+            self.assertTrue(updated["threshold_locked"])
+            self.assertFalse(updated["threshold_unlocked"])
+
+    async def test_non_admin_cannot_unlock_or_edit_unlocked_threshold(self):
+        from server import LowStockThresholdUpdate, LowStockThresholdUnlock, PrivacyPasswordUpdate, set_privacy_password, update_low_stock_threshold, unlock_low_stock_threshold
+        medicine = {"id": "med-1", "low_stock_threshold": 5, "threshold_locked": True, "threshold_unlocked": True}
+        fake_db = SimpleNamespace(medicines=_Collection([medicine]), settings=_Collection([]))
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1"}
+        pharmacist = {"id": "pharm-1", "role": "pharmacist", "tenant_id": "shop-1"}
+
+        with patch("server.db", fake_db):
+            await set_privacy_password(PrivacyPasswordUpdate(privacy_password="Private1234"), user=admin)
+            with self.assertRaises(HTTPException) as unlock_error:
+                await unlock_low_stock_threshold("med-1", LowStockThresholdUnlock(privacy_password="Private1234"), user=pharmacist)
+            self.assertEqual(unlock_error.exception.status_code, 403)
+
+            with self.assertRaises(HTTPException) as edit_error:
+                await update_low_stock_threshold("med-1", LowStockThresholdUpdate(threshold=9), user=pharmacist)
+            self.assertEqual(edit_error.exception.status_code, 403)
 
     def test_invalid_status_rejected(self):
         with self.assertRaises(ValidationError):
