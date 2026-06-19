@@ -237,6 +237,37 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated["purchase_rate"], 12.0)
         self.assertEqual(updated["return_amount"], 24.0)
 
+    async def test_edit_accepts_frontend_display_fields_and_mm_yy_expiry(self):
+        async def fallback_only(operation, fallback):
+            return await fallback()
+        payload = PurchaseReturnUpdate.model_validate({
+            "id": "return-1",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "updated_at": "2026-06-02T00:00:00+00:00",
+            "distributor_name": "Display Distributor",
+            "medicine_name": "Display Medicine",
+            "medicine_key": "display::b1",
+            "batch_label": "Batch B1",
+            "status": "Active",
+            "total_amount": 20,
+            "ledger_transaction_id": "display-ledger",
+            "linked_transaction_id": "display-linked",
+            "expiry_date": "12/27",
+            "notes": " frontend edit ",
+        })
+        with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
+            updated = await update_purchase_return("return-1", payload, {"id": "user"})
+        self.assertEqual(updated["expiry_date"], "2027-12-31")
+        self.assertEqual(updated["notes"], "frontend edit")
+        self.assertNotIn("distributor_name", self.fake_db.purchase_returns.rows[0])
+        self.assertNotEqual(updated.get("ledger_transaction_id"), "display-ledger")
+
+    def test_edit_expiry_validation_uses_mm_yy_message_not_full_date(self):
+        with self.assertRaises(Exception) as caught:
+            PurchaseReturnUpdate.model_validate({"expiry_date": "not-expiry"})
+        self.assertIn("MM/YY", str(caught.exception))
+        self.assertNotIn("YYYY-MM-DD", str(caught.exception))
+
     async def test_settled_return_cannot_be_edited(self):
         self.fake_db.purchase_returns.rows[0].update({"settlement_status": "settled_by_po", "settled_by_po": "po-1"})
         with patch("server.db", self.fake_db):
@@ -317,6 +348,33 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.fake_db.distributor_transactions.rows), 0)
         self.assertFalse(self.fake_db.purchase_returns.rows[0]["ledger_adjusted"])
         self.assertIsNone(self.fake_db.purchase_returns.rows[0]["ledger_transaction_id"])
+        self.assertEqual(self.fake_db.purchase_returns.rows[0]["settlement_status"], "deleted")
+
+    async def test_delete_orphan_return_succeeds_skips_stock_and_warns(self):
+        self.fake_db.medicines.rows.clear()
+        async def fallback_only(operation, fallback):
+            return await fallback()
+        with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
+            response = await delete_purchase_return("return-1", {"id": "user"})
+        self.assertTrue(response["success"])
+        self.assertIn("warning", response)
+        self.assertEqual(self.fake_db.purchase_returns.rows[0]["settlement_status"], "deleted")
+
+    async def test_delete_orphan_ledger_adjusted_return_removes_ledger_transaction(self):
+        self.fake_db.medicines.rows.clear()
+        self.fake_db.purchase_returns.rows[0].update({
+            "ledger_adjusted": True, "adjust_distributor_ledger": True,
+            "ledger_transaction_id": "txn-1", "settlement_status": "ledger_adjusted",
+        })
+        self.fake_db.distributor_transactions.rows.append({
+            "id": "txn-1", "return_id": "return-1", "amount": 20,
+        })
+        async def fallback_only(operation, fallback):
+            return await fallback()
+        with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
+            response = await delete_purchase_return("return-1", {"id": "user"})
+        self.assertIn("warning", response)
+        self.assertEqual(len(self.fake_db.distributor_transactions.rows), 0)
         self.assertEqual(self.fake_db.purchase_returns.rows[0]["settlement_status"], "deleted")
 
 

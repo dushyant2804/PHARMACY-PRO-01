@@ -1445,22 +1445,64 @@ class PurchaseReturnCreate(BaseModel):
 
 
 class PurchaseReturnUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     return_date: Optional[str] = None
     reason: Optional[Literal["Expired", "Damaged", "Wrong Item", "Other"]] = None
     return_quantity: Optional[float] = None
     purchase_rate: Optional[float] = None
+    expiry_date: Optional[str] = None
     notes: Optional[str] = None
     distributor: Optional[str] = None
     distributor_id: Optional[str] = None
     adjust_distributor_ledger: Optional[bool] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_frontend_payload(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        alias_fields = {
+            "batch_number": ("batch", "batch_no", "batch_label"),
+            "expiry_date": ("expiry",),
+            "return_quantity": ("quantity",),
+            "purchase_rate": ("rate",),
+        }
+        for field_name, aliases in alias_fields.items():
+            if normalized.get(field_name) not in (None, ""):
+                continue
+            for alias in aliases:
+                if normalized.get(alias) not in (None, ""):
+                    normalized[field_name] = normalized[alias]
+                    break
+
+        reason = normalized.get("reason")
+        if isinstance(reason, str):
+            reason_lookup = {
+                "expired": "Expired",
+                "damaged": "Damaged",
+                "wrong item": "Wrong Item",
+                "wrong_item": "Wrong Item",
+                "other": "Other",
+            }
+            normalized["reason"] = reason_lookup.get(reason.strip().lower(), reason.strip())
+
+        return normalized
 
     @field_validator("return_date")
     @classmethod
     def validate_return_date(cls, value):
         if value is not None and not parse_iso_date(value):
             raise ValueError("return_date must be a valid ISO date")
+        return value
+
+    @field_validator("expiry_date")
+    @classmethod
+    def validate_expiry_date(cls, value):
+        if value is not None and value != "" and not parse_expiry_date(value):
+            raise ValueError("expiry_date must be a valid MM/YY value")
         return value
 
     @field_validator("return_quantity")
@@ -6886,6 +6928,13 @@ async def _find_purchase_return_medicine(payload: PurchaseReturnCreate, session=
     return medicine
 
 
+
+def _normalize_purchase_return_expiry(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return value
+    parsed = parse_expiry_date(value)
+    return parsed.isoformat() if parsed else value
+
 def _purchase_return_ledger_transaction(return_doc: dict) -> dict:
     return {
         "id": str(uuid.uuid4()),
@@ -7346,6 +7395,15 @@ async def _set_purchase_return_stock_delta(medicine_id: str, delta: float, sessi
         raise HTTPException(status_code=404, detail="Medicine batch not found")
 
 
+async def _restore_purchase_return_stock_if_present(medicine_id: Optional[str], quantity: float, session=None) -> bool:
+    if not medicine_id or not quantity:
+        return False
+    result = await _set_rounded_stock_delta(
+        medicine_id, "purchase_return_units", -quantity, session=session
+    )
+    return bool(result and result.modified_count == 1)
+
+
 async def _sync_purchase_return_ledger(old: dict, updated: dict, session=None):
     existing_id = old.get("ledger_transaction_id")
     should_adjust = bool(updated.get("adjust_distributor_ledger"))
@@ -7391,6 +7449,8 @@ async def update_purchase_return(
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         return _return_public(current)
+    if "expiry_date" in changes:
+        changes["expiry_date"] = _normalize_purchase_return_expiry(changes["expiry_date"])
     updated = {**current, **changes}
     updated["ledger_adjusted"] = bool(updated.get("adjust_distributor_ledger"))
     updated["purchase_rate"] = _money_float(_to_decimal(updated["purchase_rate"]))
@@ -7455,8 +7515,10 @@ async def delete_purchase_return(
                 {"id": current["ledger_transaction_id"], "return_id": return_id},
                 session=session,
             )
-        await _set_purchase_return_stock_delta(current["medicine_id"], -quantity, session=session)
-        stock_restored = True
+        stock_restored = await _restore_purchase_return_stock_if_present(
+            current.get("medicine_id"), quantity, session=session
+        )
+        stock_warning = None if stock_restored else "Stock restoration skipped because medicine was missing"
         result = await db.purchase_returns.update_one({
             "id": return_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]
         }, {"$set": {
@@ -7470,7 +7532,10 @@ async def delete_purchase_return(
         }}, session=session)
         if result.modified_count != 1:
             raise HTTPException(status_code=409, detail="Purchase return changed or was applied to a purchase order")
-        return {"success": True, "message": "Purchase return deleted", "id": return_id}
+        response = {"success": True, "message": "Purchase return deleted", "id": return_id}
+        if stock_warning:
+            response["warning"] = stock_warning
+        return response
 
     async def transaction_operation(session):
         return await write(session=session)
