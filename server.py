@@ -2086,6 +2086,7 @@ async def reset_password(payload: ResetPasswordRequest):
 
 @api_router.post("/settings/privacy-password")
 @api_router.patch("/settings/privacy-password")
+@api_router.put("/settings/privacy-password")
 async def set_privacy_password(
     payload: PrivacyPasswordUpdate,
     user: dict = Depends(require_role("admin")),

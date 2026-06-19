@@ -134,6 +134,40 @@ class LowStockWorkflowTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(updated["threshold_locked"])
             self.assertFalse(updated["threshold_unlocked"])
 
+    def test_privacy_password_save_route_supports_post_patch_and_put(self):
+        from server import app, set_privacy_password
+
+        matching_routes = [
+            route for route in app.routes
+            if getattr(route, "path", None) == "/api/settings/privacy-password"
+            and set(getattr(route, "methods", set())) & {"POST", "PATCH", "PUT"}
+        ]
+        methods = set().union(*(route.methods for route in matching_routes))
+
+        self.assertIn("POST", methods)
+        self.assertIn("PATCH", methods)
+        self.assertIn("PUT", methods)
+        self.assertTrue(all(route.endpoint is set_privacy_password for route in matching_routes))
+
+    async def test_privacy_password_save_hashes_password_and_returns_clear_success(self):
+        from server import set_privacy_password, verify_password
+
+        settings = _Collection([])
+        fake_db = SimpleNamespace(settings=settings)
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1"}
+
+        with patch("server.db", fake_db):
+            response = await set_privacy_password(PrivacyPasswordUpdate(privacy_password="Private1234"), user=admin)
+
+        self.assertEqual(response["ok"], True)
+        self.assertEqual(response["privacy_password_configured"], True)
+        self.assertIn("updated_at", response)
+        self.assertNotIn("privacy_password", response)
+        self.assertNotIn("privacy_password_hash", response)
+        saved_hash = settings.records[0]["privacy_password_hash"]
+        self.assertNotEqual(saved_hash, "Private1234")
+        self.assertTrue(verify_password("Private1234", saved_hash))
+
     async def test_non_admin_cannot_unlock_or_edit_unlocked_threshold(self):
         from server import LowStockThresholdUpdate, LowStockThresholdUnlock, PrivacyPasswordUpdate, set_privacy_password, update_low_stock_threshold, unlock_low_stock_threshold
         medicine = {"id": "med-1", "low_stock_threshold": 5, "threshold_locked": True, "threshold_unlocked": True}
