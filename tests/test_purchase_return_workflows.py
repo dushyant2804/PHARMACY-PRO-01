@@ -195,6 +195,25 @@ class PurchaseReturnEditDeleteTests(unittest.IsolatedAsyncioTestCase):
             distributor_transactions=Collection([]),
         )
 
+
+    def test_purchase_return_update_route_supports_patch_and_put(self):
+        from server import api_router
+        methods = set()
+        for route in api_router.routes:
+            if route.path.endswith("/purchase-returns/{return_id}"):
+                methods.update(route.methods)
+        self.assertIn("PATCH", methods)
+        self.assertIn("PUT", methods)
+
+    async def test_patch_handler_supports_non_ledger_adjusted_return(self):
+        async def fallback_only(operation, fallback):
+            return await fallback()
+        with patch("server.db", self.fake_db), patch("server._run_with_transaction", side_effect=fallback_only):
+            updated = await update_purchase_return("return-1", PurchaseReturnUpdate(notes="frontend patch"), {"id": "user"})
+        self.assertEqual(updated["notes"], "frontend patch")
+        self.assertFalse(updated["ledger_adjusted"])
+        self.assertIsNone(updated["ledger_transaction_id"])
+
     async def test_edit_quantity_applies_only_the_stock_delta(self):
         async def fallback_only(operation, fallback):
             return await fallback()
