@@ -114,6 +114,54 @@ class DistributorLedgerInclusionTests(unittest.IsolatedAsyncioTestCase):
                     [expected_id],
                 )
 
+    async def test_specific_financial_year_running_balance_includes_prior_history_and_summary_balance_is_all_time(self):
+        transactions = [
+            {"id": "opening-prev", "distributor_id": "d1", "type": "opening_balance", "amount": 100,
+             "created_at": "2025-03-31"},
+            {"id": "purchase-current", "distributor_id": "d1", "type": "purchase", "amount": 50,
+             "created_at": "2025-04-02"},
+            {"id": "payment-current", "distributor_id": "d1", "type": "payment", "amount": 30,
+             "created_at": "2025-04-03"},
+            {"id": "purchase-next", "distributor_id": "d1", "type": "purchase", "amount": 20,
+             "created_at": "2026-04-02"},
+        ]
+
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+            transactions,
+            [],
+            financial_year="2025-26",
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["purchase-current", "payment-current"])
+        self.assertEqual([row["running_balance"] for row in result["transactions"]], [150, 120])
+        self.assertEqual(result["total_purchases"], 50)
+        self.assertEqual(result["total_paid"], 30)
+        self.assertEqual(result["balance_for_selected_period"], 20)
+        self.assertEqual(result["net_balance_for_selected_period"], 20)
+        self.assertEqual(result["balance"], 140)
+
+    async def test_all_financial_year_running_balance_remains_full_history(self):
+        transactions = [
+            {"id": "opening-prev", "distributor_id": "d1", "type": "opening_balance", "amount": 100,
+             "created_at": "2025-03-31"},
+            {"id": "purchase-current", "distributor_id": "d1", "type": "purchase", "amount": 50,
+             "created_at": "2025-04-02"},
+            {"id": "payment-current", "distributor_id": "d1", "type": "payment", "amount": 30,
+             "created_at": "2025-04-03"},
+        ]
+
+        result = await self.ledger(
+            [{"id": "d1", "name": "Supplier", "opening_balance": 0}],
+            transactions,
+            [],
+            financial_year="ALL",
+        )
+
+        self.assertEqual([row["id"] for row in result["transactions"]], ["opening-prev", "purchase-current", "payment-current"])
+        self.assertEqual([row["running_balance"] for row in result["transactions"]], [100, 150, 120])
+        self.assertEqual(result["balance"], 120)
+
     def test_financial_year_normalization_keeps_invalid_values_for_validation(self):
         self.assertIsNone(_normalize_distributor_ledger_financial_year(None))
         self.assertIsNone(_normalize_distributor_ledger_financial_year(""))
@@ -439,13 +487,13 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
         purchase_rows = [row for row in result["transactions"] if row.get("type") == "purchase"]
         self.assertEqual(len(purchase_rows), 1)
         self.assertEqual(purchase_rows[0]["id"], "txn-q-4557")
-        self.assertEqual(purchase_rows[0]["_debug_source"], "distributor_transactions")
-        self.assertFalse(purchase_rows[0]["_debug_is_synthetic"])
-        self.assertEqual(purchase_rows[0]["_debug_transaction_id"], "txn-q-4557")
-        self.assertEqual(purchase_rows[0]["_debug_purchase_order_id"], "po-q-4557")
-        self.assertIn("4557", purchase_rows[0]["_debug_invoice_identity"])
-        self.assertTrue(any("4557" in key for key in purchase_rows[0]["_debug_dedupe_key"]))
-        self.assertIn("invoice/ref identity", purchase_rows[0]["_debug_skip_reason"])
+        self.assertEqual(purchase_rows[0]["backend_row_source"], "distributor_transactions")
+        self.assertFalse(purchase_rows[0]["is_synthetic"])
+        self.assertEqual(purchase_rows[0]["transaction_id"], "txn-q-4557")
+        self.assertEqual(purchase_rows[0]["matched_purchase_order_id"], "po-q-4557")
+        self.assertNotIn("_debug_source", purchase_rows[0])
+        self.assertNotIn("_debug_dedupe_key", purchase_rows[0])
+        self.assertIn("invoice/ref identity", purchase_rows[0]["synthetic_purchase_order_skip_reason"])
         self.assertEqual(result["total_purchases"], 1250)
         self.assertEqual(result["balance"], 1250)
 
@@ -792,83 +840,12 @@ class DistributorLedgerPurchaseInvoiceDedupeTests(unittest.IsolatedAsyncioTestCa
             }],
             did="rk",
             financial_year="All",
-            debug_rk_92082=True,
         )
 
         self.assertEqual([row["id"] for row in result["transactions"]], ["opening-balance-rk"])
         self.assertEqual(result["transactions"][0]["type"], "opening_balance")
         self.assertEqual(result["total_purchases"], 92082)
         self.assertEqual(result["balance"], 92082)
-
-        po_row = next(
-            row for row in result["debug_rk_92082"]["rows"]
-            if row["source_collection"] == "purchase_orders"
-        )
-        self.assertTrue(po_row["matched_opening_balance_mirror_rule"])
-        self.assertFalse(po_row["included_in_ledger"])
-        checks = {
-            check["check"]: check
-            for comparison in po_row["exclusion_checks"]
-            for check in comparison["checks"]
-        }
-        date_amount_check = checks["same_date_or_adjacent_date_with_matching_amount"]
-        self.assertEqual(date_amount_check["actual"]["date_difference_days"], 1)
-        self.assertTrue(date_amount_check["actual"]["same_normalized_amount"])
-        self.assertTrue(date_amount_check["matched"])
-        self.assertTrue(checks["normalized_reference_intersection"]["matched"])
-
-    async def test_rk_92082_debug_flag_exposes_mirror_rule_inputs_without_changing_ledger(self):
-        result = await self.ledger(
-            [{
-                "id": "rk",
-                "name": "R K PHARMA",
-                "opening_balance": 92082,
-                "opening_balance_date": "2026-04-01",
-                "opening_balance_invoice_number": "05261",
-            }],
-            [],
-            [{
-                "id": "po-rk-in05261",
-                "distributor_id": "rk",
-                "po_no": "PO-RK-05261",
-                "invoice_ref": "IN05261",
-                "grand_total": "92082.00",
-                "po_date": "2026-04-01",
-            }],
-            did="rk",
-            financial_year="All",
-            debug_rk_92082=True,
-        )
-
-        self.assertEqual([row["id"] for row in result["transactions"]], ["opening-balance-rk"])
-        debug = result["debug_rk_92082"]
-        self.assertTrue(debug["enabled"])
-        self.assertEqual(len(debug["all_opening_balance_candidates"]), 1)
-        self.assertEqual(len(debug["all_purchase_order_synthetic_candidates"]), 1)
-        po_row = next(row for row in debug["rows"] if row["source_collection"] == "purchase_orders")
-        self.assertEqual(po_row["source_id"], "po-rk-in05261")
-        self.assertEqual(po_row["amount_raw"], 92082)
-        self.assertEqual(po_row["amount_normalized"], 92082)
-        self.assertEqual(po_row["date_normalized"], "2026-04-01")
-        self.assertEqual(po_row["invoice_ref_raw"], "IN05261")
-        self.assertEqual(po_row["invoice_ref_normalized"], "in05261")
-        self.assertTrue(po_row["matched_opening_balance_mirror_rule"])
-        self.assertFalse(po_row["included_in_ledger"])
-        self.assertFalse(po_row["included_in_balance"])
-        self.assertTrue(all(
-            check["matched"]
-            for comparison in po_row["exclusion_checks"]
-            for check in comparison["checks"]
-        ))
-
-    async def test_rk_92082_debug_flag_is_not_returned_for_other_distributors(self):
-        result = await self.ledger(
-            [{"id": "other", "name": "OTHER PHARMA", "opening_balance": 0}],
-            [],
-            [],
-            did="other",
-            debug_rk_92082=True,
-        )
         self.assertNotIn("debug_rk_92082", result)
 
     def test_rk_invoice_prefixes_include_bare_canonical_identity_and_dedupe_key(self):
