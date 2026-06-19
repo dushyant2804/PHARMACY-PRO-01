@@ -1444,7 +1444,39 @@ class PurchaseReturnCreate(BaseModel):
         return value
 
 
+PURCHASE_RETURN_UPDATE_DISPLAY_FIELDS = {
+    "id",
+    "created_at",
+    "updated_at",
+    "created_by",
+    "updated_by",
+    "deleted_at",
+    "deleted_by",
+    "distributor_name",
+    "medicine_name",
+    "medicine_key",
+    "medicine_id",
+    "batch_label",
+    "status",
+    "total_amount",
+    "return_amount",
+    "ledger_adjusted",
+    "ledger_transaction_id",
+    "linked_transaction_id",
+    "settlement_status",
+    "settled_by_po",
+    "settled_at",
+    "settlement_reference",
+    "settled_return_value",
+    "po_adjustment_id",
+    "po_adjusted_at",
+}
+
+
 class PurchaseReturnUpdate(BaseModel):
+    # Purchase Return edit forms often post back table/display fields with the
+    # editable values.  Keep this schema permissive and explicitly strip known
+    # read-only helpers so PATCH and PUT share one safe validation path.
     model_config = ConfigDict(extra="ignore")
 
     return_date: Optional[str] = None
@@ -1463,7 +1495,11 @@ class PurchaseReturnUpdate(BaseModel):
         if not isinstance(data, dict):
             return data
 
-        normalized = dict(data)
+        normalized = {
+            key: value
+            for key, value in dict(data).items()
+            if key not in PURCHASE_RETURN_UPDATE_DISPLAY_FIELDS
+        }
         alias_fields = {
             "batch_number": ("batch", "batch_no", "batch_label"),
             "expiry_date": ("expiry",),
@@ -8861,8 +8897,14 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
             return False
         return True
 
+    active_return_query = {
+        "distributor_id": payload.distributor_id,
+        "voided_at": {"$exists": False},
+        "deleted_at": {"$exists": False},
+        "settlement_status": {"$ne": "deleted"},
+    }
     candidates = await db.purchase_returns.find(
-        {"distributor_id": payload.distributor_id}, {"_id": 0}
+        active_return_query, {"_id": 0}
     ).to_list(10000) if payload.purchase_returns else []
 
     known_ids = {item["id"] for item in returns}
@@ -8976,7 +9018,13 @@ def _released_po_return_settlement_fields() -> dict:
 
 @api_router.get("/purchase-orders/eligible-purchase-returns/{distributor_id}")
 async def eligible_po_purchase_returns(distributor_id: str, user: dict = Depends(get_current_user)):
-    returns = await db.purchase_returns.find({"distributor_id": distributor_id, "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}]}, {"_id": 0}).sort("return_date", -1).to_list(1000)
+    returns = await db.purchase_returns.find({
+        "distributor_id": distributor_id,
+        "voided_at": {"$exists": False},
+        "deleted_at": {"$exists": False},
+        "settlement_status": {"$ne": "deleted"},
+        "$or": [{"po_adjustment_id": {"$exists": False}}, {"po_adjustment_id": None}],
+    }, {"_id": 0}).sort("return_date", -1).to_list(1000)
     result = []
     for item in returns:
         if item.get("voided_at") or item.get("deleted_at") or item.get("settlement_status") == "deleted" or item.get("ledger_adjusted") or item.get("adjust_distributor_ledger"):
