@@ -5798,60 +5798,6 @@ def _final_distributor_ledger_rows(
     return _dedupe_distributor_purchase_invoice_rows(candidates, distributor_id)
 
 
-def _rk_92082_debug_row(
-    row: dict,
-    distributor_id: str,
-    opening_rows: list[dict],
-    final_row_ids: set[str],
-    balance_row_ids: set[str],
-) -> dict:
-    source = row.get("backend_row_source") or row.get("source") or "distributor_transactions"
-    raw_date = row.get("transaction_date") or row.get("date") or row.get("created_at")
-    normalized_date = _distributor_transaction_date(row)
-    raw_reference = row.get("reference") or row.get("reference_number") or row.get("reference_no")
-    raw_invoice_ref = row.get("invoice_ref") or row.get("invoice_number") or row.get("invoice_no")
-    row_id = _serializable_transaction_id(row.get("id") or row.get("_id"))
-    mirror_checks = [
-        _rk_opening_balance_mirror_check(row, opening_row, distributor_id)
-        for opening_row in opening_rows
-    ]
-    matched = any(item["matched"] for item in mirror_checks)
-    return _json_safe_ledger_transaction({
-        "row_id": row_id,
-        "source_collection": source if source in {"distributor_transactions", "purchase_orders"} else "synthetic",
-        "source_type": row.get("type") or row.get("source"),
-        "source_id": _serializable_transaction_id(
-            row.get("transaction_id") or row.get("purchase_order_id") or row.get("id") or row.get("_id")
-        ),
-        "amount_raw": row.get("amount"),
-        "amount_normalized": _round_ledger_money(row.get("amount")),
-        "date_raw": raw_date,
-        "date_normalized": normalized_date.isoformat() if normalized_date else None,
-        "reference_raw": raw_reference,
-        "reference_normalized": _normalize_ledger_invoice_identity_value(raw_reference),
-        "invoice_ref_raw": raw_invoice_ref,
-        "invoice_ref_normalized": _normalize_ledger_invoice_identity_value(raw_invoice_ref),
-        "distributor_id": row.get("distributor_id") or distributor_id,
-        "transaction_type": row.get("type"),
-        "matched_opening_balance_mirror_rule": matched,
-        "opening_balance_mirror_reason": (
-            "matched_opening_balance_invoice_identity"
-            if matched
-            else "; ".join(item["reason"] for item in mirror_checks) or "no opening balance candidate"
-        ),
-        "included_in_ledger": _forensic_row_identity(row) in final_row_ids,
-        "included_in_balance": _forensic_row_identity(row) in balance_row_ids,
-        "exclusion_checks": mirror_checks,
-    }, include_items=False)
-
-
-def _is_rk_92082_debug_target(row: dict) -> bool:
-    amount_near = abs(_safe_float(row.get("amount")) - 92082) <= 1
-    refs = _purchase_invoice_reference_values(row)
-    reference_near = any("05261" in ref for ref in refs)
-    return amount_near or reference_near
-
-
 def _ledger_row_persisted_id(txn: dict) -> str | None:
     if not isinstance(txn, dict):
         return None
@@ -6408,7 +6354,6 @@ async def distributor_ledger(
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
     amount: Optional[float] = None,
-    debug_rk_92082: bool = False,
     user: dict = Depends(get_current_user),
 ):
     financial_year = _normalize_distributor_ledger_financial_year(financial_year)
@@ -6432,37 +6377,26 @@ async def distributor_ledger(
     # Pre-skipping matched PO mirrors here creates a separate accounting path
     # from rows_removed_by_dedupe and can leave synthetic purchase_orders rows
     # in the normal ledger totals when only the final dedupe recognizes them.
-    debug_enabled = (
-        debug_rk_92082
-        and str(dist.get("name") or dist.get("distributor_name") or "").strip().casefold()
-        in {"rk pharma", "r k pharma"}
-    )
-    debug_raw_transactions = None
-    debug_raw_purchase_orders = None
-    if debug_enabled:
-        debug_raw_transactions = await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000)
-        debug_raw_purchase_orders = (
-            await db.purchase_orders.find({}, {"_id": 0}).to_list(10000)
-            if hasattr(db, "purchase_orders")
-            else []
-        )
     canonical_txns = await _canonical_distributor_ledger_transactions(
             dist,
             did,
-            raw_transactions=debug_raw_transactions,
-            purchase_orders=debug_raw_purchase_orders,
             include_matched_synthetic_po_rows=True,
         )
     ledger_txns = _final_distributor_ledger_rows(
         canonical_txns,
         str(dist.get("id") or did),
     )
-    unfiltered_final_txns = list(ledger_txns)
     available_financial_years = _available_financial_years(ledger_txns)
     financial_year_metadata = _distributor_financial_year_metadata(
         ledger_txns,
         financial_year,
     )
+    display_txns = (
+        _filter_transactions_by_financial_year(ledger_txns, financial_year)
+        if financial_year
+        else list(ledger_txns)
+    )
+    display_txn_ids = {_forensic_row_identity(txn) for txn in display_txns}
     try:
         fifo_metadata_by_id = _build_distributor_fifo_metadata(
             _distributor_fifo_metadata_transactions(ledger_txns, financial_year),
@@ -6475,9 +6409,6 @@ async def distributor_ledger(
         )
         fifo_metadata_by_id = {}
 
-    if financial_year:
-        ledger_txns = _filter_transactions_by_financial_year(ledger_txns, financial_year)
-
     balance = 0.0
     running = []
     total_purchases = 0.0
@@ -6488,6 +6419,9 @@ async def distributor_ledger(
         balance, bucket = _apply_distributor_transaction(balance, txn)
         txn_amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
 
+        if _forensic_row_identity(txn) not in display_txn_ids:
+            continue
+
         if bucket == "purchase":
             total_purchases += txn_amount
         elif bucket == "adjustment":
@@ -6496,7 +6430,7 @@ async def distributor_ledger(
             total_paid += txn_amount
 
         txn_id = _serializable_transaction_id(txn.get("id") if isinstance(txn, dict) else None)
-        running.append(_json_safe_ledger_transaction(_with_distributor_ledger_debug_fields({
+        running.append(_json_safe_ledger_transaction({
             **(txn if isinstance(txn, dict) else {}),
             **fifo_metadata_by_id.get(txn_id, {}),
             "running_balance": round(balance, 2),
@@ -6505,7 +6439,7 @@ async def distributor_ledger(
                 else "partially_settled" if _safe_float(fifo_metadata_by_id.get(txn_id, {}).get("paid_amount")) > 0
                 else "unpaid"
             ) if bucket == "purchase" else None,
-        }, str(dist.get("id") or did)), include_items=True))
+        }, include_items=True))
 
     def matches_filters(txn: dict) -> bool:
         txn_date = _distributor_transaction_date(txn)
@@ -6541,59 +6475,6 @@ async def distributor_ledger(
         "current_financial_year": _current_financial_year(),
         **financial_year_metadata,
     }
-    if debug_enabled:
-        opening_candidates = [
-            row for row in canonical_txns
-            if row.get("is_opening_balance")
-            or _is_explicit_opening_balance_transaction(row, str(dist.get("id") or did))
-        ]
-        identity_values = _distributor_identity_values(dist, did)
-        distributor_names = {
-            str(dist.get(field)).strip().casefold()
-            for field in ("name", "distributor_name")
-            if dist.get(field) and str(dist.get(field)).strip()
-        }
-        synthetic_candidates = [
-            _purchase_order_ledger_transaction(po, str(dist.get("id") or did))
-            for po in (debug_raw_purchase_orders or [])
-            if _belongs_to_distributor(po, identity_values, distributor_names)
-        ]
-        debug_candidate_rows = list(canonical_txns)
-        known_identities = {_forensic_row_identity(row) for row in debug_candidate_rows}
-        debug_candidate_rows.extend(
-            row for row in synthetic_candidates
-            if _forensic_row_identity(row) not in known_identities
-        )
-        final_ids = {_forensic_row_identity(row) for row in unfiltered_final_txns}
-        balance_ids = {_forensic_row_identity(row) for row in ledger_txns}
-        debug_rows = [
-            _rk_92082_debug_row(
-                row, str(dist.get("id") or did), opening_candidates, final_ids, balance_ids
-            )
-            for row in debug_candidate_rows
-            if _is_rk_92082_debug_target(row)
-        ]
-        response["debug_rk_92082"] = {
-            "enabled": True,
-            "scope": "RK Pharma rows near 92082 or reference 05261/IN05261",
-            "rows": debug_rows,
-            "all_opening_balance_candidates": [
-                _rk_92082_debug_row(row, str(dist.get("id") or did), opening_candidates, final_ids, balance_ids)
-                for row in opening_candidates
-            ],
-            "all_purchase_order_synthetic_candidates": [
-                _rk_92082_debug_row(row, str(dist.get("id") or did), opening_candidates, final_ids, balance_ids)
-                for row in synthetic_candidates
-            ],
-            "exclusion_checks_performed": [
-                {"row_id": row["row_id"], "checks": row["exclusion_checks"]}
-                for row in debug_rows
-            ],
-            "final_rows_after_filtering": [
-                _rk_92082_debug_row(row, str(dist.get("id") or did), opening_candidates, final_ids, balance_ids)
-                for row in ledger_txns
-            ],
-        }
     return response
 
 
