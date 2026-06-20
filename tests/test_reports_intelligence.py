@@ -106,7 +106,9 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", db): result = await purchase_return_report(user={})
         self.assertEqual(result["returned_quantity"], 3); self.assertEqual(result["total_return_value"], 25.81)
         self.assertEqual(result["settled_return_value"], 20.25); self.assertEqual(result["unsettled_return_value"], 5.56)
-        self.assertEqual(result["medicine_wise_return_analytics"][0]["value"], 25.81)
+        self.assertEqual(result["medicine_wise_return_analytics"][0]["return_value"], 20.25)
+        self.assertEqual(result["medicine_wise_return_analytics"][0]["status"], "Ledger Adjusted")
+        self.assertEqual(result["medicine_wise_return_analytics"][1]["status"], "Credit Pending / Recorded Only")
 
     async def test_profitability_dead_stock_and_reorder_use_invoice_history(self):
         invoices = Collection([{"created_at":"2026-01-01T00:00:00+00:00","items":[{"medicine_id":"m1","name":"A","quantity":10,"line_total":100,"purchase_cost":60}]}])
@@ -246,3 +248,80 @@ class CustomerOutstandingMovementTests(unittest.IsolatedAsyncioTestCase):
                 result = await outstanding_report(user={})
             self.assertEqual(result["monthly_outstanding_trend"], expected)
             self.assertEqual(result["monthly_outstanding_trends"], expected)
+
+
+class CustomerLedgerRouteMonthlySummaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_customer_monthly_summary_appears_when_transactions_exist(self):
+        from server import customer_ledger
+
+        class QueryCursor(Cursor):
+            def sort(self, *args):
+                self.rows = sorted(self.rows, key=lambda row: str(row.get("created_at") or row.get("transaction_date") or row.get("date") or ""))
+                return self
+
+        class LedgerCollection(Collection):
+            def find(self, query=None, projection=None):
+                rows = self.rows
+                if query and query.get("customer_id"):
+                    rows = [r for r in rows if r.get("customer_id") == query["customer_id"]]
+                return QueryCursor(rows)
+            async def find_one(self, query=None, projection=None):
+                return next((dict(r) for r in self.rows if not query or all(r.get(k) == v for k, v in query.items())), None)
+            async def update_one(self, query, update):
+                for row in self.rows:
+                    if all(row.get(k) == v for k, v in query.items()):
+                        row.update(update.get("$set", {}))
+                return None
+
+        db = SimpleNamespace(
+            customers=LedgerCollection([{"id": "c-real", "name": "Real Customer"}]),
+            customer_transactions=LedgerCollection([
+                {"id": "sale-1", "customer_id": "c-real", "type": "sale", "amount": 150.25, "transaction_date": "2026-06-05", "created_at": "2026-06-06T10:00:00+00:00"},
+                {"id": "pay-1", "customer_id": "c-real", "type": "payment", "amount": 50.10, "date": "2026-06-07", "created_at": "2026-06-07T10:00:00+00:00"},
+            ]),
+        )
+        with patch("server.db", db):
+            result = await customer_ledger("c-real", user={})
+
+        self.assertEqual(result["monthly_summary"], [{
+            "month": "2026-06",
+            "total_credit_sales": 150.25,
+            "sales_added": 150.25,
+            "total_payments_received": 50.1,
+            "net_receivable_movement": 100.15,
+            "closing_receivable_balance": 100.15,
+            "transaction_count": 2,
+        }])
+        self.assertEqual(result["monthly_movement_summary"], result["monthly_summary"])
+
+    async def test_customer_monthly_summary_uses_safe_id_date_fallback(self):
+        from server import _customer_monthly_summary_from_transactions
+        rows = _customer_monthly_summary_from_transactions([
+            {"id": "2026-06-09-legacy-sale", "type": "sale", "amount": 10},
+            {"id": "uuid-without-date", "type": "sale", "amount": 99},
+        ])
+        self.assertEqual(rows[0]["month"], "2026-06")
+        self.assertEqual(rows[0]["transaction_count"], 1)
+
+
+class PurchaseReturnBusinessStatusReportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_purchase_returns_get_clear_status_labels_and_deleted_excluded(self):
+        rows = [
+            {"id": "ledger", "medicine_name": "A", "distributor": "D", "return_quantity": 2, "purchase_rate": 10, "return_date": "2026-06-01", "ledger_adjusted": True},
+            {"id": "pending", "medicine_name": "B", "distributor": "D", "return_quantity": 1, "purchase_rate": 5, "return_date": "2026-06-02", "ledger_adjusted": False},
+            {"id": "po", "medicine_name": "C", "distributor": "D", "return_quantity": 3, "purchase_rate": 7, "return_date": "2026-06-03", "po_adjustment_id": "po-1"},
+            {"id": "deleted", "medicine_name": "X", "distributor": "D", "return_quantity": 9, "purchase_rate": 99, "return_date": "2026-06-04", "settlement_status": "deleted"},
+        ]
+        with patch("server.db", SimpleNamespace(purchase_returns=Collection(rows))):
+            result = await purchase_return_report(user={})
+
+        self.assertEqual(result["return_count"], 3)
+        statuses = {row["medicine"]: row["status"] for row in result["medicine_wise_return_analytics"]}
+        self.assertEqual(statuses, {"A": "Ledger Adjusted", "B": "Credit Pending / Recorded Only", "C": "Adjusted in Purchase"})
+        self.assertEqual(result["summary_buckets"], {
+            "Ledger Adjusted Value": 20.0,
+            "Pending Credit Value": 5.0,
+            "Adjusted in Purchase Value": 21.0,
+        })
+        self.assertEqual({row["id"] for row in result["purchase_returns"]}, {"ledger", "pending", "po"})
+        self.assertEqual(next(row for row in result["purchase_returns"] if row["id"] == "po")["status"], "Adjusted in Purchase")
