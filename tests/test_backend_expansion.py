@@ -27,20 +27,20 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         response = await version(http_response)
         self.assertEqual(
             set(response),
-            {"version", "build", "build_id", "release_notes", "whats_new", "version_history",
-             "message", "updated_at", "update_type"},
+            {"current_version", "latest_version", "current_build", "latest_build",
+             "full_version", "update_available", "release_date", "release_notes"},
         )
-        self.assertEqual(response["version"], APP_VERSION)
-        self.assertTrue(response["build"])
-        self.assertIsInstance(response["message"], str)
+        self.assertEqual(response["latest_version"], APP_VERSION)
+        self.assertEqual(response["current_version"], APP_VERSION)
+        self.assertTrue(response["latest_build"])
+        self.assertTrue(response["current_build"])
         self.assertEqual(response["release_notes"], APP_RELEASE_NOTES)
-        self.assertGreaterEqual(len(response["release_notes"].splitlines()), 2)
-        self.assertIn(response["update_type"], ("patch", "minor", "major"))
-        self.assertTrue(response["updated_at"].endswith("Z"))
-        self.assertRegex(response["version"], r"^\d+\.\d+\.\d+$")
-        self.assertTrue(response["build_id"])
-        self.assertTrue(response["whats_new"])
-        self.assertTrue(response["version_history"])
+        self.assertEqual(set(response["release_notes"]), {"new", "improved", "fixed"})
+        self.assertTrue(any(response["release_notes"].values()))
+        self.assertFalse(response["update_available"])
+        self.assertTrue(response["release_date"].endswith("Z"))
+        self.assertRegex(response["latest_version"], r"^\d+\.\d+\.\d+$")
+        self.assertEqual(response["full_version"], f"{response['latest_version']}+{response['latest_build']}")
         self.assertEqual(http_response.headers["cache-control"], "no-store")
 
     def test_version_config_supports_expected_update_types_and_returns_a_copy(self):
@@ -48,8 +48,20 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(SUPPORTED_UPDATE_TYPES, ("patch", "minor", "major"))
         metadata = get_version_metadata()
-        metadata["message"] = "changed by caller"
-        self.assertNotEqual(metadata["message"], VERSION_METADATA["message"])
+        metadata["release_notes"]["fixed"].append("changed by caller")
+        self.assertNotEqual(metadata["release_notes"], VERSION_METADATA["release_notes"])
+
+    def test_version_update_availability_ignores_build_only_changes_with_same_notes(self):
+        from version_config import get_version_metadata
+
+        old_release = get_version_metadata(current_version="3.1.0", current_build="20260611-stock-repair")
+        self.assertTrue(old_release["update_available"])
+
+        same_semantic_unknown_build = get_version_metadata(
+            current_version=APP_VERSION,
+            current_build="20260620-different",
+        )
+        self.assertFalse(same_semantic_unknown_build["update_available"])
 
     def test_old_and_new_business_settings_are_normalized_without_data_loss(self):
         from server import normalize_settings
