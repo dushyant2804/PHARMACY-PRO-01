@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "test_pharmacy")
-from server import category_profitability, dead_stock_report, expiry_report, fast_moving_medicines, medicine_profitability, outstanding_report, purchase_return_report, reorder_report, sales_report, slow_moving_medicines, stock_valuation
+from server import category_profitability, dashboard_summary, dead_stock_report, expiry_report, fast_moving_medicines, medicine_profitability, outstanding_report, purchase_return_report, reorder_report, sales_report, slow_moving_medicines, stock_valuation
 
 class Cursor:
     def __init__(self, rows): self.rows = rows
@@ -28,6 +28,17 @@ def assert_no_invalid_numbers(testcase, value):
     elif isinstance(value, list):
         for child in value:
             assert_no_invalid_numbers(testcase, child)
+
+
+def assert_no_overlay_state(testcase, value, path="payload"):
+    overlay_keys = {"loading", "is_loading", "isLoading", "overlay", "show_overlay", "showOverlay"}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            testcase.assertNotIn(key, overlay_keys, f"Backend payload exposed frontend overlay/loading key at {path}.{key}")
+            assert_no_overlay_state(testcase, child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            assert_no_overlay_state(testcase, child, f"{path}[{index}]")
 
 def iso(days): return (datetime.now(timezone.utc)-timedelta(days=days)).isoformat()
 
@@ -109,6 +120,49 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["medicine_wise_return_analytics"][0]["return_value"], 20.25)
         self.assertEqual(result["medicine_wise_return_analytics"][0]["status"], "Ledger Adjusted")
         self.assertEqual(result["medicine_wise_return_analytics"][1]["status"], "Credit Pending / Recorded Only")
+
+    async def test_dashboard_and_purchase_return_payloads_do_not_expose_overlay_state(self):
+        returns = Collection([
+            {
+                "id": "return-ledger",
+                "medicine_name": "Amoxicillin",
+                "distributor_name": "Main Distributor",
+                "return_quantity": 2,
+                "purchase_rate": 10.125,
+                "ledger_adjusted": True,
+            },
+            {
+                "id": "return-pending",
+                "medicine_name": "Cetirizine",
+                "distributor_name": "Main Distributor",
+                "return_quantity": 1,
+                "purchase_rate": 5.555,
+            },
+        ])
+        empty = Collection([])
+        db = SimpleNamespace(
+            invoices=empty, expenses=empty, medicines=empty, customers=empty, distributors=empty,
+            customer_transactions=empty, distributor_transactions=empty, purchase_orders=empty,
+            regular_patients=empty, purchase_returns=returns,
+        )
+
+        with patch("server.db", db):
+            dashboard = await dashboard_summary(user={})
+            purchase_returns = await purchase_return_report(user={})
+
+        self.assertEqual(dashboard["sales_total"], 0)
+        self.assertEqual(dashboard["patient_alerts"], [])
+        self.assertEqual(purchase_returns["returned_quantity"], 3)
+        self.assertEqual(purchase_returns["total_return_value"], 25.81)
+        self.assertEqual(purchase_returns["return_count"], 2)
+        self.assertEqual(purchase_returns["summary_buckets"], {
+            "Ledger Adjusted Value": 20.25,
+            "Pending Credit Value": 5.56,
+            "Adjusted in Purchase Value": 0.0,
+        })
+        for payload in (dashboard, purchase_returns):
+            assert_no_invalid_numbers(self, payload)
+            assert_no_overlay_state(self, payload)
 
     async def test_profitability_dead_stock_and_reorder_use_invoice_history(self):
         invoices = Collection([{"created_at":"2026-01-01T00:00:00+00:00","items":[{"medicine_id":"m1","name":"A","quantity":10,"line_total":100,"purchase_cost":60}]}])
