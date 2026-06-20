@@ -8333,6 +8333,59 @@ def _outstanding_aging(transactions: list[dict], charge_types: set[str], credit_
             "urgency": "critical" if oldest > 90 else "high" if oldest > 60 else "medium" if oldest > 30 else "normal"}
 
 
+def _distributor_monthly_outstanding_movement(distributors: list[dict], distributor_txns: list[dict]) -> list[dict]:
+    """Build month-end distributor payable movement from distributor ledger rows only."""
+    distributor_by_id = {str(d.get("id") or ""): d for d in distributors if isinstance(d, dict)}
+    opening_balances = {
+        distributor_id: _safe_float(distributor.get("opening_balance", 0))
+        for distributor_id, distributor in distributor_by_id.items()
+    }
+    rows_by_month = defaultdict(lambda: {"purchases": 0.0, "payments": 0.0, "adjustments": 0.0})
+    dated_txns = []
+
+    for txn in distributor_txns:
+        if not isinstance(txn, dict):
+            continue
+        month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+        if not month:
+            continue
+        dated_txns.append(txn)
+        _balance, bucket = _apply_distributor_transaction(0, txn)
+        amount = _safe_float(txn.get("amount"))
+        if bucket == "purchase":
+            rows_by_month[month]["purchases"] += amount
+        elif bucket == "adjustment":
+            rows_by_month[month]["adjustments"] += amount
+        else:
+            rows_by_month[month]["payments"] += amount
+
+    if not rows_by_month:
+        return []
+
+    running_balance_by_distributor = defaultdict(float, opening_balances)
+    txns_by_month = defaultdict(list)
+    for txn in dated_txns:
+        txns_by_month[_month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))].append(txn)
+
+    movement = []
+    for month in sorted(rows_by_month):
+        for txn in txns_by_month.get(month, []):
+            distributor_id = str(txn.get("distributor_id") or "")
+            running_balance_by_distributor[distributor_id], _bucket = _apply_distributor_transaction(
+                running_balance_by_distributor[distributor_id],
+                txn,
+            )
+        row = rows_by_month[month]
+        movement.append({
+            "month": month,
+            "purchases": _round_ledger_money(row["purchases"]),
+            "payments": _round_ledger_money(row["payments"]),
+            "adjustments": _round_ledger_money(row["adjustments"]),
+            "closing_distributor_payable": _round_ledger_money(sum(running_balance_by_distributor.values())),
+        })
+    return movement
+
+
 @api_router.get("/reports/outstanding")
 async def outstanding_report(user: dict = Depends(get_current_user)):
     customers = await db.customers.find({}, {"_id": 0}).to_list(1000)
@@ -8362,22 +8415,16 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
             dist_out.append({"id": distributor["id"], "name": distributor["name"], "distributor": distributor["name"], "balance": _round_ledger_money(balance), "outstanding": _round_ledger_money(balance), "age": aging["oldest_due_days"], "aging_days": aging["oldest_due_days"], "last_purchase": last_purchase.isoformat() if last_purchase else None, **aging})
             for key, value in aging["buckets"].items(): distributor_aging[key] += value
     customer_total = sum(row["balance"] for row in cust_out); distributor_total = sum(row["balance"] for row in dist_out)
-    monthly = defaultdict(lambda: {"customer_receivables": 0.0, "distributor_payables": 0.0})
-    for row in _customer_monthly_summary_from_transactions(customer_txns):
-        month = row.get("month")
-        if month:
-            monthly[month]["customer_receivables"] += _safe_float(row.get("net_receivable_movement"))
-    for txn in distributor_txns:
-        month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
-        if not month:
-            continue
-        _balance, bucket = _apply_distributor_transaction(0, txn)
-        amount = _safe_float(txn.get("amount"))
-        if bucket == "purchase":
-            monthly[month]["distributor_payables"] += amount
-        elif bucket in {"payment", "adjustment"}:
-            monthly[month]["distributor_payables"] -= amount
-    trends = [{"month": m, "customer_receivables": _round_ledger_money(v["customer_receivables"]), "distributor_payables": _round_ledger_money(v["distributor_payables"]), "net_exposure": _round_ledger_money(v["distributor_payables"] - v["customer_receivables"])} for m, v in sorted(monthly.items())]
+    distributor_outstanding_movement = _distributor_monthly_outstanding_movement(distributors, distributor_txns)
+    trends = [
+        {
+            "month": row["month"],
+            "customer_receivables": 0.0,
+            "distributor_payables": _round_ledger_money(row["purchases"] - row["payments"] - row["adjustments"]),
+            "net_exposure": _round_ledger_money(row["purchases"] - row["payments"] - row["adjustments"]),
+        }
+        for row in distributor_outstanding_movement
+    ]
     return {"customers": cust_out, "distributors": dist_out, "customer_total": _round_ledger_money(customer_total), "distributor_total": _round_ledger_money(distributor_total),
             "customer_receivables": _round_ledger_money(customer_total), "distributor_payables": _round_ledger_money(distributor_total),
             "net_exposure": _round_ledger_money(distributor_total - customer_total),
@@ -8388,7 +8435,7 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
             "customer_aging": {key: _round_ledger_money(value) for key, value in customer_aging.items()}, "distributor_aging": {key: _round_ledger_money(value) for key, value in distributor_aging.items()},
             "aging_buckets": {"customers": {key: _round_ledger_money(value) for key, value in customer_aging.items()}, "distributors": {key: _round_ledger_money(value) for key, value in distributor_aging.items()}},
             "schema_notes": {"aging_days": "Numeric age in days for the oldest unpaid charge; legacy age is the same days value."},
-            "outstanding_movement": {"customer_transactions": customer_txns, "distributor_transactions": distributor_txns}}
+            "distributor_outstanding_movement": distributor_outstanding_movement}
 
 
 @api_router.post("/daily-summary")
