@@ -152,6 +152,7 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(expiry["top_expiry_risk_medicines"], [])
         self.assertEqual(outstanding["customer_receivables"], 0)
         self.assertEqual(outstanding["monthly_outstanding_trend"], [])
+        self.assertEqual(outstanding["distributor_outstanding_movement"], [])
         self.assertEqual(medicine_profit["items"], [])
         self.assertEqual(category_profit["items"], [])
         self.assertEqual(fast["items"], [])
@@ -218,36 +219,33 @@ class CustomerOutstandingMovementTests(unittest.IsolatedAsyncioTestCase):
             "transaction_count": 2,
         }])
 
-    async def test_outstanding_trend_distributor_only_customer_only_and_combined(self):
+    async def test_outstanding_movement_uses_distributor_ledger_only(self):
         scenarios = [
             (
-                SimpleNamespace(customers=Collection([]), distributors=Collection([{"id":"d1","name":"D"}]), customer_transactions=Collection([]), distributor_transactions=Collection([
+                SimpleNamespace(customers=Collection([]), distributors=Collection([{"id":"d1","name":"D","opening_balance":10}]), customer_transactions=Collection([]), distributor_transactions=Collection([
                     {"distributor_id":"d1","type":"purchase","amount":20.129,"created_at":"2026-05-01T00:00:00+00:00"},
                     {"distributor_id":"d1","type":"payment","amount":5,"created_at":"bad-date"},
+                    {"distributor_id":"d1","type":"payment","amount":3,"created_at":"2026-06-01T00:00:00+00:00"},
+                    {"distributor_id":"d1","type":"purchase_return","amount":2,"created_at":"2026-06-02T00:00:00+00:00"},
                 ])),
-                [{"month":"2026-05", "customer_receivables":0.0, "distributor_payables":20.13, "net_exposure":20.13}],
+                [
+                    {"month":"2026-05", "purchases":20.13, "payments":0.0, "adjustments":0.0, "closing_distributor_payable":30.13},
+                    {"month":"2026-06", "purchases":0.0, "payments":3.0, "adjustments":2.0, "closing_distributor_payable":25.13},
+                ],
             ),
             (
                 SimpleNamespace(customers=Collection([{"id":"c1","name":"C"}]), distributors=Collection([]), customer_transactions=Collection([
                     {"customer_id":"c1","type":"sale","amount":30.555,"created_at":"2026-05-01T00:00:00+00:00"},
                     {"customer_id":"c1","type":"payment","amount":10.111,"created_at":"2026-05-03T00:00:00+00:00"},
                 ]), distributor_transactions=Collection([])),
-                [{"month":"2026-05", "customer_receivables":20.44, "distributor_payables":0.0, "net_exposure":-20.44}],
-            ),
-            (
-                SimpleNamespace(customers=Collection([{"id":"c1","name":"C"}]), distributors=Collection([{"id":"d1","name":"D"}]), customer_transactions=Collection([
-                    {"customer_id":"c1","type":"sale","amount":10,"created_at":"2026-05-01T00:00:00+00:00"},
-                ]), distributor_transactions=Collection([
-                    {"distributor_id":"d1","type":"purchase","amount":25,"created_at":"2026-05-02T00:00:00+00:00"},
-                ])),
-                [{"month":"2026-05", "customer_receivables":10.0, "distributor_payables":25.0, "net_exposure":15.0}],
+                [],
             ),
         ]
         for db, expected in scenarios:
             with patch("server.db", db):
                 result = await outstanding_report(user={})
-            self.assertEqual(result["monthly_outstanding_trend"], expected)
-            self.assertEqual(result["monthly_outstanding_trends"], expected)
+            self.assertEqual(result["distributor_outstanding_movement"], expected)
+            self.assertNotIn("outstanding_movement", result)
 
 
 class CustomerLedgerRouteMonthlySummaryTests(unittest.IsolatedAsyncioTestCase):
