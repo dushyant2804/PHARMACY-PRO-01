@@ -9611,6 +9611,17 @@ def _sanitize_settings_payload(payload: dict) -> dict:
     return sanitized
 
 
+def _settings_update_set(payload: dict) -> dict:
+    """Build the mutable settings fields for $set without tenant ownership fields.
+
+    TenantAwareCollection adds tenant_id/shop_id to the scoped filter and to
+    $setOnInsert for upserts. If a client saves a full settings document that
+    already contains tenant_id/shop_id, also placing those paths in $set would
+    conflict with the wrapper-generated $setOnInsert ownership values.
+    """
+    return {key: value for key, value in payload.items() if key not in {"tenant_id", "shop_id"}}
+
+
 def _settings_payload_field_snapshot(payload: dict) -> dict:
     return {
         "selected_theme": payload.get("selected_theme"),
@@ -9720,7 +9731,7 @@ async def update_settings(payload: dict, user: dict = Depends(require_role("admi
         logger.info("Saving settings business profile fields", extra={"tenant_id": user.get("tenant_id"), "fields": sorted(business_fields.intersection(payload))})
 
     update_filter = {"key": "main"}
-    update_operation = {"$set": payload}
+    update_operation = {"$set": _settings_update_set(payload)}
     log_context = _settings_save_log_context(payload, user, update_filter, update_operation)
     logger.info("Saving settings payload: %s", log_context, extra=log_context)
 
