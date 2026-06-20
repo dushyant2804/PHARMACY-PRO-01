@@ -300,6 +300,22 @@ class _SettingsCollection:
         return _SettingsUpdateResult()
 
 
+class _RecordingSettingsMotorCollection:
+    def __init__(self, record=None):
+        self.record = record or {"key": "main", "tenant_id": "shop-1", "shop_id": "shop-1"}
+        self.calls = []
+
+    async def update_one(self, query, update, *args, **kwargs):
+        self.calls.append((query, update, kwargs))
+        self.record.update(query if "key" in query else {"key": "main"})
+        self.record.update(update.get("$setOnInsert", {}))
+        self.record.update(update.get("$set", {}))
+        return _SettingsUpdateResult()
+
+    async def find_one(self, query, projection=None):
+        return dict(self.record)
+
+
 class SettingsSaveContractTest(unittest.IsolatedAsyncioTestCase):
     async def test_settings_save_treats_missing_theme_font_logo_as_optional(self):
         from types import SimpleNamespace
@@ -335,6 +351,58 @@ class SettingsSaveContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.record["selected_font"], "inter")
         self.assertEqual(response["selected_theme"], "dark")
         self.assertEqual(response["selected_font"], "inter")
+
+    async def test_settings_save_strips_tenant_fields_from_set_but_keeps_tenant_upsert_ownership(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from server import TenantAwareCollection, _current_demo, _current_tenant, _request_active, update_settings
+
+        raw_settings = _RecordingSettingsMotorCollection()
+        tenant_settings = TenantAwareCollection(raw_settings, "settings")
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1", "shop_id": "shop-1"}
+        payload = {
+            "tenant_id": "shop-1",
+            "shop_id": "shop-1",
+            "selected_theme": "dark",
+            "selected_font": "inter",
+            "theme_settings": {"accent": "blue"},
+            "pharmacy_logo": {"url": "/uploads/branding/shop-1/logo.png"},
+            "business_name": "Care Pharmacy",
+            "business_address": "1 Main St",
+            "business_phone": "5550100",
+            "business_gstin": "GSTIN123",
+            "dl_number_1": "DL-ONE",
+            "dl_number_2": "DL-TWO",
+        }
+
+        active = _request_active.set(True)
+        tenant = _current_tenant.set("shop-1")
+        demo = _current_demo.set(False)
+        try:
+            with patch("server.db", SimpleNamespace(settings=tenant_settings)):
+                response = await update_settings(payload, user=admin)
+        finally:
+            _current_demo.reset(demo)
+            _current_tenant.reset(tenant)
+            _request_active.reset(active)
+
+        query, update, kwargs = raw_settings.calls[0]
+        self.assertEqual(query, {"$and": [{"tenant_id": "shop-1"}, {"key": "main"}]})
+        self.assertEqual(kwargs, {"upsert": True})
+        self.assertNotIn("tenant_id", update["$set"])
+        self.assertNotIn("shop_id", update["$set"])
+        self.assertEqual(update["$setOnInsert"]["tenant_id"], "shop-1")
+        self.assertEqual(update["$setOnInsert"]["shop_id"], "shop-1")
+        self.assertEqual(response["selected_theme"], "dark")
+        self.assertEqual(response["selected_font"], "inter")
+        self.assertEqual(response["theme_settings"], {"accent": "blue"})
+        self.assertEqual(response["pharmacy_logo"]["url"], "/uploads/branding/shop-1/logo.png")
+        self.assertEqual(response["business_name"], "Care Pharmacy")
+        self.assertEqual(response["business_address"], "1 Main St")
+        self.assertEqual(response["business_phone"], "5550100")
+        self.assertEqual(response["business_gstin"], "GSTIN123")
+        self.assertEqual(response["dl_number_1"], "DL-ONE")
+        self.assertEqual(response["dl_number_2"], "DL-TWO")
 
     async def test_settings_save_returns_validation_error_for_invalid_mongo_field(self):
         from server import update_settings
