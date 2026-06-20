@@ -197,3 +197,52 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slow["items"][0]["current_stock"], 8)
         for payload in (sales, expiry, outstanding, med_profit, cat_profit, fast, slow):
             assert_no_invalid_numbers(self, payload)
+
+class CustomerOutstandingMovementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_customer_ledger_monthly_summary_helper_generates_rows_and_ignores_invalid_dates(self):
+        from server import _customer_monthly_summary_from_transactions
+        rows = _customer_monthly_summary_from_transactions([
+            {"customer_id": "c1", "type": "sale", "amount": 100.129, "created_at": "2026-05-01T00:00:00+00:00"},
+            {"customer_id": "c1", "type": "payment", "amount": 25.124, "created_at": "2026-05-02T00:00:00+00:00"},
+            {"customer_id": "c1", "type": "sale", "amount": 10, "created_at": "not-a-date"},
+        ])
+        self.assertEqual(rows, [{
+            "month": "2026-05",
+            "total_credit_sales": 100.13,
+            "sales_added": 100.13,
+            "total_payments_received": 25.12,
+            "net_receivable_movement": 75.01,
+            "closing_receivable_balance": 75.01,
+            "transaction_count": 2,
+        }])
+
+    async def test_outstanding_trend_distributor_only_customer_only_and_combined(self):
+        scenarios = [
+            (
+                SimpleNamespace(customers=Collection([]), distributors=Collection([{"id":"d1","name":"D"}]), customer_transactions=Collection([]), distributor_transactions=Collection([
+                    {"distributor_id":"d1","type":"purchase","amount":20.129,"created_at":"2026-05-01T00:00:00+00:00"},
+                    {"distributor_id":"d1","type":"payment","amount":5,"created_at":"bad-date"},
+                ])),
+                [{"month":"2026-05", "customer_receivables":0.0, "distributor_payables":20.13, "net_exposure":20.13}],
+            ),
+            (
+                SimpleNamespace(customers=Collection([{"id":"c1","name":"C"}]), distributors=Collection([]), customer_transactions=Collection([
+                    {"customer_id":"c1","type":"sale","amount":30.555,"created_at":"2026-05-01T00:00:00+00:00"},
+                    {"customer_id":"c1","type":"payment","amount":10.111,"created_at":"2026-05-03T00:00:00+00:00"},
+                ]), distributor_transactions=Collection([])),
+                [{"month":"2026-05", "customer_receivables":20.44, "distributor_payables":0.0, "net_exposure":-20.44}],
+            ),
+            (
+                SimpleNamespace(customers=Collection([{"id":"c1","name":"C"}]), distributors=Collection([{"id":"d1","name":"D"}]), customer_transactions=Collection([
+                    {"customer_id":"c1","type":"sale","amount":10,"created_at":"2026-05-01T00:00:00+00:00"},
+                ]), distributor_transactions=Collection([
+                    {"distributor_id":"d1","type":"purchase","amount":25,"created_at":"2026-05-02T00:00:00+00:00"},
+                ])),
+                [{"month":"2026-05", "customer_receivables":10.0, "distributor_payables":25.0, "net_exposure":15.0}],
+            ),
+        ]
+        for db, expected in scenarios:
+            with patch("server.db", db):
+                result = await outstanding_report(user={})
+            self.assertEqual(result["monthly_outstanding_trend"], expected)
+            self.assertEqual(result["monthly_outstanding_trends"], expected)

@@ -7434,6 +7434,85 @@ async def purchase_return_report(
     }
 
 
+
+def _customer_transaction_month(txn: dict) -> Optional[str]:
+    if not isinstance(txn, dict):
+        return None
+    return _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+
+
+def _apply_customer_transaction(balance: float, txn: dict) -> tuple[float, str]:
+    amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
+    txn_type = str(txn.get("type") if isinstance(txn, dict) else "").lower()
+
+    if txn_type in {"sale", "credit_sale", "invoice", "debit", "opening_balance"}:
+        return balance + amount, "sale"
+
+    if txn_type in {"payment", "receipt", "credit", "credit_adjustment", "return", "sales_return"}:
+        return balance - amount, "payment"
+
+    return balance, "ignored"
+
+
+def _customer_monthly_summary_from_transactions(transactions: list[dict]) -> list[dict]:
+    monthly = defaultdict(lambda: {
+        "month": "",
+        "total_credit_sales": 0.0,
+        "sales_added": 0.0,
+        "total_payments_received": 0.0,
+        "net_receivable_movement": 0.0,
+        "closing_receivable_balance": 0.0,
+        "transaction_count": 0,
+    })
+
+    valid_txns = []
+    for txn in transactions:
+        month = _customer_transaction_month(txn)
+        if not month:
+            continue
+        valid_txns.append((month, txn))
+
+    balance = 0.0
+    for month, txn in sorted(valid_txns, key=lambda item: (item[0], str(item[1].get("created_at") or item[1].get("transaction_date") or item[1].get("date") or ""), str(item[1].get("id") or ""))):
+        amount = _safe_float(txn.get("amount"))
+        new_balance, bucket = _apply_customer_transaction(balance, txn)
+        if bucket == "ignored":
+            continue
+        balance = _round_ledger_money(new_balance)
+        row = monthly[month]
+        row["month"] = month
+        if bucket == "sale":
+            row["total_credit_sales"] += amount
+            row["sales_added"] += amount
+            row["net_receivable_movement"] += amount
+        elif bucket == "payment":
+            row["total_payments_received"] += amount
+            row["net_receivable_movement"] -= amount
+        row["closing_receivable_balance"] = balance
+        row["transaction_count"] += 1
+
+    summaries = []
+    for month in sorted(monthly):
+        row = monthly[month]
+        for key in ("total_credit_sales", "sales_added", "total_payments_received", "net_receivable_movement", "closing_receivable_balance"):
+            row[key] = _round_ledger_money(row[key])
+        summaries.append(dict(row))
+    return summaries
+
+
+async def _customer_monthly_summary_data(customer_id: Optional[str] = None):
+    query = {"customer_id": customer_id} if customer_id else {}
+    txns = await db.customer_transactions.find(query, {"_id": 0}).to_list(10000)
+    summaries = _customer_monthly_summary_from_transactions(txns)
+    return {
+        "customer_id": customer_id,
+        "items": summaries,
+        "total_credit_sales": _round_ledger_money(sum(row["total_credit_sales"] for row in summaries)),
+        "sales_added": _round_ledger_money(sum(row["sales_added"] for row in summaries)),
+        "total_payments_received": _round_ledger_money(sum(row["total_payments_received"] for row in summaries)),
+        "net_receivable_movement": _round_ledger_money(sum(row["net_receivable_movement"] for row in summaries)),
+    }
+
 async def _distributor_monthly_summary_data(month: str, distributor_id: Optional[str] = None):
     try:
         datetime.strptime(month, "%Y-%m")
@@ -7609,7 +7688,8 @@ async def customer_ledger(cid: str, search: Optional[str] = None, invoice_number
         text = " ".join(str(t.get(k, "")) for k in ("invoice_number", "reference_number", "reference", "payment_mode", "mode", "type"))
         return (not search or search.lower() in text.lower()) and (not invoice_number or invoice_number.lower() in str(t.get("invoice_number") or t.get("reference") or "").lower()) and (not reference_number or reference_number.lower() in str(t.get("reference_number") or t.get("reference") or "").lower()) and (not payment_mode or payment_mode.lower() == str(t.get("payment_mode") or t.get("mode") or "").lower()) and (not transaction_type or transaction_type.lower() == str(t.get("type") or "").lower()) and (not start or str(t.get("created_at", "")) >= start) and (not end or str(t.get("created_at", "")) <= end) and (amount is None or round(float(t.get("amount", 0) or 0), 2) == round(amount, 2))
     running = [t for t in running if matches(t)]
-    return {"customer": cust, "transactions": running, "balance": round(balance, 2)}
+    monthly_summary = _customer_monthly_summary_from_transactions(txns)
+    return {"customer": cust, "transactions": running, "balance": round(balance, 2), "monthly_summary": monthly_summary, "monthly_movement_summary": monthly_summary}
 
 
 def _ledger_export_csv(owner_type: str, ledger: dict, start_date: date | None, end_date: date | None) -> str:
@@ -8172,14 +8252,20 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
             for key, value in aging["buckets"].items(): distributor_aging[key] += value
     customer_total = sum(row["balance"] for row in cust_out); distributor_total = sum(row["balance"] for row in dist_out)
     monthly = defaultdict(lambda: {"customer_receivables": 0.0, "distributor_payables": 0.0})
-    for txn in customer_txns:
-        month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+    for row in _customer_monthly_summary_from_transactions(customer_txns):
+        month = row.get("month")
         if month:
-            monthly[month]["customer_receivables"] += _safe_float(txn.get("amount")) * (1 if str(txn.get("type")).lower() == "sale" else -1 if str(txn.get("type")).lower() in {"payment", "credit", "credit_adjustment"} else 0)
+            monthly[month]["customer_receivables"] += _safe_float(row.get("net_receivable_movement"))
     for txn in distributor_txns:
         month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
-        if month:
-            monthly[month]["distributor_payables"] += _safe_float(txn.get("amount")) * (1 if str(txn.get("type")).lower() in {"purchase", "sale", "opening_balance"} else -1 if str(txn.get("type")).lower() in {"payment", "purchase_return", "credit", "credit_adjustment"} else 0)
+        if not month:
+            continue
+        _balance, bucket = _apply_distributor_transaction(0, txn)
+        amount = _safe_float(txn.get("amount"))
+        if bucket == "purchase":
+            monthly[month]["distributor_payables"] += amount
+        elif bucket in {"payment", "adjustment"}:
+            monthly[month]["distributor_payables"] -= amount
     trends = [{"month": m, "customer_receivables": _round_ledger_money(v["customer_receivables"]), "distributor_payables": _round_ledger_money(v["distributor_payables"]), "net_exposure": _round_ledger_money(v["distributor_payables"] - v["customer_receivables"])} for m, v in sorted(monthly.items())]
     return {"customers": cust_out, "distributors": dist_out, "customer_total": _round_ledger_money(customer_total), "distributor_total": _round_ledger_money(distributor_total),
             "customer_receivables": _round_ledger_money(customer_total), "distributor_payables": _round_ledger_money(distributor_total),
