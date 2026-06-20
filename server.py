@@ -9556,7 +9556,58 @@ ALLOWED_LOGO_CONTENT_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/web
 
 def normalize_settings(settings: Optional[dict] = None) -> dict:
     """Add new settings defaults without changing or removing legacy fields."""
-    return {**SETTINGS_DEFAULTS, **(settings or {})}
+    normalized = {**SETTINGS_DEFAULTS, **(settings or {})}
+    for field in ("selected_theme", "selected_font"):
+        if not normalized.get(field):
+            normalized[field] = SETTINGS_DEFAULTS[field]
+    for field in ("activity_logs",):
+        if normalized.get(field) is None:
+            normalized[field] = list(SETTINGS_DEFAULTS[field])
+    for field in ("role_permissions", "theme_settings", "backup_metadata"):
+        if normalized.get(field) is None:
+            normalized[field] = dict(SETTINGS_DEFAULTS[field])
+    for field in ("business_name", "business_address", "business_phone", "business_gstin", "signature_b64", "dl_number_1", "dl_number_2"):
+        if normalized.get(field) is None:
+            normalized[field] = SETTINGS_DEFAULTS[field]
+    return normalized
+
+
+def _validate_settings_key(key: str) -> None:
+    if key.startswith("$") or "." in key:
+        raise HTTPException(status_code=422, detail=f"Invalid settings field: {key}")
+
+
+def _validate_settings_keys(value, prefix: str = "settings") -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key = str(key)
+            _validate_settings_key(key)
+            _validate_settings_keys(nested, f"{prefix}.{key}")
+    elif isinstance(value, list):
+        for item in value:
+            _validate_settings_keys(item, prefix)
+
+
+def _sanitize_settings_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict) or isinstance(payload, list):
+        raise HTTPException(status_code=422, detail="Settings payload must be a JSON object")
+    sanitized = dict(payload)
+    _validate_settings_keys(sanitized)
+    logo = sanitized.get("pharmacy_logo")
+    if "pharmacy_logo" in sanitized and logo is not None and not isinstance(logo, (str, dict)):
+        raise HTTPException(status_code=422, detail="pharmacy_logo must be a string, object, or null")
+    for field in ("selected_theme", "selected_font"):
+        if sanitized.get(field) is None:
+            sanitized.pop(field, None)
+    for field in ("theme_settings", "role_permissions", "backup_metadata"):
+        if field in sanitized and sanitized[field] is None:
+            sanitized[field] = dict(SETTINGS_DEFAULTS[field])
+    if "activity_logs" in sanitized and sanitized["activity_logs"] is None:
+        sanitized["activity_logs"] = list(SETTINGS_DEFAULTS["activity_logs"])
+    for field in ("business_name", "business_address", "business_phone", "business_gstin", "signature_b64", "dl_number_1", "dl_number_2"):
+        if sanitized.get(field) is None:
+            sanitized[field] = SETTINGS_DEFAULTS[field]
+    return sanitized
 
 
 def settings_response(settings: Optional[dict] = None, *, include_legacy_welcome: bool = False) -> dict:
@@ -9608,10 +9659,29 @@ async def get_settings(
 
 @api_router.put("/settings")
 async def update_settings(payload: dict, user: dict = Depends(require_role("admin"))):
+    payload = _sanitize_settings_payload(payload)
     payload["key"] = "main"
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await db.settings.update_one({"key": "main"}, {"$set": payload}, upsert=True)
-    s = await db.settings.find_one({"key": "main"}, {"_id": 0})
+
+    business_fields = {"business_name", "business_address", "business_phone", "business_gstin", "dl_number_1", "dl_number_2"}
+    if "selected_theme" in payload or "theme_settings" in payload:
+        logger.info("Saving settings theme fields", extra={"tenant_id": user.get("tenant_id"), "fields": [k for k in ("selected_theme", "theme_settings") if k in payload]})
+    if "selected_font" in payload:
+        logger.info("Saving settings font field", extra={"tenant_id": user.get("tenant_id")})
+    if "pharmacy_logo" in payload:
+        logger.info("Saving settings logo field", extra={"tenant_id": user.get("tenant_id"), "logo_present": payload.get("pharmacy_logo") is not None})
+    if business_fields.intersection(payload):
+        logger.info("Saving settings business profile fields", extra={"tenant_id": user.get("tenant_id"), "fields": sorted(business_fields.intersection(payload))})
+
+    try:
+        await db.settings.update_one({"key": "main"}, {"$set": payload}, upsert=True)
+        s = await db.settings.find_one({"key": "main"}, {"_id": 0})
+    except PyMongoError as exc:
+        logger.exception("Database error while saving settings")
+        raise HTTPException(status_code=503, detail="Unable to save settings right now") from exc
+    except TypeError as exc:
+        logger.exception("Invalid settings payload while saving settings")
+        raise HTTPException(status_code=422, detail="Invalid settings payload") from exc
     return settings_response(s)
 
 
@@ -9659,12 +9729,17 @@ async def upload_pharmacy_logo(
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "uploaded_by": user.get("id") or user.get("email"),
     }
-    await db.settings.update_one(
-        {"key": "main"},
-        {"$set": {"key": "main", "pharmacy_logo": logo_doc, "updated_at": logo_doc["uploaded_at"]}},
-        upsert=True,
-    )
-    s = await db.settings.find_one({"key": "main"}, {"_id": 0})
+    logger.info("Saving settings logo upload", extra={"tenant_id": user.get("tenant_id"), "content_type": logo.content_type, "size": size})
+    try:
+        await db.settings.update_one(
+            {"key": "main"},
+            {"$set": {"key": "main", "pharmacy_logo": logo_doc, "updated_at": logo_doc["uploaded_at"]}},
+            upsert=True,
+        )
+        s = await db.settings.find_one({"key": "main"}, {"_id": 0})
+    except PyMongoError as exc:
+        logger.exception("Database error while saving settings logo")
+        raise HTTPException(status_code=503, detail="Unable to save pharmacy logo right now") from exc
     return settings_response(s)
 
 
