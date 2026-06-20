@@ -211,5 +211,68 @@ class AnalyticsAndReturnContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["distributor_id"], "dist-1")
 
 
+class TableActionAliasContractTest(unittest.TestCase):
+    def test_invoice_normalizer_adds_invoice_id_without_removing_existing_fields(self):
+        from server import _normalize_invoice
+
+        invoice = {
+            "id": "inv-1",
+            "invoice_no": "INV-001",
+            "customer_id": "cust-1",
+            "customer_name": "Customer",
+            "payment_mode": "cash",
+            "total": 25,
+            "items": [{"medicine_id": "med-1", "line_total": 25}],
+        }
+
+        normalized = _normalize_invoice(invoice, include_internal=True)
+
+        self.assertEqual(normalized["id"], "inv-1")
+        self.assertEqual(normalized["invoice_id"], "inv-1")
+        self.assertEqual(normalized["customer_id"], "cust-1")
+        self.assertEqual(normalized["items"][0]["medicine_id"], "med-1")
+
+    def test_ledger_transaction_aliases_preserve_existing_identifiers(self):
+        from server import _json_safe_ledger_transaction
+
+        transaction = {
+            "id": "txn-1",
+            "distributor_id": "dist-1",
+            "purchase_order_id": "po-1",
+            "reference": "BILL-1",
+            "amount": 12.345,
+        }
+
+        normalized = _json_safe_ledger_transaction(transaction, include_items=True)
+
+        self.assertEqual(normalized["id"], "txn-1")
+        self.assertEqual(normalized["transaction_id"], "txn-1")
+        self.assertEqual(normalized["distributor_id"], "dist-1")
+        self.assertEqual(normalized["purchase_order_id"], "po-1")
+        self.assertEqual(normalized["reference"], "BILL-1")
+
+    def test_purchase_return_alias_keeps_business_fields_available(self):
+        from server import _normalized_purchase_return_money
+
+        return_row = {
+            "id": "return-1",
+            "medicine_id": "med-1",
+            "distributor_id": "dist-1",
+            "batch_no": "B1",
+            "return_quantity": 2,
+            "purchase_rate": 10,
+            "return_date": "2026-06-20",
+        }
+
+        normalized = _normalized_purchase_return_money(return_row)
+
+        self.assertEqual(normalized["id"], "return-1")
+        self.assertEqual(normalized["medicine_id"], "med-1")
+        self.assertEqual(normalized["distributor_id"], "dist-1")
+        self.assertEqual(normalized["batch_no"], "B1")
+        self.assertEqual(normalized["return_amount"], 20.0)
+        self.assertIn("status", normalized)
+
+
 if __name__ == "__main__":
     unittest.main()
