@@ -276,3 +276,70 @@ class TableActionAliasContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _SettingsUpdateResult:
+    matched_count = 1
+
+
+class _SettingsCollection:
+    def __init__(self, record=None):
+        self.record = record
+        self.updates = []
+
+    async def find_one(self, query, projection=None):
+        if self.record and self.record.get("key") == query.get("key"):
+            return dict(self.record)
+        return None
+
+    async def update_one(self, query, update, upsert=False):
+        self.updates.append((query, update, upsert))
+        if self.record is None:
+            self.record = dict(query)
+        self.record.update(update["$set"])
+        return _SettingsUpdateResult()
+
+
+class SettingsSaveContractTest(unittest.IsolatedAsyncioTestCase):
+    async def test_settings_save_treats_missing_theme_font_logo_as_optional(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from server import update_settings
+
+        settings = _SettingsCollection({"key": "main", "business_name": "Legacy"})
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1"}
+
+        with patch("server.db", SimpleNamespace(settings=settings)):
+            response = await update_settings({"business_phone": "5550100", "selected_theme": None, "selected_font": None}, user=admin)
+
+        saved = settings.updates[0][1]["$set"]
+        self.assertNotIn("selected_theme", saved)
+        self.assertNotIn("selected_font", saved)
+        self.assertEqual(response["selected_theme"], "default")
+        self.assertEqual(response["selected_font"], "system")
+        self.assertIsNone(response["pharmacy_logo"])
+        self.assertEqual(response["business_phone"], "5550100")
+
+    async def test_settings_save_persists_theme_and_font(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from server import update_settings
+
+        settings = _SettingsCollection({"key": "main"})
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1"}
+
+        with patch("server.db", SimpleNamespace(settings=settings)):
+            response = await update_settings({"selected_theme": "dark", "selected_font": "inter"}, user=admin)
+
+        self.assertEqual(settings.record["selected_theme"], "dark")
+        self.assertEqual(settings.record["selected_font"], "inter")
+        self.assertEqual(response["selected_theme"], "dark")
+        self.assertEqual(response["selected_font"], "inter")
+
+    async def test_settings_save_returns_validation_error_for_invalid_mongo_field(self):
+        from server import update_settings
+
+        with self.assertRaises(HTTPException) as caught:
+            await update_settings({"$set": {"business_name": "Bad"}}, user={"role": "admin"})
+
+        self.assertEqual(caught.exception.status_code, 422)
