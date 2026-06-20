@@ -27,7 +27,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Literal
 from collections import Counter, defaultdict
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.encoders import jsonable_encoder
@@ -259,9 +259,9 @@ FORGOT_PASSWORD_WINDOW_MINUTES = 15
 SIGNUP_OTP_TTL_MINUTES = 10
 SIGNUP_OTP_ATTEMPTS = 5
 # Compatibility aliases; version_config.py is the single source of release metadata.
-APP_VERSION = VERSION_METADATA["version"]
-APP_BUILD = VERSION_METADATA["build"]
-APP_UPDATE_MESSAGE = VERSION_METADATA["message"]
+APP_VERSION = VERSION_METADATA["latest_version"]
+APP_BUILD = VERSION_METADATA["latest_build"]
+APP_UPDATE_MESSAGE = "PharmacyOS {version} is ready to install.".format(version=VERSION_METADATA["full_version"])
 APP_RELEASE_NOTES = VERSION_METADATA["release_notes"]
 
 
@@ -1863,9 +1863,13 @@ async def _send_signup_otp(method: str, identifier: str, otp: str) -> bool:
 
 
 @api_router.get("/version")
-async def version(response: Response):
+async def version(
+    response: Response,
+    current_version: Optional[str] = Query(default=None),
+    current_build: Optional[str] = Query(default=None),
+):
     response.headers["Cache-Control"] = "no-store"
-    return get_version_metadata()
+    return get_version_metadata(current_version=current_version, current_build=current_build)
 
 
 @api_router.post("/auth/signup/request-otp")
