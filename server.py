@@ -6649,10 +6649,15 @@ def _normalized_purchase_return_money(return_doc: dict) -> dict:
             normalized[field] = _money_float(_to_decimal(normalized[field]))
     if normalized.get("return_amount") is None:
         normalized["return_amount"] = _purchase_return_credit(normalized)
+    status, adjustment_type, _bucket = _purchase_return_business_status(normalized)
+    normalized["status"] = status
+    normalized["adjustment_type"] = adjustment_type
     return normalized
 
 
 def _purchase_return_settlement_status(return_doc: dict) -> str:
+    if return_doc.get("deleted_at") or return_doc.get("voided_at"):
+        return "deleted"
     if return_doc.get("settlement_status"):
         return return_doc["settlement_status"]
     if return_doc.get("po_adjustment_id") or return_doc.get("settled_by_po"):
@@ -6661,6 +6666,31 @@ def _purchase_return_settlement_status(return_doc: dict) -> str:
         return "ledger_adjusted"
     return "unsettled"
 
+
+
+
+def _purchase_return_business_status(return_doc: dict) -> tuple[str, str, str]:
+    settlement = _purchase_return_settlement_status(return_doc)
+    if settlement == "deleted":
+        return "Deleted / Voided", "deleted", "deleted"
+    if settlement == "settled_by_po":
+        return "Adjusted in Purchase", "purchase_adjustment", "adjusted_in_purchase"
+    if return_doc.get("ledger_adjusted") or return_doc.get("adjust_distributor_ledger"):
+        return "Ledger Adjusted", "ledger_adjustment", "ledger_adjusted"
+    return "Credit Pending / Recorded Only", "recorded_only", "pending_credit"
+
+
+def _purchase_return_analytics_row(return_doc: dict) -> dict:
+    status, adjustment_type, _bucket = _purchase_return_business_status(return_doc)
+    return {
+        "medicine": return_doc.get("medicine_name") or return_doc.get("medicine") or "Unknown",
+        "returned_qty": round_qty(_safe_float(return_doc.get("return_quantity"))),
+        "return_value": _purchase_return_credit(return_doc),
+        "status": status,
+        "adjustment_type": adjustment_type,
+        "distributor": return_doc.get("distributor") or return_doc.get("distributor_name") or "Unknown",
+        "return_date": return_doc.get("return_date") or return_doc.get("date") or return_doc.get("created_at"),
+    }
 
 async def _find_purchase_return_medicine(payload: PurchaseReturnCreate, session=None) -> dict:
     batch_filter = {"batch_no": payload.batch_number}
@@ -7371,18 +7401,24 @@ async def purchase_return_report(
         ledger_adjusted=ledger_adjusted,
     )
     returns = await db.purchase_returns.find(query, {"_id": 0}).to_list(10000)
+    returns = [item for item in returns if _purchase_return_settlement_status(item) != "deleted"]
 
     by_distributor = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
     by_medicine = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
     by_reason = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
     by_ledger_status = {
-        "adjusted": {"quantity": 0.0, "value": 0.0, "count": 0},
-        "pending": {"quantity": 0.0, "value": 0.0, "count": 0},
+        "Ledger Adjusted": {"quantity": 0.0, "value": 0.0, "count": 0},
+        "Credit Pending / Recorded Only": {"quantity": 0.0, "value": 0.0, "count": 0},
+        "Adjusted in Purchase": {"quantity": 0.0, "value": 0.0, "count": 0},
     }
+    analytics_rows = []
 
     total_quantity = 0.0
     total_value = 0.0
     settled_value = 0.0
+    ledger_adjusted_value = 0.0
+    pending_credit_value = 0.0
+    adjusted_in_purchase_value = 0.0
 
     def add_summary(bucket: dict, key: str, quantity: float, value: float):
         bucket[key]["quantity"] += quantity
@@ -7394,14 +7430,21 @@ async def purchase_return_report(
         value = _purchase_return_credit(item)
         total_quantity += quantity
         total_value += value
-        if _purchase_return_settlement_status(item) in {"ledger_adjusted", "settled_by_po"}:
+        status_label, _adjustment_type, status_bucket = _purchase_return_business_status(item)
+        if status_bucket in {"ledger_adjusted", "adjusted_in_purchase"}:
             settled_value += value
+        if status_bucket == "ledger_adjusted":
+            ledger_adjusted_value += value
+        elif status_bucket == "adjusted_in_purchase":
+            adjusted_in_purchase_value += value
+        elif status_bucket == "pending_credit":
+            pending_credit_value += value
 
         add_summary(by_distributor, item.get("distributor") or "Unknown", quantity, value)
         add_summary(by_medicine, item.get("medicine_name") or "Unknown", quantity, value)
         add_summary(by_reason, item.get("reason") or "Unknown", quantity, value)
-        status_key = "adjusted" if item.get("ledger_adjusted") else "pending"
-        add_summary(by_ledger_status, status_key, quantity, value)
+        add_summary(by_ledger_status, status_label, quantity, value)
+        analytics_rows.append(_purchase_return_analytics_row(item))
 
     def finalize_summary(bucket: dict) -> list[dict]:
         output = []
@@ -7421,6 +7464,14 @@ async def purchase_return_report(
         "total_returned_quantity": round_qty(total_quantity),
         "returned_quantity": round_qty(total_quantity),
         "total_return_value": round(total_value, 2),
+        "ledger_adjusted_value": _money_float(_to_decimal(ledger_adjusted_value)),
+        "pending_credit_value": _money_float(_to_decimal(pending_credit_value)),
+        "adjusted_in_purchase_value": _money_float(_to_decimal(adjusted_in_purchase_value)),
+        "summary_buckets": {
+            "Ledger Adjusted Value": _money_float(_to_decimal(ledger_adjusted_value)),
+            "Pending Credit Value": _money_float(_to_decimal(pending_credit_value)),
+            "Adjusted in Purchase Value": _money_float(_to_decimal(adjusted_in_purchase_value)),
+        },
         "settled_return_value": _money_float(_to_decimal(settled_value)),
         "unsettled_return_value": _money_float(_to_decimal(total_value) - _to_decimal(settled_value)),
         "return_count": len(returns),
@@ -7428,17 +7479,43 @@ async def purchase_return_report(
         "purchase_returns": [_normalized_purchase_return_money(item) for item in returns],
         "returns_by_distributor": finalize_summary(by_distributor),
         "returns_by_medicine": finalize_summary(by_medicine),
-        "medicine_wise_return_analytics": finalize_summary(by_medicine),
+        "medicine_wise_return_analytics": analytics_rows,
         "returns_by_reason": finalize_summary(by_reason),
         "ledger_adjusted_status": finalize_summary(by_ledger_status),
     }
 
 
 
-def _customer_transaction_month(txn: dict) -> Optional[str]:
+def _customer_transaction_date(txn: dict):
     if not isinstance(txn, dict):
         return None
-    return _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+    parsed = _parse_ledger_transaction_date(
+        txn.get("transaction_date")
+        or txn.get("date")
+        or txn.get("created_at")
+    )
+    if parsed:
+        return parsed
+
+    # Last-resort legacy fallback: only use id when it safely starts with an ISO date.
+    txn_id = str(txn.get("id") or "")
+    if len(txn_id) >= 10 and txn_id[4:5] == "-" and txn_id[7:8] == "-":
+        return _parse_ledger_transaction_date(txn_id[:10])
+    return None
+
+
+def _customer_transaction_month(txn: dict) -> Optional[str]:
+    parsed = _customer_transaction_date(txn)
+    return parsed.strftime("%Y-%m") if parsed else None
+
+
+def _customer_transaction_sort_key(txn: dict):
+    parsed = _customer_transaction_date(txn)
+    return (
+        parsed or date.min,
+        _ledger_sort_datetime(txn.get("created_at") if isinstance(txn, dict) else None),
+        str(txn.get("id") if isinstance(txn, dict) else ""),
+    )
 
 
 def _apply_customer_transaction(balance: float, txn: dict) -> tuple[float, str]:
@@ -7473,7 +7550,7 @@ def _customer_monthly_summary_from_transactions(transactions: list[dict]) -> lis
         valid_txns.append((month, txn))
 
     balance = 0.0
-    for month, txn in sorted(valid_txns, key=lambda item: (item[0], str(item[1].get("created_at") or item[1].get("transaction_date") or item[1].get("date") or ""), str(item[1].get("id") or ""))):
+    for month, txn in sorted(valid_txns, key=lambda item: (item[0], _customer_transaction_sort_key(item[1]))):
         amount = _safe_float(txn.get("amount"))
         new_balance, bucket = _apply_customer_transaction(balance, txn)
         if bucket == "ignored":
