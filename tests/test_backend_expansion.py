@@ -317,6 +317,36 @@ class _RecordingSettingsMotorCollection:
 
 
 class SettingsSaveContractTest(unittest.IsolatedAsyncioTestCase):
+
+    def test_settings_response_strips_legacy_welcome_screen_fields(self):
+        from server import settings_response
+
+        response = settings_response({
+            "key": "main",
+            "business_name": "Legacy",
+            "welcome_screen": {"enabled": True},
+            "welcome_screen_enabled": True,
+            "welcome_title": "Hello",
+            "welcome_subtitle": "Start",
+            "welcome_background": "blue",
+            "welcome_logo": "/welcome.png",
+            "welcome_message": "Welcome",
+            "welcome_settings": {"show": True},
+        })
+
+        for field in (
+            "welcome_screen",
+            "welcome_screen_enabled",
+            "welcome_title",
+            "welcome_subtitle",
+            "welcome_background",
+            "welcome_logo",
+            "welcome_message",
+            "welcome_settings",
+        ):
+            self.assertNotIn(field, response)
+        self.assertEqual(response["business_name"], "Legacy")
+
     async def test_settings_save_treats_missing_theme_font_logo_as_optional(self):
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -335,6 +365,45 @@ class SettingsSaveContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["selected_font"], "system")
         self.assertIsNone(response["pharmacy_logo"])
         self.assertEqual(response["business_phone"], "5550100")
+
+
+    async def test_settings_save_does_not_generate_or_persist_welcome_screen_fields(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from server import update_settings
+
+        settings = _SettingsCollection({"key": "main", "welcome_title": "Stored legacy title"})
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1"}
+
+        with patch("server.db", SimpleNamespace(settings=settings)):
+            response = await update_settings({
+                "business_name": "Care Pharmacy",
+                "welcome_screen": {"enabled": True},
+                "welcome_settings": {"headline": "Hello"},
+                "welcome_title": "Hello",
+            }, user=admin)
+
+        saved = settings.updates[0][1]["$set"]
+        self.assertNotIn("welcome_screen", saved)
+        self.assertNotIn("welcome_settings", saved)
+        self.assertNotIn("welcome_title", saved)
+        self.assertNotIn("welcome_title", response)
+        self.assertEqual(response["business_name"], "Care Pharmacy")
+
+    async def test_get_settings_logs_that_welcome_screen_config_is_not_returned(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from server import get_settings
+
+        settings = _SettingsCollection({"key": "main", "welcome_screen": {"enabled": True}})
+        user = {"id": "admin-1", "tenant_id": "shop-1"}
+
+        with patch("server.db", SimpleNamespace(settings=settings)), self.assertLogs("pharmacy", level="INFO") as logs:
+            response = await get_settings(user=user)
+
+        self.assertNotIn("welcome_screen", response)
+        self.assertIn("GET /api/settings Welcome Screen configuration return audit", "\n".join(logs.output))
+        self.assertIn("welcome_screen_config_returned", "\n".join(logs.output))
 
     async def test_settings_save_persists_theme_and_font(self):
         from types import SimpleNamespace

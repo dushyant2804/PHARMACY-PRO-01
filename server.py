@@ -9594,6 +9594,8 @@ def _sanitize_settings_payload(payload: dict) -> dict:
         raise HTTPException(status_code=422, detail="Settings payload must be a JSON object")
     sanitized = dict(payload)
     _validate_settings_keys(sanitized)
+    for field in WELCOME_SCREEN_FIELDS:
+        sanitized.pop(field, None)
     logo = sanitized.get("pharmacy_logo")
     if "pharmacy_logo" in sanitized and logo is not None and not isinstance(logo, (str, dict)):
         raise HTTPException(status_code=422, detail="pharmacy_logo must be a string, object, or null")
@@ -9628,8 +9630,8 @@ def _settings_payload_field_snapshot(payload: dict) -> dict:
         "selected_font": payload.get("selected_font"),
         "theme_settings": payload.get("theme_settings"),
         "pharmacy_logo": payload.get("pharmacy_logo"),
-        "logo_fields": {key: payload.get(key) for key in ("pharmacy_logo", "pharmacy_logo_url", "logo_url", "welcome_logo") if key in payload},
-        "welcome_screen_fields": {key: payload.get(key) for key in WELCOME_SCREEN_FIELDS if key in payload},
+        "logo_fields": {key: payload.get(key) for key in ("pharmacy_logo", "pharmacy_logo_url", "logo_url") if key in payload},
+        "removed_welcome_screen_fields": sorted(field for field in WELCOME_SCREEN_FIELDS if field in payload),
         "new_settings_fields": sorted(key for key in payload if key not in SETTINGS_DEFAULTS and key not in WELCOME_SCREEN_FIELDS and key not in {"updated_at"}),
     }
 
@@ -9667,8 +9669,8 @@ def _settings_save_log_context(payload: dict, user: dict, update_filter: dict, u
         "bson_failure_field": _find_first_bson_encoding_failure(update_operation),
     }
 
-def settings_response(settings: Optional[dict] = None, *, include_legacy_welcome: bool = False) -> dict:
-    """Return settings for active UI while preserving opt-in legacy welcome fields."""
+def settings_response(settings: Optional[dict] = None) -> dict:
+    """Return active settings without legacy Welcome Screen configuration."""
     normalized = normalize_settings(settings)
     logo = normalized.get("pharmacy_logo")
     if isinstance(logo, dict):
@@ -9681,9 +9683,8 @@ def settings_response(settings: Optional[dict] = None, *, include_legacy_welcome
     else:
         normalized["pharmacy_logo_url"] = None
         normalized["logo_url"] = None
-    if not include_legacy_welcome:
-        for field in WELCOME_SCREEN_FIELDS:
-            normalized.pop(field, None)
+    for field in WELCOME_SCREEN_FIELDS:
+        normalized.pop(field, None)
     return normalized
 
 
@@ -9706,12 +9707,22 @@ def _logo_extension(upload: UploadFile) -> str:
 
 
 @api_router.get("/settings")
-async def get_settings(
-    include_legacy_welcome: bool = Query(default=False),
-    user: dict = Depends(get_current_user),
-):
+async def get_settings(user: dict = Depends(get_current_user)):
     s = await db.settings.find_one({"key": "main"}, {"_id": 0})
-    return settings_response(s, include_legacy_welcome=include_legacy_welcome)
+    response = settings_response(s)
+    returned_welcome_fields = sorted(field for field in WELCOME_SCREEN_FIELDS if field in response)
+    stored_welcome_fields = sorted(field for field in WELCOME_SCREEN_FIELDS if field in (s or {}))
+    logger.info(
+        "GET /api/settings Welcome Screen configuration return audit: welcome_screen_config_returned=%s",
+        bool(returned_welcome_fields),
+        extra={
+            "tenant_id": user.get("tenant_id"),
+            "stored_welcome_screen_fields": stored_welcome_fields,
+            "returned_welcome_screen_fields": returned_welcome_fields,
+            "welcome_screen_config_returned": bool(returned_welcome_fields),
+        },
+    )
+    return response
 
 
 @api_router.put("/settings")
