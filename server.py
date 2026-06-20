@@ -7427,6 +7427,7 @@ async def purchase_return_report(
         "purchase_returns": [_normalized_purchase_return_money(item) for item in returns],
         "returns_by_distributor": finalize_summary(by_distributor),
         "returns_by_medicine": finalize_summary(by_medicine),
+        "medicine_wise_return_analytics": finalize_summary(by_medicine),
         "returns_by_reason": finalize_summary(by_reason),
         "ledger_adjusted_status": finalize_summary(by_ledger_status),
     }
@@ -8031,7 +8032,9 @@ async def sales_report(start: Optional[str] = None, end: Optional[str] = None, u
     medicines = await db.medicines.find({"id": {"$in": list(medicine_ids)}}, {"_id": 0, "id": 1, "purchase_price": 1}).to_list(len(medicine_ids) or 1)
     costs = {medicine.get("id"): _safe_float(medicine.get("purchase_price")) for medicine in medicines}
     total_sales = total_gst = total_discount = profit = 0.0
-    daily, monthly = defaultdict(float), defaultdict(float)
+    daily, monthly, monthly_profit = defaultdict(float), defaultdict(float), defaultdict(float)
+    payment_modes = defaultdict(float)
+    medicine_sales = defaultdict(lambda: {"medicine": "Unknown", "units_sold": 0.0, "revenue": 0.0, "cost": 0.0})
     for invoice in invoices:
         invoice_total = _safe_float(invoice.get("total", invoice.get("grand_total", 0)))
         total_sales += invoice_total
@@ -8041,6 +8044,8 @@ async def sales_report(start: Optional[str] = None, end: Optional[str] = None, u
         if day:
             daily[day] += invoice_total
             monthly[day[:7]] += invoice_total
+        payment_modes[str(invoice.get("payment_mode") or invoice.get("payment_method") or "unknown").lower()] += invoice_total
+        invoice_profit = 0.0
         for item in invoice.get("items", []):
             quantity = _safe_float(item.get("units_dispensed", item.get("quantity", 0)))
             revenue = _safe_float(item.get("line_total", item.get("net_amount", item.get("mrp", 0) * quantity)))
@@ -8049,12 +8054,35 @@ async def sales_report(start: Optional[str] = None, end: Optional[str] = None, u
             if cost < 0:
                 unit_cost = _safe_float(item.get("purchase_rate", item.get("purchase_price", costs.get(item.get("medicine_id"), 0))))
                 cost = unit_cost * quantity
-            profit += revenue - cost
+            item_profit = revenue - cost
+            profit += item_profit
+            invoice_profit += item_profit
+            med_key = item.get("medicine_id") or item.get("name") or item.get("medicine_name") or "Unknown"
+            row = medicine_sales[med_key]
+            row["medicine"] = item.get("name") or item.get("medicine_name") or row["medicine"]
+            row["units_sold"] += quantity
+            row["revenue"] += revenue
+            row["cost"] += cost
+        if day:
+            monthly_profit[day[:7]] += invoice_profit
+    def _rank_row(row: dict) -> dict:
+        revenue = row["revenue"]; cost = row["cost"]; item_profit = revenue - cost
+        return {"medicine": row["medicine"], "units_sold": round_qty(row["units_sold"]), "revenue": _round_ledger_money(revenue),
+                "cost": _round_ledger_money(cost), "profit": _round_ledger_money(item_profit),
+                "margin_percentage": _round_ledger_money((item_profit / revenue * 100) if revenue else 0)}
+    ranked = [_rank_row(row) for row in medicine_sales.values()]
     return {
         "total_sales": _round_ledger_money(total_sales), "total_gst": _round_ledger_money(total_gst),
         "total_discount": _round_ledger_money(total_discount), "estimated_profit": _round_ledger_money(profit),
         "daily": [{"date": key, "total": _round_ledger_money(value)} for key, value in sorted(daily.items())],
         "monthly_sales_trend": [{"month": key, "sales": _round_ledger_money(value)} for key, value in sorted(monthly.items())],
+        "monthly_profit_trend": [{"month": key, "profit": _round_ledger_money(value)} for key, value in sorted(monthly_profit.items())],
+        "payment_mode_distribution": [{"mode": key, "amount": _round_ledger_money(value)} for key, value in sorted(payment_modes.items())],
+        "top_revenue_medicines": sorted(ranked, key=lambda x: x["revenue"], reverse=True)[:20],
+        "top_profit_medicines": sorted(ranked, key=lambda x: x["profit"], reverse=True)[:20],
+        "average_bill_value": _round_ledger_money(total_sales / len(invoices)) if invoices else 0.0,
+        "average_profit_per_invoice": _round_ledger_money(profit / len(invoices)) if invoices else 0.0,
+        "highest_billing_day": ({"date": max(daily.items(), key=lambda x: x[1])[0], "sales": _round_ledger_money(max(daily.values()))} if daily else None),
         "invoice_count": len(invoices),
     }
 
@@ -8128,7 +8156,8 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
         aging = _outstanding_aging(customer_grouped[customer.get("id")], {"sale"}, {"payment", "credit", "credit_adjustment"})
         balance = sum(aging["buckets"].values())
         if balance > 0:
-            cust_out.append({"id": customer["id"], "name": customer["name"], "phone": customer.get("phone", ""), "balance": _round_ledger_money(balance), **aging})
+            last_payment = max((_analytics_date(t.get("transaction_date") or t.get("date") or t.get("created_at")) for t in customer_grouped[customer.get("id")] if str(t.get("type")).lower() == "payment"), default=None)
+            cust_out.append({"id": customer["id"], "name": customer["name"], "customer": customer["name"], "phone": customer.get("phone", ""), "balance": _round_ledger_money(balance), "outstanding": _round_ledger_money(balance), "age": aging["oldest_due_days"], "last_payment": last_payment.isoformat() if last_payment else None, **aging})
             for key, value in aging["buckets"].items(): customer_aging[key] += value
     for distributor in distributors:
         txns = distributor_grouped[distributor.get("id")]
@@ -8137,11 +8166,26 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
         if balance > 0:
             # Legacy opening balances may not have a transaction; retain them in the current bucket.
             gap = max(0.0, balance - sum(aging["buckets"].values())); aging["buckets"]["0-30"] = _round_ledger_money(aging["buckets"]["0-30"] + gap)
-            dist_out.append({"id": distributor["id"], "name": distributor["name"], "balance": _round_ledger_money(balance), **aging})
+            last_purchase = max((_analytics_date(t.get("transaction_date") or t.get("date") or t.get("created_at")) for t in txns if str(t.get("type")).lower() in {"purchase", "opening_balance"}), default=None)
+            dist_out.append({"id": distributor["id"], "name": distributor["name"], "distributor": distributor["name"], "balance": _round_ledger_money(balance), "outstanding": _round_ledger_money(balance), "age": aging["oldest_due_days"], "last_purchase": last_purchase.isoformat() if last_purchase else None, **aging})
             for key, value in aging["buckets"].items(): distributor_aging[key] += value
     customer_total = sum(row["balance"] for row in cust_out); distributor_total = sum(row["balance"] for row in dist_out)
+    monthly = defaultdict(lambda: {"customer_receivables": 0.0, "distributor_payables": 0.0})
+    for txn in customer_txns:
+        month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+        if month:
+            monthly[month]["customer_receivables"] += _safe_float(txn.get("amount")) * (1 if str(txn.get("type")).lower() == "sale" else -1 if str(txn.get("type")).lower() in {"payment", "credit", "credit_adjustment"} else 0)
+    for txn in distributor_txns:
+        month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+        if month:
+            monthly[month]["distributor_payables"] += _safe_float(txn.get("amount")) * (1 if str(txn.get("type")).lower() in {"purchase", "sale", "opening_balance"} else -1 if str(txn.get("type")).lower() in {"payment", "purchase_return", "credit", "credit_adjustment"} else 0)
+    trends = [{"month": m, "customer_receivables": _round_ledger_money(v["customer_receivables"]), "distributor_payables": _round_ledger_money(v["distributor_payables"]), "net_exposure": _round_ledger_money(v["distributor_payables"] - v["customer_receivables"])} for m, v in sorted(monthly.items())]
     return {"customers": cust_out, "distributors": dist_out, "customer_total": _round_ledger_money(customer_total), "distributor_total": _round_ledger_money(distributor_total),
             "customer_receivables": _round_ledger_money(customer_total), "distributor_payables": _round_ledger_money(distributor_total),
+            "net_exposure": _round_ledger_money(distributor_total - customer_total),
+            "customer_recovery_ranking": sorted(cust_out, key=lambda x: x["outstanding"], reverse=True),
+            "distributor_payable_ranking": sorted(dist_out, key=lambda x: x["outstanding"], reverse=True),
+            "monthly_outstanding_trends": trends,
             "customer_aging": {key: _round_ledger_money(value) for key, value in customer_aging.items()}, "distributor_aging": {key: _round_ledger_money(value) for key, value in distributor_aging.items()},
             "aging_buckets": {"customers": customer_aging, "distributors": distributor_aging},
             "outstanding_movement": {"customer_transactions": customer_txns, "distributor_transactions": distributor_txns}}
@@ -8168,12 +8212,16 @@ async def add_daily_summary(payload: dict, user: dict = Depends(get_current_user
 async def expiry_report(user: dict = Depends(get_current_user)):
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
     today = datetime.now(timezone.utc).date()
-    expired, expiring_30, expiring_90, safe = [], [], [], []
+    expired, expiring_30, expiring_90, safe, risk_medicines = [], [], [], [], []
+    total_inventory_cost_value = total_inventory_mrp_value = 0.0
 
     for m in medicines:
         available = _available_stock(m)
         if available <= 0:
             continue
+        purchase_price = _safe_float(m.get("purchase_price"))
+        total_inventory_cost_value += available * purchase_price
+        total_inventory_mrp_value += available * _safe_float(m.get("mrp"))
         details = expiry_details(m.get("expiry_date"), today)
 
         item = {
@@ -8189,11 +8237,14 @@ async def expiry_report(user: dict = Depends(get_current_user)):
 
         if details["expiry_status"] == "expired":
             expired.append(item)
+            risk_medicines.append(item)
         elif details["days_to_expiry"] is not None and details["days_to_expiry"] <= 30:
             expiring_30.append(item)
+            risk_medicines.append(item)
         elif details["days_to_expiry"] is not None and details["days_to_expiry"] <= EXPIRY_WARNING_DAYS:
             # This is the non-overlapping 31-90 day risk bucket.
             expiring_90.append(item)
+            risk_medicines.append(item)
         else:
             safe.append(item)
 
@@ -8219,6 +8270,19 @@ async def expiry_report(user: dict = Depends(get_current_user)):
         "expiring_30_count": len(expiring_30),
         "expiring_90_count": len(expiring_90),
         "safe_count": len(safe),
+        "total_inventory_cost_value": _round_ledger_money(total_inventory_cost_value),
+        "total_inventory_mrp_value": _round_ledger_money(total_inventory_mrp_value),
+        "top_expiry_risk_medicines": [
+            {
+                "medicine": item.get("name") or item.get("medicine_name") or "Unknown",
+                "batch": item.get("batch_no") or item.get("batch_number") or item.get("batch") or "",
+                "expiry": item.get("expiry_date"),
+                "stock": item["available_units"],
+                "purchase_price": _round_ledger_money(_safe_float(item.get("purchase_price"))),
+                "risk_value": item["cost_value_at_risk"],
+            }
+            for item in sorted(risk_medicines, key=lambda x: x["cost_value_at_risk"], reverse=True)[:20]
+        ],
         **expiry_values,
         "near_expiry_value_at_risk": _round_ledger_money(
             expiry_values["expiring_30_value_at_risk"] + expiry_values["expiring_90_value_at_risk"]
@@ -8257,6 +8321,102 @@ async def top_medicines(start: str, end: str, user: dict = Depends(get_current_u
     result = sorted(map_data.values(), key=lambda x: x["revenue"], reverse=True)
 
     return result[:20]
+
+
+def _invoice_item_quantity(item: dict) -> float:
+    return _safe_float(item.get("units_dispensed", item.get("quantity", 0)))
+
+
+async def _invoice_item_profit_rows() -> tuple[list[dict], dict]:
+    invoices = await db.invoices.find({}, {"_id": 0}).to_list(20000)
+    medicine_ids = {item.get("medicine_id") for invoice in invoices for item in invoice.get("items", []) if item.get("medicine_id")}
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(20000)
+    by_id = {m.get("id"): m for m in medicines}
+    rows = []
+    for invoice in invoices:
+        sold_on = _analytics_date(invoice.get("created_at") or invoice.get("invoice_date") or invoice.get("date"))
+        for item in invoice.get("items", []):
+            qty = _invoice_item_quantity(item)
+            revenue = _safe_float(item.get("line_total", item.get("net_amount", item.get("mrp", 0) * qty)))
+            cost = _safe_float(item.get("purchase_cost"), -1)
+            med = by_id.get(item.get("medicine_id"), {})
+            if cost < 0:
+                cost = _safe_float(item.get("purchase_rate", item.get("purchase_price", med.get("purchase_price", 0)))) * qty
+            rows.append({"medicine_id": item.get("medicine_id"), "medicine": item.get("name") or item.get("medicine_name") or med.get("name") or "Unknown",
+                         "quantity": qty, "revenue": revenue, "cost": cost, "sold_on": sold_on, "category": item.get("category") or med.get("category")})
+    return rows, by_id
+
+
+def _finalize_profit_rows(grouped: dict) -> list[dict]:
+    output = []
+    for values in grouped.values():
+        profit = values["revenue"] - values["cost"]
+        output.append({"medicine": values.get("medicine", "Unknown"), "revenue": _round_ledger_money(values["revenue"]),
+                       "cost": _round_ledger_money(values["cost"]), "profit": _round_ledger_money(profit),
+                       "margin_percentage": _round_ledger_money((profit / values["revenue"] * 100) if values["revenue"] else 0),
+                       "units_sold": round_qty(values["units_sold"])})
+    return output
+
+
+@api_router.get("/reports/medicine-profitability")
+async def medicine_profitability(sort_by: Literal["revenue", "cost", "profit", "margin_percentage", "units_sold"] = "profit", user: dict = Depends(get_current_user)):
+    rows, _ = await _invoice_item_profit_rows()
+    grouped = defaultdict(lambda: {"medicine": "Unknown", "revenue": 0.0, "cost": 0.0, "units_sold": 0.0})
+    for row in rows:
+        key = row.get("medicine_id") or row["medicine"]
+        grouped[key]["medicine"] = row["medicine"]; grouped[key]["revenue"] += row["revenue"]; grouped[key]["cost"] += row["cost"]; grouped[key]["units_sold"] += row["quantity"]
+    return {"items": sorted(_finalize_profit_rows(grouped), key=lambda x: x[sort_by], reverse=True)}
+
+
+@api_router.get("/reports/category-profitability")
+async def category_profitability(user: dict = Depends(get_current_user)):
+    rows, _ = await _invoice_item_profit_rows()
+    grouped = {key: {"category": key, "revenue": 0.0, "cost": 0.0} for key in ("OTC", "H", "H1", "Other")}
+    for row in rows:
+        category = str(row.get("category") or "Other").upper()
+        bucket = category if category in {"OTC", "H", "H1"} else "Other"
+        grouped[bucket]["revenue"] += row["revenue"]; grouped[bucket]["cost"] += row["cost"]
+    return {"items": [{"category": k, "revenue": _round_ledger_money(v["revenue"]), "profit": _round_ledger_money(v["revenue"] - v["cost"]),
+                       "margin": _round_ledger_money(((v["revenue"] - v["cost"]) / v["revenue"] * 100) if v["revenue"] else 0)} for k, v in grouped.items()]}
+
+
+@api_router.get("/reports/dead-stock")
+async def dead_stock_report(days: Literal[90, 180, 365] = 90, user: dict = Depends(get_current_user)):
+    rows, _ = await _invoice_item_profit_rows()
+    last_sale = {}
+    for row in rows:
+        if row["sold_on"]:
+            last_sale[row.get("medicine_id") or row["medicine"]] = max(last_sale.get(row.get("medicine_id") or row["medicine"], date.min), row["sold_on"])
+    today = datetime.now(timezone.utc).date()
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(20000)
+    items = []
+    for m in medicines:
+        stock = _available_stock(m)
+        if stock <= 0: continue
+        sold_on = last_sale.get(m.get("id") or m.get("name"))
+        age = (today - sold_on).days if sold_on else 999999
+        if age >= days:
+            items.append({"medicine": m.get("name") or "Unknown", "stock": round_qty(stock), "inventory_value": _round_ledger_money(stock * _safe_float(m.get("purchase_price"))),
+                          "last_sale_date": sold_on.isoformat() if sold_on else None, "days_since_last_sale": age})
+    return {"days": days, "items": sorted(items, key=lambda x: x["inventory_value"], reverse=True)}
+
+
+@api_router.get("/reports/reorder")
+async def reorder_report(user: dict = Depends(get_current_user)):
+    rows, _ = await _invoice_item_profit_rows()
+    first_sale = min((r["sold_on"] for r in rows if r["sold_on"]), default=datetime.now(timezone.utc).date())
+    months = max(1, ((datetime.now(timezone.utc).date() - first_sale).days + 29) // 30)
+    sold = defaultdict(float)
+    for row in rows: sold[row.get("medicine_id") or row["medicine"]] += row["quantity"]
+    medicines = await db.medicines.find({}, {"_id": 0}).to_list(20000)
+    items = []
+    for m in medicines:
+        stock = _available_stock(m); avg = sold[m.get("id") or m.get("name")] / months
+        if avg <= 0: continue
+        days_remaining = stock / (avg / 30)
+        items.append({"medicine": m.get("name") or "Unknown", "current_stock": round_qty(stock), "average_monthly_sale": round_qty(avg),
+                      "estimated_days_remaining": round(days_remaining, 1), "suggested_reorder_quantity": round_qty(max(0, avg * 2 - stock))})
+    return {"items": sorted(items, key=lambda x: x["estimated_days_remaining"])}
 
 
 # ---------------- Analytics (compact, tenant-scoped payloads) ----------------
