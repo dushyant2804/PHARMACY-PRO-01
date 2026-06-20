@@ -4017,6 +4017,18 @@ def _normalize_invoice(invoice: dict, include_internal: bool = False) -> dict:
     result["items"] = [{**item, **{field: _round_invoice_money(item[field]) for field in ("line_total", "gst_amount", "net_amount", "purchase_cost", "estimated_profit", "margin_percentage") if field in item}} for item in result.get("items", [])]
     if not include_internal:
         result = _strip_internal_invoice_fields(result)
+    return _ensure_action_aliases(result, alias_id_fields=("invoice_id",))
+
+
+def _ensure_action_aliases(row: dict, *, alias_id_fields: tuple[str, ...] = ()) -> dict:
+    """Add non-destructive stable aliases used by table row actions."""
+    result = dict(row or {})
+    stable_id = result.get("id") or result.get("_id")
+    if result.get("id") in (None, "") and stable_id not in (None, ""):
+        result["id"] = str(stable_id)
+    for alias in alias_id_fields:
+        if result.get(alias) in (None, "") and stable_id not in (None, ""):
+            result[alias] = str(stable_id)
     return result
 
 
@@ -5258,7 +5270,8 @@ def _json_safe_ledger_transaction(txn: dict, include_items: bool = False) -> dic
     for money_field in ("amount", "running_balance", "bill_amount", "paid_amount", "due_amount"):
         if money_field in safe_txn:
             safe_txn[money_field] = _round_ledger_money(safe_txn[money_field])
-    for id_field in ("id", "distributor_id", "purchase_order_id", "sale_id"):
+    safe_txn = _ensure_action_aliases(safe_txn, alias_id_fields=("transaction_id",))
+    for id_field in ("id", "transaction_id", "distributor_id", "purchase_order_id", "sale_id"):
         if safe_txn.get(id_field) not in (None, ""):
             safe_txn[id_field] = str(safe_txn[id_field])
     return safe_txn
@@ -6653,6 +6666,7 @@ def _normalized_purchase_return_money(return_doc: dict) -> dict:
             normalized[field] = _money_float(_to_decimal(normalized[field]))
     if normalized.get("return_amount") is None:
         normalized["return_amount"] = _purchase_return_credit(normalized)
+    normalized = _ensure_action_aliases(normalized)
     status, adjustment_type, _bucket = _purchase_return_business_status(normalized)
     normalized["status"] = status
     normalized["adjustment_type"] = adjustment_type
@@ -7794,7 +7808,10 @@ async def customer_ledger(cid: str, search: Optional[str] = None, invoice_number
         balance = round(balance, 2)
         if t.get("running_balance") != balance:
             await db.customer_transactions.update_one({"id": t["id"]}, {"$set": {"running_balance": balance, "amount": round(float(t.get("amount", 0) or 0), 2)}})
-        running.append({**t, "amount": round(float(t.get("amount", 0) or 0), 2), "running_balance": balance})
+        running.append(_ensure_action_aliases(
+            {**t, "amount": round(float(t.get("amount", 0) or 0), 2), "running_balance": balance},
+            alias_id_fields=("transaction_id",),
+        ))
     def matches(t):
         text = " ".join(str(t.get(k, "")) for k in ("invoice_number", "reference_number", "reference", "payment_mode", "mode", "type"))
         return (not search or search.lower() in text.lower()) and (not invoice_number or invoice_number.lower() in str(t.get("invoice_number") or t.get("reference") or "").lower()) and (not reference_number or reference_number.lower() in str(t.get("reference_number") or t.get("reference") or "").lower()) and (not payment_mode or payment_mode.lower() == str(t.get("payment_mode") or t.get("mode") or "").lower()) and (not transaction_type or transaction_type.lower() == str(t.get("type") or "").lower()) and (not start or str(t.get("created_at", "")) >= start) and (not end or str(t.get("created_at", "")) <= end) and (amount is None or round(float(t.get("amount", 0) or 0), 2) == round(amount, 2))
@@ -9452,7 +9469,8 @@ async def update_po(
 
 @api_router.get("/purchase-orders")
 async def list_pos(user: dict = Depends(get_current_user)):
-    return await db.purchase_orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000)
+    purchase_orders = await db.purchase_orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000)
+    return [_ensure_action_aliases(po, alias_id_fields=("purchase_order_id",)) for po in purchase_orders]
 
 
 @api_router.get("/purchase-orders/{pid}")
@@ -9460,7 +9478,7 @@ async def get_po(pid: str, user: dict = Depends(get_current_user)):
     po = await db.purchase_orders.find_one({"id": pid}, {"_id": 0})
     if not po:
         raise HTTPException(status_code=404, detail="Purchase order not found")
-    return po
+    return _ensure_action_aliases(po, alias_id_fields=("purchase_order_id",))
 
 
 # ---------------- Doctors (referring history) ----------------
@@ -9569,6 +9587,7 @@ def _normalize_daily_sale(entry: dict) -> dict:
         legacy_total if item.get("payment_status") == "pending" else 0,
     ))
     gross = _money(cash + upi + card + outstanding)
+    item = _ensure_action_aliases(item)
     item.update({
         "cash_sales": cash,
         "upi_sales": upi,
@@ -9765,6 +9784,7 @@ async def _daily_closing_expected(closing_date: str, opening_cash: float = 0) ->
 
 def _daily_closing_public(closing: dict) -> dict:
     closing = _prepare_daily_closing(closing)
+    closing = _ensure_action_aliases(closing)
     return {
         key: value
         for key, value in closing.items()
