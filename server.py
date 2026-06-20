@@ -2112,8 +2112,6 @@ async def set_privacy_password(
                 },
                 "$setOnInsert": {
                     "key": "privacy_password",
-                    "tenant_id": user.get("tenant_id"),
-                    "shop_id": user.get("shop_id") or user.get("tenant_id"),
                     "created_at": now_iso,
                 },
             },
@@ -2147,7 +2145,9 @@ def _threshold_response(medicine: dict) -> dict:
 
 
 def _privacy_settings_filter(user: dict) -> dict:
-    return {"key": "privacy_password", "tenant_id": user.get("tenant_id")}
+    # TenantAwareCollection injects tenant_id/shop_id automatically for settings.
+    # Keep this selector neutral so MongoDB upserts do not see tenant_id twice.
+    return {"key": "privacy_password"}
 
 
 async def _privacy_password_hash(user: dict) -> Optional[str]:
