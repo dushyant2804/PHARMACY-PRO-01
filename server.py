@@ -6680,16 +6680,39 @@ def _purchase_return_business_status(return_doc: dict) -> tuple[str, str, str]:
     return "Credit Pending / Recorded Only", "recorded_only", "pending_credit"
 
 
+def _purchase_return_report_status_label(return_doc: dict) -> str:
+    if return_doc.get("adjust_ledger") is True or return_doc.get("ledger_adjusted") is True:
+        return "Ledger Adjusted"
+    if (
+        return_doc.get("adjusted_in_purchase") is True
+        or return_doc.get("consumed_in_po") is True
+        or bool(return_doc.get("po_adjustment_id"))
+        or bool(return_doc.get("settled_by_po"))
+    ):
+        return "Adjusted in Purchase"
+    return "Credit Pending"
+
+
 def _purchase_return_analytics_row(return_doc: dict) -> dict:
-    status, adjustment_type, _bucket = _purchase_return_business_status(return_doc)
+    quantity = _safe_float(return_doc.get("return_quantity"))
+    purchase_rate = _safe_float(return_doc.get("purchase_rate"))
+    medicine_name = return_doc.get("medicine_name") or return_doc.get("medicine") or return_doc.get("name") or "Unknown"
+    distributor_name = return_doc.get("distributor_name") or return_doc.get("distributor") or return_doc.get("supplier_name") or "Unknown"
+    return_value = _money_float(_to_decimal(quantity) * _to_decimal(purchase_rate))
+    status_label = _purchase_return_report_status_label(return_doc)
     return {
-        "medicine": return_doc.get("medicine_name") or return_doc.get("medicine") or "Unknown",
-        "returned_qty": round_qty(_safe_float(return_doc.get("return_quantity"))),
-        "return_value": _purchase_return_credit(return_doc),
-        "status": status,
-        "adjustment_type": adjustment_type,
-        "distributor": return_doc.get("distributor") or return_doc.get("distributor_name") or "Unknown",
+        "medicine_name": medicine_name,
+        "distributor_name": distributor_name,
+        "return_quantity": round_qty(quantity),
+        "purchase_rate": _money_float(_to_decimal(purchase_rate)),
+        "return_value": return_value,
         "return_date": return_doc.get("return_date") or return_doc.get("date") or return_doc.get("created_at"),
+        "status_label": status_label,
+        # Backward-compatible aliases for existing report consumers.
+        "medicine": medicine_name,
+        "distributor": distributor_name,
+        "returned_qty": round_qty(quantity),
+        "status": status_label if status_label != "Credit Pending" else "Credit Pending / Recorded Only",
     }
 
 async def _find_purchase_return_medicine(payload: PurchaseReturnCreate, session=None) -> dict:
@@ -7406,11 +7429,7 @@ async def purchase_return_report(
     by_distributor = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
     by_medicine = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
     by_reason = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
-    by_ledger_status = {
-        "Ledger Adjusted": {"quantity": 0.0, "value": 0.0, "count": 0},
-        "Credit Pending / Recorded Only": {"quantity": 0.0, "value": 0.0, "count": 0},
-        "Adjusted in Purchase": {"quantity": 0.0, "value": 0.0, "count": 0},
-    }
+    by_ledger_status = defaultdict(lambda: {"quantity": 0.0, "value": 0.0, "count": 0})
     analytics_rows = []
 
     total_quantity = 0.0
@@ -7426,25 +7445,26 @@ async def purchase_return_report(
         bucket[key]["count"] += 1
 
     for item in returns:
-        quantity = float(item.get("return_quantity", 0) or 0)
-        value = _purchase_return_credit(item)
+        quantity = _safe_float(item.get("return_quantity"))
+        value = _money_float(_to_decimal(quantity) * _to_decimal(_safe_float(item.get("purchase_rate"))))
         total_quantity += quantity
         total_value += value
-        status_label, _adjustment_type, status_bucket = _purchase_return_business_status(item)
-        if status_bucket in {"ledger_adjusted", "adjusted_in_purchase"}:
+        analytics_row = _purchase_return_analytics_row(item)
+        status_label = analytics_row["status_label"]
+        if status_label in {"Ledger Adjusted", "Adjusted in Purchase"}:
             settled_value += value
-        if status_bucket == "ledger_adjusted":
+        if status_label == "Ledger Adjusted":
             ledger_adjusted_value += value
-        elif status_bucket == "adjusted_in_purchase":
+        elif status_label == "Adjusted in Purchase":
             adjusted_in_purchase_value += value
-        elif status_bucket == "pending_credit":
+        elif status_label == "Credit Pending":
             pending_credit_value += value
 
-        add_summary(by_distributor, item.get("distributor") or "Unknown", quantity, value)
-        add_summary(by_medicine, item.get("medicine_name") or "Unknown", quantity, value)
+        add_summary(by_distributor, analytics_row["distributor_name"], quantity, value)
+        add_summary(by_medicine, analytics_row["medicine_name"], quantity, value)
         add_summary(by_reason, item.get("reason") or "Unknown", quantity, value)
         add_summary(by_ledger_status, status_label, quantity, value)
-        analytics_rows.append(_purchase_return_analytics_row(item))
+        analytics_rows.append(analytics_row)
 
     def finalize_summary(bucket: dict) -> list[dict]:
         output = []
@@ -7479,6 +7499,7 @@ async def purchase_return_report(
         "purchase_returns": [_normalized_purchase_return_money(item) for item in returns],
         "returns_by_distributor": finalize_summary(by_distributor),
         "returns_by_medicine": finalize_summary(by_medicine),
+        "purchase_return_analytics": analytics_rows,
         "medicine_wise_return_analytics": analytics_rows,
         "returns_by_reason": finalize_summary(by_reason),
         "ledger_adjusted_status": finalize_summary(by_ledger_status),
@@ -7497,7 +7518,7 @@ def _customer_transaction_date(txn: dict):
     if parsed:
         return parsed
 
-    # Last-resort legacy fallback: only use id when it safely starts with an ISO date.
+    # Last-resort legacy fallback after the required transaction_date/date/created_at priority.
     txn_id = str(txn.get("id") or "")
     if len(txn_id) >= 10 and txn_id[4:5] == "-" and txn_id[7:8] == "-":
         return _parse_ledger_transaction_date(txn_id[:10])
@@ -7520,12 +7541,12 @@ def _customer_transaction_sort_key(txn: dict):
 
 def _apply_customer_transaction(balance: float, txn: dict) -> tuple[float, str]:
     amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
-    txn_type = str(txn.get("type") if isinstance(txn, dict) else "").lower()
+    txn_type = str(txn.get("type") if isinstance(txn, dict) else "").strip().lower()
 
-    if txn_type in {"sale", "credit_sale", "invoice", "debit", "opening_balance"}:
+    if txn_type == "sale":
         return balance + amount, "sale"
 
-    if txn_type in {"payment", "receipt", "credit", "credit_adjustment", "return", "sales_return"}:
+    if txn_type == "payment":
         return balance - amount, "payment"
 
     return balance, "ignored"
@@ -7569,18 +7590,27 @@ def _customer_monthly_summary_from_transactions(transactions: list[dict]) -> lis
         row["transaction_count"] += 1
 
     summaries = []
+    money_keys = ("total_credit_sales", "sales_added", "total_payments_received", "net_receivable_movement", "closing_receivable_balance")
     for month in sorted(monthly):
         row = monthly[month]
-        for key in ("total_credit_sales", "sales_added", "total_payments_received", "net_receivable_movement", "closing_receivable_balance"):
+        for key in money_keys:
             row[key] = _round_ledger_money(row[key])
+        if all(row[key] == 0 for key in money_keys):
+            continue
         summaries.append(dict(row))
+    if transactions and not summaries:
+        logger.warning("Customer monthly summary generation produced no non-zero rows from %s transactions", len(transactions))
     return summaries
 
 
 async def _customer_monthly_summary_data(customer_id: Optional[str] = None):
     query = {"customer_id": customer_id} if customer_id else {}
     txns = await db.customer_transactions.find(query, {"_id": 0}).to_list(10000)
-    summaries = _customer_monthly_summary_from_transactions(txns)
+    try:
+        summaries = _customer_monthly_summary_from_transactions(txns)
+    except Exception:
+        logger.exception("Customer monthly summary generation failed customer_id=%s", customer_id)
+        summaries = []
     return {
         "customer_id": customer_id,
         "items": summaries,
@@ -7765,7 +7795,11 @@ async def customer_ledger(cid: str, search: Optional[str] = None, invoice_number
         text = " ".join(str(t.get(k, "")) for k in ("invoice_number", "reference_number", "reference", "payment_mode", "mode", "type"))
         return (not search or search.lower() in text.lower()) and (not invoice_number or invoice_number.lower() in str(t.get("invoice_number") or t.get("reference") or "").lower()) and (not reference_number or reference_number.lower() in str(t.get("reference_number") or t.get("reference") or "").lower()) and (not payment_mode or payment_mode.lower() == str(t.get("payment_mode") or t.get("mode") or "").lower()) and (not transaction_type or transaction_type.lower() == str(t.get("type") or "").lower()) and (not start or str(t.get("created_at", "")) >= start) and (not end or str(t.get("created_at", "")) <= end) and (amount is None or round(float(t.get("amount", 0) or 0), 2) == round(amount, 2))
     running = [t for t in running if matches(t)]
-    monthly_summary = _customer_monthly_summary_from_transactions(txns)
+    try:
+        monthly_summary = _customer_monthly_summary_from_transactions(txns)
+    except Exception:
+        logger.exception("Customer ledger monthly summary generation failed customer_id=%s", cid)
+        monthly_summary = []
     return {"customer": cust, "transactions": running, "balance": round(balance, 2), "monthly_summary": monthly_summary, "monthly_movement_summary": monthly_summary}
 
 
