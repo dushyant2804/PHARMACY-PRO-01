@@ -8388,55 +8388,104 @@ def _outstanding_aging(transactions: list[dict], charge_types: set[str], credit_
 
 
 def _distributor_monthly_outstanding_movement(distributors: list[dict], distributor_txns: list[dict]) -> list[dict]:
-    """Build month-end distributor payable movement from distributor ledger rows only."""
+    """Build month-end distributor payable movement from Distributor Ledger rows only."""
     distributor_by_id = {str(d.get("id") or ""): d for d in distributors if isinstance(d, dict)}
-    opening_balances = {
-        distributor_id: _safe_float(distributor.get("opening_balance", 0))
-        for distributor_id, distributor in distributor_by_id.items()
-    }
-    rows_by_month = defaultdict(lambda: {"purchases": 0.0, "payments": 0.0, "adjustments": 0.0})
-    dated_txns = []
-
+    raw_txns_by_distributor = defaultdict(list)
     for txn in distributor_txns:
         if not isinstance(txn, dict):
             continue
-        month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
-        if not month:
-            continue
-        dated_txns.append(txn)
-        _balance, bucket = _apply_distributor_transaction(0, txn)
-        amount = _safe_float(txn.get("amount"))
-        if bucket == "purchase":
-            rows_by_month[month]["purchases"] += amount
-        elif bucket == "adjustment":
-            rows_by_month[month]["adjustments"] += amount
+        raw_txns_by_distributor[str(txn.get("distributor_id") or "")].append(txn)
+
+    rows_by_month = defaultdict(lambda: {"purchases": 0.0, "payments": 0.0, "adjustments": 0.0})
+    txns_by_month = defaultdict(list)
+    running_balance_by_distributor = defaultdict(float)
+    distributor_ids = set(distributor_by_id) | set(raw_txns_by_distributor)
+
+    for distributor_id in sorted(distributor_ids):
+        distributor = distributor_by_id.get(distributor_id, {"id": distributor_id})
+        # Canonicalize each distributor's own ledger stream so legacy opening
+        # balances are represented exactly as the Distributor Ledger does,
+        # without ever consulting Customer Ledger transactions.
+        raw_distributor_txns = raw_txns_by_distributor.get(distributor_id, [])
+        if distributor_id in distributor_by_id:
+            ledger_txns = _distributor_opening_balance_deduped_transactions(distributor, raw_distributor_txns)
+            if raw_distributor_txns and not (distributor.get("created_at") or _distributor_opening_balance_date(distributor)):
+                first_ledger_date = min(
+                    (
+                        parsed
+                        for raw_txn in raw_distributor_txns
+                        if (parsed := _analytics_date(raw_txn.get("transaction_date") or raw_txn.get("date") or raw_txn.get("created_at")))
+                    ),
+                    default=None,
+                )
+                if first_ledger_date:
+                    for index, ledger_txn in enumerate(ledger_txns):
+                        if str(ledger_txn.get("type") or "").lower() == "opening_balance":
+                            dated_opening = ledger_txn.copy()
+                            dated_opening["transaction_date"] = first_ledger_date.isoformat()
+                            dated_opening["created_at"] = first_ledger_date.isoformat()
+                            ledger_txns[index] = dated_opening
+                            break
         else:
-            rows_by_month[month]["payments"] += amount
+            ledger_txns = list(raw_distributor_txns)
+
+        for txn in sorted(ledger_txns, key=_distributor_fifo_sort_key):
+            month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
+            if not month:
+                continue
+            txns_by_month[month].append(txn)
+            _balance, bucket = _apply_distributor_transaction(0, txn)
+            amount = _safe_float(txn.get("amount"))
+            rows_by_month[month]
+            if bucket == "purchase":
+                if str(txn.get("type") or "").lower() != "opening_balance":
+                    rows_by_month[month]["purchases"] += amount
+            elif bucket == "adjustment":
+                rows_by_month[month]["adjustments"] += amount
+            else:
+                rows_by_month[month]["payments"] += amount
 
     if not rows_by_month:
+        logger.info(
+            "Distributor outstanding movement generated distributors_processed=%s movement_records=%s chart_dataset=%s",
+            len(distributor_ids),
+            0,
+            [],
+        )
         return []
 
-    running_balance_by_distributor = defaultdict(float, opening_balances)
-    txns_by_month = defaultdict(list)
-    for txn in dated_txns:
-        txns_by_month[_month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))].append(txn)
-
     movement = []
+    previous_closing = 0.0
     for month in sorted(rows_by_month):
-        for txn in txns_by_month.get(month, []):
+        for txn in sorted(txns_by_month.get(month, []), key=_distributor_fifo_sort_key):
             distributor_id = str(txn.get("distributor_id") or "")
             running_balance_by_distributor[distributor_id], _bucket = _apply_distributor_transaction(
                 running_balance_by_distributor[distributor_id],
                 txn,
             )
         row = rows_by_month[month]
+        closing_payable = _round_ledger_money(sum(running_balance_by_distributor.values()))
+        net_movement = _round_ledger_money(closing_payable - previous_closing)
         movement.append({
             "month": month,
             "purchases": _round_ledger_money(row["purchases"]),
             "payments": _round_ledger_money(row["payments"]),
             "adjustments": _round_ledger_money(row["adjustments"]),
-            "closing_distributor_payable": _round_ledger_money(sum(running_balance_by_distributor.values())),
+            "opening_distributor_payable": _round_ledger_money(previous_closing),
+            "closing_distributor_payable": closing_payable,
+            "outstanding_payable": closing_payable,
+            "net_movement": net_movement,
+            "outstanding_increase": _round_ledger_money(max(net_movement, 0.0)),
+            "outstanding_decrease": _round_ledger_money(abs(min(net_movement, 0.0))),
         })
+        previous_closing = closing_payable
+
+    logger.info(
+        "Distributor outstanding movement generated distributors_processed=%s movement_records=%s chart_dataset=%s",
+        len(distributor_ids),
+        len(movement),
+        movement,
+    )
     return movement
 
 
@@ -8474,8 +8523,8 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
         {
             "month": row["month"],
             "customer_receivables": 0.0,
-            "distributor_payables": _round_ledger_money(row["purchases"] - row["payments"] - row["adjustments"]),
-            "net_exposure": _round_ledger_money(row["purchases"] - row["payments"] - row["adjustments"]),
+            "distributor_payables": _round_ledger_money(row["closing_distributor_payable"]),
+            "net_exposure": _round_ledger_money(row["closing_distributor_payable"]),
         }
         for row in distributor_outstanding_movement
     ]

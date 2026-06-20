@@ -229,8 +229,8 @@ class CustomerOutstandingMovementTests(unittest.IsolatedAsyncioTestCase):
                     {"distributor_id":"d1","type":"purchase_return","amount":2,"created_at":"2026-06-02T00:00:00+00:00"},
                 ])),
                 [
-                    {"month":"2026-05", "purchases":20.13, "payments":0.0, "adjustments":0.0, "closing_distributor_payable":30.13},
-                    {"month":"2026-06", "purchases":0.0, "payments":3.0, "adjustments":2.0, "closing_distributor_payable":25.13},
+                    {"month":"2026-05", "purchases":20.13, "payments":0.0, "adjustments":0.0, "opening_distributor_payable":0.0, "closing_distributor_payable":30.13, "outstanding_payable":30.13, "net_movement":30.13, "outstanding_increase":30.13, "outstanding_decrease":0.0},
+                    {"month":"2026-06", "purchases":0.0, "payments":3.0, "adjustments":2.0, "opening_distributor_payable":30.13, "closing_distributor_payable":25.13, "outstanding_payable":25.13, "net_movement":-5.0, "outstanding_increase":0.0, "outstanding_decrease":5.0},
                 ],
             ),
             (
@@ -246,6 +246,33 @@ class CustomerOutstandingMovementTests(unittest.IsolatedAsyncioTestCase):
                 result = await outstanding_report(user={})
             self.assertEqual(result["distributor_outstanding_movement"], expected)
             self.assertNotIn("outstanding_movement", result)
+
+
+    async def test_outstanding_movement_returns_single_distributor_opening_balance(self):
+        db = SimpleNamespace(
+            customers=Collection([{"id":"c1","name":"C"}]),
+            distributors=Collection([{"id":"d1","name":"Only Distributor","opening_balance":42.5,"created_at":"2026-04-15T00:00:00+00:00"}]),
+            customer_transactions=Collection([
+                {"customer_id":"c1","type":"sale","amount":999,"created_at":"2026-04-01T00:00:00+00:00"},
+            ]),
+            distributor_transactions=Collection([]),
+        )
+        with patch("server.db", db):
+            result = await outstanding_report(user={})
+
+        self.assertEqual(result["distributor_outstanding_movement"], [{
+            "month":"2026-04",
+            "purchases":0.0,
+            "payments":0.0,
+            "adjustments":0.0,
+            "opening_distributor_payable":0.0,
+            "closing_distributor_payable":42.5,
+            "outstanding_payable":42.5,
+            "net_movement":42.5,
+            "outstanding_increase":42.5,
+            "outstanding_decrease":0.0,
+        }])
+        self.assertEqual(result["monthly_outstanding_trend"][0]["customer_receivables"], 0.0)
 
 
 class CustomerLedgerRouteMonthlySummaryTests(unittest.IsolatedAsyncioTestCase):
