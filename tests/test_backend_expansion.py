@@ -343,3 +343,37 @@ class SettingsSaveContractTest(unittest.IsolatedAsyncioTestCase):
             await update_settings({"$set": {"business_name": "Bad"}}, user={"role": "admin"})
 
         self.assertEqual(caught.exception.status_code, 422)
+
+    def test_settings_bson_diagnostics_identify_first_unencodable_field(self):
+        from server import _find_first_bson_encoding_failure
+
+        payload = {"$set": {"selected_theme": "default", "new_widget_config": object()}}
+
+        failure = _find_first_bson_encoding_failure(payload)
+
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure["field"], "payload.$set.new_widget_config")
+        self.assertEqual(failure["value_type"], "object")
+
+    async def test_settings_save_logs_payload_context_before_database_failure(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from pymongo.errors import PyMongoError
+        from server import update_settings
+
+        class FailingSettingsCollection:
+            async def update_one(self, query, update, upsert=False):
+                raise PyMongoError("simulated settings write failure")
+
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1", "shop_id": "shop-1"}
+        payload = {"selected_theme": "dark", "selected_font": "inter", "theme_settings": {"accent": "blue"}}
+
+        with patch("server.db", SimpleNamespace(settings=FailingSettingsCollection())):
+            with self.assertLogs("pharmacy", level="ERROR") as logs:
+                with self.assertRaises(HTTPException) as caught:
+                    await update_settings(payload, user=admin)
+
+        self.assertEqual(caught.exception.status_code, 503)
+        output = "\n".join(logs.output)
+        self.assertIn("Database error while saving settings: simulated settings write failure", output)
+        self.assertIn("Traceback", output)
