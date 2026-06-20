@@ -53,6 +53,15 @@ class _Collection:
 
 
 
+class _RecordingMotorCollection:
+    def __init__(self):
+        self.calls = []
+
+    async def update_one(self, query, update, *args, **kwargs):
+        self.calls.append((query, update, kwargs))
+        return _UpdateResult()
+
+
 class LowStockWorkflowTest(unittest.IsolatedAsyncioTestCase):
     async def test_update_status_persists_without_changing_stock(self):
         medicine = {"id": "med-1", "purchased_units": 10, "sold_units": 3, "low_stock_status": "low_stock"}
@@ -187,6 +196,47 @@ class LowStockWorkflowTest(unittest.IsolatedAsyncioTestCase):
         saved_hash = settings.records[0]["privacy_password_hash"]
         self.assertNotEqual(saved_hash, "test password")
         self.assertTrue(verify_password("test password", saved_hash))
+
+
+    async def test_privacy_password_tenant_aware_upsert_uses_neutral_selector(self):
+        from server import (
+            TenantAwareCollection,
+            _current_demo,
+            _current_tenant,
+            _request_active,
+            set_privacy_password,
+            verify_password,
+        )
+
+        raw_settings = _RecordingMotorCollection()
+        tenant_settings = TenantAwareCollection(raw_settings, "settings")
+        fake_db = SimpleNamespace(settings=tenant_settings)
+        admin = {"id": "admin-1", "email": "admin@example.com", "role": "admin", "tenant_id": "shop-1", "shop_id": "shop-1"}
+        active = _request_active.set(True)
+        tenant = _current_tenant.set("shop-1")
+        demo = _current_demo.set(False)
+        try:
+            with patch("server.db", fake_db):
+                response = await set_privacy_password(PrivacyPasswordUpdate(privacy_password="Private1234"), user=admin)
+        finally:
+            _current_demo.reset(demo)
+            _current_tenant.reset(tenant)
+            _request_active.reset(active)
+
+        self.assertEqual(response["ok"], True)
+        self.assertNotIn("privacy_password", response)
+        self.assertNotIn("privacy_password_hash", response)
+        query, update, kwargs = raw_settings.calls[0]
+        self.assertEqual(query, {"$and": [{"tenant_id": "shop-1"}, {"key": "privacy_password"}]})
+        self.assertNotIn("tenant_id", query["$and"][1])
+        self.assertEqual(kwargs, {"upsert": True})
+        self.assertNotIn("tenant_id", update["$set"])
+        self.assertNotIn("shop_id", update["$set"])
+        self.assertEqual(update["$setOnInsert"].get("tenant_id"), "shop-1")
+        self.assertEqual(update["$setOnInsert"].get("shop_id"), "shop-1")
+        self.assertEqual(update["$setOnInsert"]["key"], "privacy_password")
+        self.assertNotEqual(update["$set"]["privacy_password_hash"], "Private1234")
+        self.assertTrue(verify_password("Private1234", update["$set"]["privacy_password_hash"]))
 
     async def test_non_admin_cannot_unlock_or_edit_unlocked_threshold(self):
         from server import LowStockThresholdUpdate, LowStockThresholdUnlock, PrivacyPasswordUpdate, set_privacy_password, update_low_stock_threshold, unlock_low_stock_threshold
