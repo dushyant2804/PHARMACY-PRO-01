@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "test_pharmacy")
-from server import expiry_report, outstanding_report, purchase_return_report, sales_report, stock_valuation
+from server import category_profitability, dead_stock_report, expiry_report, medicine_profitability, outstanding_report, purchase_return_report, reorder_report, sales_report, stock_valuation
 
 class Cursor:
     def __init__(self, rows): self.rows = rows
@@ -25,6 +25,9 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", db): result = await sales_report(user={})
         self.assertEqual(result["total_sales"], 20.13); self.assertEqual(result["total_gst"], 1.01)
         self.assertEqual(result["estimated_profit"], 16.01); self.assertEqual(result["monthly_sales_trend"][0]["sales"], 20.13)
+        self.assertEqual(result["average_bill_value"], 20.13)
+        self.assertEqual(result["monthly_profit_trend"][0]["profit"], 16.01)
+        self.assertEqual(result["top_profit_medicines"][0]["medicine"], "Unknown")
 
     async def test_expiry_value_at_risk(self):
         medicines = Collection([{"id":"expired","purchased_units":3,"sold_units":1,"purchase_price":10.125,"mrp":20,"expiry_date":iso(2)}, {"id":"near","purchased_units":1,"sold_units":0,"purchase_price":5.555,"mrp":10,"expiry_date":iso(-20)}])
@@ -54,6 +57,8 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["expiring_30_value_at_risk"], 14)
         self.assertEqual(result["expiring_90_value_at_risk"], 12)
         self.assertEqual(result["expiry_value_at_risk"], 46)
+        self.assertEqual(result["total_inventory_cost_value"], 51)
+        self.assertEqual(result["top_expiry_risk_medicines"][0]["risk_value"], 20)
 
     async def test_stock_and_expiry_api_expose_exact_non_overlapping_risk_bucket_values(self):
         medicines = Collection([
@@ -81,9 +86,25 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", db): result = await outstanding_report(user={})
         self.assertEqual(result["customer_receivables"], 75.0); self.assertEqual(result["customer_aging"]["90+"], 75.0)
         self.assertEqual(result["distributor_payables"], 10.0); self.assertEqual(result["distributor_aging"]["0-30"], 10.0)
+        self.assertEqual(result["net_exposure"], -65.0)
+        self.assertEqual(result["customer_recovery_ranking"][0]["outstanding"], 75.0)
 
     async def test_purchase_return_summary_uses_hardened_settlement(self):
         db = SimpleNamespace(purchase_returns=Collection([{"return_quantity":2,"purchase_rate":10.125,"ledger_adjusted":True}, {"return_quantity":1,"purchase_rate":5.555}]))
         with patch("server.db", db): result = await purchase_return_report(user={})
         self.assertEqual(result["returned_quantity"], 3); self.assertEqual(result["total_return_value"], 25.81)
         self.assertEqual(result["settled_return_value"], 20.25); self.assertEqual(result["unsettled_return_value"], 5.56)
+        self.assertEqual(result["medicine_wise_return_analytics"][0]["value"], 25.81)
+
+    async def test_profitability_dead_stock_and_reorder_use_invoice_history(self):
+        invoices = Collection([{"created_at":"2026-01-01T00:00:00+00:00","items":[{"medicine_id":"m1","name":"A","quantity":10,"line_total":100,"purchase_cost":60}]}])
+        medicines = Collection([{"id":"m1","name":"A","purchase_price":6,"purchased_units":30,"sold_units":10,"category":"OTC"}, {"id":"m2","name":"B","purchase_price":5,"purchased_units":4}])
+        with patch("server.db", SimpleNamespace(invoices=invoices, medicines=medicines)):
+            profit = await medicine_profitability(user={})
+            category = await category_profitability(user={})
+            dead = await dead_stock_report(days=90, user={})
+            reorder = await reorder_report(user={})
+        self.assertEqual(profit["items"][0]["profit"], 40)
+        self.assertEqual(category["items"][0]["category"], "OTC")
+        self.assertTrue(any(item["medicine"] == "B" for item in dead["items"]))
+        self.assertEqual(reorder["items"][0]["medicine"], "A")
