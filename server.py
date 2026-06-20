@@ -5212,9 +5212,10 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError, OverflowError):
         return default
+    return number if math.isfinite(number) else default
 
 
 def _round_ledger_money(value: float) -> float:
@@ -8157,7 +8158,7 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
         balance = sum(aging["buckets"].values())
         if balance > 0:
             last_payment = max((_analytics_date(t.get("transaction_date") or t.get("date") or t.get("created_at")) for t in customer_grouped[customer.get("id")] if str(t.get("type")).lower() == "payment"), default=None)
-            cust_out.append({"id": customer["id"], "name": customer["name"], "customer": customer["name"], "phone": customer.get("phone", ""), "balance": _round_ledger_money(balance), "outstanding": _round_ledger_money(balance), "age": aging["oldest_due_days"], "last_payment": last_payment.isoformat() if last_payment else None, **aging})
+            cust_out.append({"id": customer["id"], "name": customer["name"], "customer": customer["name"], "phone": customer.get("phone", ""), "balance": _round_ledger_money(balance), "outstanding": _round_ledger_money(balance), "age": aging["oldest_due_days"], "aging_days": aging["oldest_due_days"], "last_payment": last_payment.isoformat() if last_payment else None, **aging})
             for key, value in aging["buckets"].items(): customer_aging[key] += value
     for distributor in distributors:
         txns = distributor_grouped[distributor.get("id")]
@@ -8167,7 +8168,7 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
             # Legacy opening balances may not have a transaction; retain them in the current bucket.
             gap = max(0.0, balance - sum(aging["buckets"].values())); aging["buckets"]["0-30"] = _round_ledger_money(aging["buckets"]["0-30"] + gap)
             last_purchase = max((_analytics_date(t.get("transaction_date") or t.get("date") or t.get("created_at")) for t in txns if str(t.get("type")).lower() in {"purchase", "opening_balance"}), default=None)
-            dist_out.append({"id": distributor["id"], "name": distributor["name"], "distributor": distributor["name"], "balance": _round_ledger_money(balance), "outstanding": _round_ledger_money(balance), "age": aging["oldest_due_days"], "last_purchase": last_purchase.isoformat() if last_purchase else None, **aging})
+            dist_out.append({"id": distributor["id"], "name": distributor["name"], "distributor": distributor["name"], "balance": _round_ledger_money(balance), "outstanding": _round_ledger_money(balance), "age": aging["oldest_due_days"], "aging_days": aging["oldest_due_days"], "last_purchase": last_purchase.isoformat() if last_purchase else None, **aging})
             for key, value in aging["buckets"].items(): distributor_aging[key] += value
     customer_total = sum(row["balance"] for row in cust_out); distributor_total = sum(row["balance"] for row in dist_out)
     monthly = defaultdict(lambda: {"customer_receivables": 0.0, "distributor_payables": 0.0})
@@ -8185,9 +8186,11 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
             "net_exposure": _round_ledger_money(distributor_total - customer_total),
             "customer_recovery_ranking": sorted(cust_out, key=lambda x: x["outstanding"], reverse=True),
             "distributor_payable_ranking": sorted(dist_out, key=lambda x: x["outstanding"], reverse=True),
+            "monthly_outstanding_trend": trends,
             "monthly_outstanding_trends": trends,
             "customer_aging": {key: _round_ledger_money(value) for key, value in customer_aging.items()}, "distributor_aging": {key: _round_ledger_money(value) for key, value in distributor_aging.items()},
-            "aging_buckets": {"customers": customer_aging, "distributors": distributor_aging},
+            "aging_buckets": {"customers": {key: _round_ledger_money(value) for key, value in customer_aging.items()}, "distributors": {key: _round_ledger_money(value) for key, value in distributor_aging.items()}},
+            "schema_notes": {"aging_days": "Numeric age in days for the oldest unpaid charge; legacy age is the same days value."},
             "outstanding_movement": {"customer_transactions": customer_txns, "distributor_transactions": distributor_txns}}
 
 
@@ -8371,13 +8374,56 @@ async def medicine_profitability(sort_by: Literal["revenue", "cost", "profit", "
 @api_router.get("/reports/category-profitability")
 async def category_profitability(user: dict = Depends(get_current_user)):
     rows, _ = await _invoice_item_profit_rows()
-    grouped = {key: {"category": key, "revenue": 0.0, "cost": 0.0} for key in ("OTC", "H", "H1", "Other")}
+    grouped = defaultdict(lambda: {"category": "Other", "revenue": 0.0, "cost": 0.0})
     for row in rows:
         category = str(row.get("category") or "Other").upper()
-        bucket = category if category in {"OTC", "H", "H1"} else "Other"
+        bucket = category if category in STANDARD_MEDICINE_CATEGORIES else "Other"
+        grouped[bucket]["category"] = bucket
         grouped[bucket]["revenue"] += row["revenue"]; grouped[bucket]["cost"] += row["cost"]
-    return {"items": [{"category": k, "revenue": _round_ledger_money(v["revenue"]), "profit": _round_ledger_money(v["revenue"] - v["cost"]),
-                       "margin": _round_ledger_money(((v["revenue"] - v["cost"]) / v["revenue"] * 100) if v["revenue"] else 0)} for k, v in grouped.items()]}
+    items = []
+    for values in grouped.values():
+        profit = values["revenue"] - values["cost"]
+        items.append({"category": values["category"], "revenue": _round_ledger_money(values["revenue"]), "profit": _round_ledger_money(profit),
+                      "margin": _round_ledger_money((profit / values["revenue"] * 100) if values["revenue"] else 0)})
+    return {"items": sorted(items, key=lambda x: x["profit"], reverse=True)}
+
+
+async def _medicine_movement_items() -> list[dict]:
+    rows, by_id = await _invoice_item_profit_rows()
+    grouped = defaultdict(lambda: {"medicine": "Unknown", "units_sold": 0.0, "revenue": 0.0, "last_sale_date": None})
+    for row in rows:
+        key = row.get("medicine_id") or row["medicine"]
+        grouped[key]["medicine"] = row["medicine"]
+        grouped[key]["units_sold"] += row["quantity"]
+        grouped[key]["revenue"] += row["revenue"]
+        if row["sold_on"]:
+            grouped[key]["last_sale_date"] = max(grouped[key]["last_sale_date"] or date.min, row["sold_on"])
+    items = []
+    for key, values in grouped.items():
+        medicine = by_id.get(key, {})
+        stock = _available_stock(medicine) if medicine else 0.0
+        items.append({
+            "medicine": values["medicine"],
+            "units_sold": round_qty(values["units_sold"]),
+            "revenue": _round_ledger_money(values["revenue"]),
+            "current_stock": round_qty(stock),
+            "last_sale_date": values["last_sale_date"].isoformat() if values["last_sale_date"] else None,
+        })
+    return items
+
+
+@api_router.get("/reports/fast-moving-medicines")
+async def fast_moving_medicines(limit: int = 20, user: dict = Depends(get_current_user)):
+    limit = max(1, min(limit, 100))
+    items = await _medicine_movement_items()
+    return {"items": sorted(items, key=lambda x: (x["units_sold"], x["revenue"]), reverse=True)[:limit]}
+
+
+@api_router.get("/reports/slow-moving-medicines")
+async def slow_moving_medicines(limit: int = 20, user: dict = Depends(get_current_user)):
+    limit = max(1, min(limit, 100))
+    items = [item for item in await _medicine_movement_items() if item["current_stock"] > 0]
+    return {"items": sorted(items, key=lambda x: (x["units_sold"], -x["current_stock"], x["medicine"]))[:limit]}
 
 
 @api_router.get("/reports/dead-stock")
@@ -8651,9 +8697,10 @@ def _to_decimal(value) -> Decimal:
     if value in (None, ""):
         return Decimal("0")
     try:
-        return Decimal(str(value))
+        decimal_value = Decimal(str(value))
     except Exception:
         return Decimal("0")
+    return decimal_value if decimal_value.is_finite() else Decimal("0")
 
 
 def _round_money(value: Decimal) -> Decimal:

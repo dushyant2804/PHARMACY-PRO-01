@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "test_pharmacy")
-from server import category_profitability, dead_stock_report, expiry_report, medicine_profitability, outstanding_report, purchase_return_report, reorder_report, sales_report, stock_valuation
+from server import category_profitability, dead_stock_report, expiry_report, fast_moving_medicines, medicine_profitability, outstanding_report, purchase_return_report, reorder_report, sales_report, slow_moving_medicines, stock_valuation
 
 class Cursor:
     def __init__(self, rows): self.rows = rows
@@ -16,6 +16,18 @@ class Collection:
         rows = self.rows
         if query and "id" in query and isinstance(query["id"], dict): rows = [r for r in rows if r.get("id") in query["id"].get("$in", [])]
         return Cursor(rows)
+
+
+def assert_no_invalid_numbers(testcase, value):
+    if isinstance(value, float):
+        testcase.assertFalse(value != value, "NaN returned")
+        testcase.assertNotIn(value, (float("inf"), float("-inf")))
+    elif isinstance(value, dict):
+        for child in value.values():
+            assert_no_invalid_numbers(testcase, child)
+    elif isinstance(value, list):
+        for child in value:
+            assert_no_invalid_numbers(testcase, child)
 
 def iso(days): return (datetime.now(timezone.utc)-timedelta(days=days)).isoformat()
 
@@ -108,3 +120,80 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(category["items"][0]["category"], "OTC")
         self.assertTrue(any(item["medicine"] == "B" for item in dead["items"]))
         self.assertEqual(reorder["items"][0]["medicine"], "A")
+
+
+    async def test_reports_no_data_return_empty_arrays_and_zero_summaries(self):
+        empty = Collection([])
+        db = SimpleNamespace(
+            invoices=empty, medicines=empty, customers=empty, distributors=empty,
+            customer_transactions=empty, distributor_transactions=empty, purchase_returns=empty,
+        )
+        with patch("server.db", db):
+            sales = await sales_report(user={})
+            expiry = await expiry_report(user={})
+            outstanding = await outstanding_report(user={})
+            medicine_profit = await medicine_profitability(user={})
+            category_profit = await category_profitability(user={})
+            fast = await fast_moving_medicines(user={})
+            slow = await slow_moving_medicines(user={})
+            dead = await dead_stock_report(user={})
+            reorder = await reorder_report(user={})
+            returns = await purchase_return_report(user={})
+
+        self.assertEqual(sales["total_sales"], 0)
+        self.assertEqual(sales["monthly_sales_trend"], [])
+        self.assertEqual(sales["monthly_profit_trend"], [])
+        self.assertEqual(sales["payment_mode_distribution"], [])
+        self.assertEqual(sales["top_revenue_medicines"], [])
+        self.assertEqual(sales["top_profit_medicines"], [])
+        self.assertEqual(expiry["expiry_value_at_risk"], 0)
+        self.assertEqual(expiry["top_expiry_risk_medicines"], [])
+        self.assertEqual(outstanding["customer_receivables"], 0)
+        self.assertEqual(outstanding["monthly_outstanding_trend"], [])
+        self.assertEqual(medicine_profit["items"], [])
+        self.assertEqual(category_profit["items"], [])
+        self.assertEqual(fast["items"], [])
+        self.assertEqual(slow["items"], [])
+        self.assertEqual(dead["items"], [])
+        self.assertEqual(reorder["items"], [])
+        self.assertEqual(returns["medicine_wise_return_analytics"], [])
+        for payload in (sales, expiry, outstanding, medicine_profit, category_profit, fast, slow, dead, reorder, returns):
+            assert_no_invalid_numbers(self, payload)
+
+    async def test_chart_ready_arrays_round_money_and_numeric_aging_days(self):
+        invoices = Collection([{
+            "created_at": "2026-06-01T00:00:00+00:00", "total": "NaN", "gst_total": float("inf"), "payment_mode": "cash",
+            "items": [{"medicine_id":"m1","name":"A","quantity":2,"line_total":20.129,"purchase_cost":7.115,"category":"OTC"}],
+        }])
+        medicines = Collection([{
+            "id":"m1", "name":"A", "purchase_price":3.557, "purchased_units":10, "sold_units":2,
+            "category":"OTC", "expiry_date": iso(-15),
+        }])
+        db = SimpleNamespace(
+            invoices=invoices, medicines=medicines, customers=Collection([{"id":"c1","name":"C"}]), distributors=Collection([]),
+            customer_transactions=Collection([{"customer_id":"c1","type":"sale","amount":10.129,"created_at":"not-a-date"}]),
+            distributor_transactions=Collection([]),
+        )
+        with patch("server.db", db):
+            sales = await sales_report(user={})
+            expiry = await expiry_report(user={})
+            outstanding = await outstanding_report(user={})
+            med_profit = await medicine_profitability(user={})
+            cat_profit = await category_profitability(user={})
+            fast = await fast_moving_medicines(user={})
+            slow = await slow_moving_medicines(user={})
+
+        self.assertIsInstance(sales["monthly_sales_trend"], list)
+        self.assertEqual(sales["total_sales"], 0)
+        self.assertEqual(sales["estimated_profit"], 13.01)
+        self.assertEqual(med_profit["items"][0]["revenue"], 20.13)
+        self.assertEqual(cat_profit["items"], [{"category":"OTC", "revenue":20.13, "profit":13.01, "margin":64.65}])
+        self.assertGreater(expiry["expiry_value_at_risk"], 0)
+        self.assertGreater(len(expiry["top_expiry_risk_medicines"]), 0)
+        self.assertEqual(expiry["top_expiry_risk_medicines"][0]["risk_value"], expiry["expiring_30_value_at_risk"])
+        self.assertIsInstance(outstanding["customers"][0]["aging_days"], int)
+        self.assertGreaterEqual(outstanding["customers"][0]["aging_days"], 0)
+        self.assertEqual(fast["items"][0]["units_sold"], 2)
+        self.assertEqual(slow["items"][0]["current_stock"], 8)
+        for payload in (sales, expiry, outstanding, med_profit, cat_profit, fast, slow):
+            assert_no_invalid_numbers(self, payload)
