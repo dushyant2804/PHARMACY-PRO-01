@@ -33,11 +33,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
+from starlette.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator, model_validator
-from fastapi import UploadFile, File
+from starlette.datastructures import UploadFile
 
 from version_config import VERSION_METADATA, get_version_metadata
 
@@ -46,6 +47,9 @@ from version_config import VERSION_METADATA, get_version_metadata
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 raw_db = client[os.environ['DB_NAME']]
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", ROOT_DIR / "uploads")).resolve()
+BRANDING_UPLOAD_DIR = UPLOAD_DIR / "branding"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 REAL_TENANT_ID = os.environ.get("REAL_TENANT_ID", "real_shop")
 DEMO_TENANT_ID = "demo_shop"
@@ -197,6 +201,7 @@ class TenantAwareDatabase:
 db = TenantAwareDatabase(raw_db)
 
 app = FastAPI(title="Pharmacy Management API")
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 @app.get("/")
 def home():
@@ -1870,6 +1875,33 @@ async def version(
 ):
     response.headers["Cache-Control"] = "no-store"
     return get_version_metadata(current_version=current_version, current_build=current_build)
+
+
+@api_router.get("/updates/check")
+@api_router.get("/update-check")
+async def check_updates(
+    response: Response,
+    current_version: Optional[str] = Query(default=None),
+    current_build: Optional[str] = Query(default=None),
+):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        metadata = get_version_metadata(current_version=current_version, current_build=current_build)
+        return {**metadata, "status": "ok"}
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.exception("Update metadata check failed: %s", reason)
+        fallback = dict(VERSION_METADATA)
+        fallback.update(
+            {
+                "current_version": current_version or VERSION_METADATA["current_version"],
+                "current_build": current_build or VERSION_METADATA["current_build"],
+                "update_available": False,
+                "status": "metadata_unavailable",
+                "reason": reason,
+            }
+        )
+        return fallback
 
 
 @api_router.post("/auth/signup/request-otp")
@@ -9500,6 +9532,8 @@ SETTINGS_DEFAULTS = {
     "dl_number_2": "",
     # May contain a storage path/URL plus optional name, content_type, and size.
     "pharmacy_logo": None,
+    "selected_theme": "default",
+    "selected_font": "system",
     # Reserved, backward-compatible structures for incremental settings features.
     "activity_logs": [],
     "role_permissions": {},
@@ -9507,24 +9541,131 @@ SETTINGS_DEFAULTS = {
     "backup_metadata": {},
 }
 
+WELCOME_SCREEN_FIELDS = {
+    "welcome_screen",
+    "welcome_screen_enabled",
+    "welcome_title",
+    "welcome_subtitle",
+    "welcome_background",
+    "welcome_logo",
+    "welcome_message",
+    "welcome_settings",
+}
+ALLOWED_LOGO_CONTENT_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml"}
+
 
 def normalize_settings(settings: Optional[dict] = None) -> dict:
     """Add new settings defaults without changing or removing legacy fields."""
     return {**SETTINGS_DEFAULTS, **(settings or {})}
 
 
+def settings_response(settings: Optional[dict] = None, *, include_legacy_welcome: bool = False) -> dict:
+    """Return settings for active UI while preserving opt-in legacy welcome fields."""
+    normalized = normalize_settings(settings)
+    logo = normalized.get("pharmacy_logo")
+    if isinstance(logo, dict):
+        logo_path = logo.get("url") or logo.get("path")
+        normalized["pharmacy_logo_url"] = logo_path
+        normalized["logo_url"] = logo_path
+    elif isinstance(logo, str):
+        normalized["pharmacy_logo_url"] = logo
+        normalized["logo_url"] = logo
+    else:
+        normalized["pharmacy_logo_url"] = None
+        normalized["logo_url"] = None
+    if not include_legacy_welcome:
+        for field in WELCOME_SCREEN_FIELDS:
+            normalized.pop(field, None)
+    return normalized
+
+
+def _tenant_upload_segment(user: dict) -> str:
+    value = user.get("tenant_id") or user.get("shop_id") or "default"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))[:80] or "default"
+
+
+def _logo_extension(upload: UploadFile) -> str:
+    suffix = Path(upload.filename or "").suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".svg"}:
+        return suffix
+    return {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+        "image/svg+xml": ".svg",
+    }.get(upload.content_type or "", ".bin")
+
+
 @api_router.get("/settings")
-async def get_settings(user: dict = Depends(get_current_user)):
+async def get_settings(
+    include_legacy_welcome: bool = Query(default=False),
+    user: dict = Depends(get_current_user),
+):
     s = await db.settings.find_one({"key": "main"}, {"_id": 0})
-    return normalize_settings(s)
+    return settings_response(s, include_legacy_welcome=include_legacy_welcome)
 
 
 @api_router.put("/settings")
 async def update_settings(payload: dict, user: dict = Depends(require_role("admin"))):
     payload["key"] = "main"
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.settings.update_one({"key": "main"}, {"$set": payload}, upsert=True)
     s = await db.settings.find_one({"key": "main"}, {"_id": 0})
-    return normalize_settings(s)
+    return settings_response(s)
+
+
+@api_router.post("/settings/logo")
+@api_router.post("/settings/pharmacy-logo")
+async def upload_pharmacy_logo(
+    request: Request,
+    user: dict = Depends(require_role("admin")),
+):
+    try:
+        form = await request.form()
+    except Exception as exc:
+        logger.exception("Failed to parse pharmacy logo upload form: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid multipart logo upload") from exc
+    logo = form.get("logo") or form.get("file") or form.get("pharmacy_logo")
+    if not isinstance(logo, UploadFile):
+        raise HTTPException(status_code=400, detail="Upload field must be named logo, file, or pharmacy_logo")
+    if logo.content_type not in ALLOWED_LOGO_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Logo must be a PNG, JPG, WEBP, or SVG image")
+
+    tenant_dir = BRANDING_UPLOAD_DIR / _tenant_upload_segment(user)
+    tenant_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{uuid.uuid4()}{_logo_extension(logo)}"
+    destination = tenant_dir / filename
+
+    size = 0
+    with destination.open("wb") as output:
+        while True:
+            chunk = await logo.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 5 * 1024 * 1024:
+                destination.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="Logo file must be 5 MB or smaller")
+            output.write(chunk)
+
+    public_path = f"/uploads/branding/{_tenant_upload_segment(user)}/{filename}"
+    logo_doc = {
+        "path": public_path,
+        "url": public_path,
+        "filename": logo.filename or filename,
+        "content_type": logo.content_type,
+        "size": size,
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "uploaded_by": user.get("id") or user.get("email"),
+    }
+    await db.settings.update_one(
+        {"key": "main"},
+        {"$set": {"key": "main", "pharmacy_logo": logo_doc, "updated_at": logo_doc["uploaded_at"]}},
+        upsert=True,
+    )
+    s = await db.settings.find_one({"key": "main"}, {"_id": 0})
+    return settings_response(s)
 
 
 # ---------------- Daily Sales Book (business-summary register) ----------------
