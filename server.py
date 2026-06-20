@@ -37,6 +37,7 @@ from starlette.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
+from bson import BSON
 from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator, model_validator
 from starlette.datastructures import UploadFile
 
@@ -9610,6 +9611,51 @@ def _sanitize_settings_payload(payload: dict) -> dict:
     return sanitized
 
 
+def _settings_payload_field_snapshot(payload: dict) -> dict:
+    return {
+        "selected_theme": payload.get("selected_theme"),
+        "selected_font": payload.get("selected_font"),
+        "theme_settings": payload.get("theme_settings"),
+        "pharmacy_logo": payload.get("pharmacy_logo"),
+        "logo_fields": {key: payload.get(key) for key in ("pharmacy_logo", "pharmacy_logo_url", "logo_url", "welcome_logo") if key in payload},
+        "welcome_screen_fields": {key: payload.get(key) for key in WELCOME_SCREEN_FIELDS if key in payload},
+        "new_settings_fields": sorted(key for key in payload if key not in SETTINGS_DEFAULTS and key not in WELCOME_SCREEN_FIELDS and key not in {"updated_at"}),
+    }
+
+
+def _find_first_bson_encoding_failure(value, path: str = "payload") -> Optional[dict]:
+    try:
+        BSON.encode({"value": value})
+        return None
+    except Exception as exc:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                child = _find_first_bson_encoding_failure(nested, f"{path}.{key}")
+                if child:
+                    return child
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                child = _find_first_bson_encoding_failure(nested, f"{path}[{index}]")
+                if child:
+                    return child
+        return {"field": path, "value_type": type(value).__name__, "exception": repr(exc)}
+
+
+def _settings_save_log_context(payload: dict, user: dict, update_filter: dict, update_operation: dict) -> dict:
+    return {
+        "incoming_payload": payload,
+        "settings_fields": _settings_payload_field_snapshot(payload),
+        "selected_theme": payload.get("selected_theme"),
+        "selected_font": payload.get("selected_font"),
+        "pharmacy_logo": payload.get("pharmacy_logo"),
+        "user_id": user.get("id") or user.get("user_id"),
+        "tenant_id": user.get("tenant_id"),
+        "shop_id": user.get("shop_id"),
+        "mongo_filter": update_filter,
+        "mongo_update": update_operation,
+        "bson_failure_field": _find_first_bson_encoding_failure(update_operation),
+    }
+
 def settings_response(settings: Optional[dict] = None, *, include_legacy_welcome: bool = False) -> dict:
     """Return settings for active UI while preserving opt-in legacy welcome fields."""
     normalized = normalize_settings(settings)
@@ -9673,14 +9719,29 @@ async def update_settings(payload: dict, user: dict = Depends(require_role("admi
     if business_fields.intersection(payload):
         logger.info("Saving settings business profile fields", extra={"tenant_id": user.get("tenant_id"), "fields": sorted(business_fields.intersection(payload))})
 
+    update_filter = {"key": "main"}
+    update_operation = {"$set": payload}
+    log_context = _settings_save_log_context(payload, user, update_filter, update_operation)
+    logger.info("Saving settings payload: %s", log_context, extra=log_context)
+
     try:
-        await db.settings.update_one({"key": "main"}, {"$set": payload}, upsert=True)
-        s = await db.settings.find_one({"key": "main"}, {"_id": 0})
+        await db.settings.update_one(update_filter, update_operation, upsert=True)
+        s = await db.settings.find_one(update_filter, {"_id": 0})
     except PyMongoError as exc:
-        logger.exception("Database error while saving settings")
+        logger.exception(
+            "Database error while saving settings: %s | context=%s",
+            exc,
+            log_context,
+            extra={**log_context, "exception_type": type(exc).__name__, "exception_message": str(exc)},
+        )
         raise HTTPException(status_code=503, detail="Unable to save settings right now") from exc
     except TypeError as exc:
-        logger.exception("Invalid settings payload while saving settings")
+        logger.exception(
+            "Invalid settings payload while saving settings: %s | context=%s",
+            exc,
+            log_context,
+            extra={**log_context, "exception_type": type(exc).__name__, "exception_message": str(exc)},
+        )
         raise HTTPException(status_code=422, detail="Invalid settings payload") from exc
     return settings_response(s)
 
