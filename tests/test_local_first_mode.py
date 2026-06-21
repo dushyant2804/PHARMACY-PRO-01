@@ -105,6 +105,7 @@ asyncio.run(main())
         "PHARMACYOS_MODE": "LOCAL_MODE",
         "DB_NAME": "unused_local_test",
         "LOCAL_DB_PATH": str(db_path),
+        "SOURCE_DB_PATH": str(tmp_path / "source.sqlite3"),
         "BACKUP_DIR": str(backup_dir),
         "UPLOAD_DIR": str(upload_dir),
         "JWT_SECRET": "test-secret",
@@ -172,3 +173,103 @@ def test_sqlite_adapter_query_and_update_patterns(tmp_path):
         assert counter["seq"] == 11
 
     asyncio.run(exercise())
+
+
+def test_local_mode_first_login_cloud_import_preserves_auth_and_requires_overwrite(tmp_path):
+    db_path = tmp_path / "local.sqlite3"
+    backup_dir = tmp_path / "backups"
+    script = r'''
+import asyncio
+import os
+from fastapi import HTTPException
+from starlette.responses import Response
+
+import server
+from local_database import LocalSQLiteDatabase
+
+PASSWORD = "StrongPass123"
+
+class FakeAdmin:
+    async def command(self, name):
+        return {"ok": 1}
+
+class FakeClient:
+    def __init__(self, *args, **kwargs):
+        self.admin = FakeAdmin()
+        self.source = LocalSQLiteDatabase(os.environ["SOURCE_DB_PATH"])
+    def __getitem__(self, name):
+        return self.source
+    def close(self):
+        pass
+
+async def main():
+    fake_client = FakeClient()
+    password_hash = server.hash_password(PASSWORD)
+    await fake_client.source.users.insert_one({
+        "id": "cloud-admin", "email": "owner@example.com", "name": "Cloud Admin",
+        "role": "admin", "tenant_id": "real_shop", "shop_id": "real_shop",
+        "password_hash": password_hash, "active": True, "is_demo": False,
+    })
+    await fake_client.source.roles.insert_one({"id": "role-admin", "name": "admin"})
+    await fake_client.source.settings.insert_one({"id": "settings", "key": "main", "tenant_id": "real_shop"})
+    await fake_client.source.medicines.insert_one({"id": "med-1", "name": "CloudMed", "tenant_id": "real_shop"})
+    await fake_client.source.customers.insert_one({"id": "cust-1", "name": "Cloud Customer", "tenant_id": "real_shop"})
+    await fake_client.source.distributors.insert_one({"id": "dist-1", "name": "Cloud Distributor", "tenant_id": "real_shop"})
+    await fake_client.source.invoices.insert_one({"id": "inv-1", "tenant_id": "real_shop"})
+    await fake_client.source.purchase_orders.insert_one({"id": "po-1", "tenant_id": "real_shop"})
+    await fake_client.source.customer_transactions.insert_one({"id": "ctxn-1", "tenant_id": "real_shop"})
+    await fake_client.source.distributor_transactions.insert_one({"id": "dtxn-1", "tenant_id": "real_shop"})
+    await fake_client.source.purchase_returns.insert_one({"id": "ret-1", "tenant_id": "real_shop"})
+    await fake_client.source.stock_adjustments.insert_one({"id": "stock-1", "tenant_id": "real_shop"})
+    await fake_client.source.daily_sales.insert_one({"id": "sale-1", "tenant_id": "real_shop"})
+    await fake_client.source.daily_summary.insert_one({"id": "report-1", "tenant_id": "real_shop"})
+
+    server.AsyncIOMotorClient = lambda *args, **kwargs: fake_client
+    dry = await server.local_mode_import_dry_run()
+    assert dry["dry_run"] is True
+    assert dry["cloud_records_found"]["users"] == 1
+    assert dry["local_records_before_import"]["users"] == 0
+    assert dry["local_records_after_import"] is None
+
+    imported = await server.local_mode_import_confirm(overwrite_local=False)
+    assert imported["dry_run"] is False
+    assert imported["imported"]["users"] == 1
+    assert imported["local_records_after_import"]["users"] == 1
+
+    stored = await server.raw_db.users.find_one({"email": "owner@example.com"})
+    assert stored["password_hash"] == password_hash
+    login = await server.login(server.UserLogin(email="owner@example.com", password=PASSWORD), Response())
+    assert login["id"] == "cloud-admin"
+
+    try:
+        await server.local_mode_import_confirm(overwrite_local=False)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("expected overwrite confirmation guard")
+
+    overwritten = await server.local_mode_import_confirm(overwrite_local=True)
+    assert overwritten["local_records_before_import"]["users"] == 1
+    assert overwritten["local_records_after_import"]["users"] == 1
+
+asyncio.run(main())
+'''
+    env = os.environ.copy()
+    env.update({
+        "PHARMACYOS_MODE": "LOCAL_MODE",
+        "MONGO_URL": "mongodb://atlas-source.example/pharmacy",
+        "DB_NAME": "cloud_source",
+        "LOCAL_DB_PATH": str(db_path),
+        "SOURCE_DB_PATH": str(tmp_path / "source.sqlite3"),
+        "BACKUP_DIR": str(backup_dir),
+        "JWT_SECRET": "test-secret",
+    })
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

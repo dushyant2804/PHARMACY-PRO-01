@@ -72,6 +72,19 @@ BACKUP_COLLECTIONS = [
     "stock_adjustments", "daily_closings", "daily_sales", "expenses",
     "regular_patients", "settings",
 ]
+LOCAL_FIRST_IMPORT_COLLECTIONS = [
+    # Auth, roles, tenant bootstrap data. Password hashes are copied verbatim.
+    "users", "roles", "pending_signups", "password_reset_requests",
+    # Application settings and counters.
+    "settings", "counters",
+    # Inventory, stock, and day-to-day business data.
+    "medicines", "stock_adjustments", "distributors", "customers",
+    "purchase_orders", "purchase_returns", "invoices",
+    "customer_transactions", "distributor_transactions",
+    # Reports and supporting datasets.
+    "daily_closings", "daily_sales", "daily_summary", "expenses",
+    "regular_patients", "doctor_history", "historical_sales",
+]
 
 if LOCAL_MODE:
     mongo_url = os.environ.get("MONGO_URL", "")
@@ -9358,6 +9371,87 @@ async def _verify_import_counts(payload: dict) -> dict:
     return {name: {"source": len(source.get(name, [])), "target": await db[name].count_documents({})} for name in names}
 
 
+
+def _json_safe_mongo_document(document: dict) -> dict:
+    return json.loads(json.dumps(document, default=str))
+
+
+async def _local_collection_counts(collections: Optional[List[str]] = None) -> dict:
+    names = collections or LOCAL_FIRST_IMPORT_COLLECTIONS
+    return {name: await raw_db[name].count_documents({}) for name in names}
+
+
+async def _cloud_to_local_source_counts(cloud_database, collections: Optional[List[str]] = None) -> dict:
+    names = collections or LOCAL_FIRST_IMPORT_COLLECTIONS
+    return {name: await cloud_database[name].count_documents({}) for name in names}
+
+
+def _require_local_cloud_import_config() -> Tuple[str, str]:
+    if not LOCAL_MODE:
+        raise HTTPException(status_code=400, detail="Cloud-to-local import is only available in LOCAL_MODE")
+    if not mongo_url:
+        raise HTTPException(status_code=400, detail="MONGO_URL must point to the source Atlas database before importing Local Mode data")
+    db_name = os.environ.get("DB_NAME")
+    if not db_name:
+        raise HTTPException(status_code=400, detail="DB_NAME must name the source Atlas database before importing Local Mode data")
+    return mongo_url, db_name
+
+
+async def _cloud_to_local_import(dry_run: bool, confirm: bool, overwrite_local: bool) -> dict:
+    source_url, source_db_name = _require_local_cloud_import_config()
+    started_at = datetime.now(timezone.utc).isoformat()
+    source_client = AsyncIOMotorClient(source_url, serverSelectionTimeoutMS=8000)
+    try:
+        await source_client.admin.command("ping")
+        source_db = source_client[source_db_name]
+        cloud_counts = await _cloud_to_local_source_counts(source_db)
+        local_before = await _local_collection_counts()
+        local_has_data = any(count > 0 for count in local_before.values())
+        logger.info("Local first cloud import dry-run: cloud records found=%s", cloud_counts)
+        logger.info("Local first cloud import dry-run: local records before import=%s", local_before)
+        result = {
+            "ok": True,
+            "dry_run": dry_run or not confirm,
+            "requires_confirm": True,
+            "overwrite_local": overwrite_local,
+            "started_at": started_at,
+            "source_database": source_db_name,
+            "collections": LOCAL_FIRST_IMPORT_COLLECTIONS,
+            "cloud_records_found": cloud_counts,
+            "local_records_before_import": local_before,
+            "local_records_after_import": None,
+            "message": "Dry run only. Re-run with dry_run=false&confirm=true after reviewing counts.",
+        }
+        if dry_run or not confirm:
+            return result
+        if local_has_data and not overwrite_local:
+            raise HTTPException(
+                status_code=409,
+                detail="Local SQLite already contains data. Re-run with overwrite_local=true only after user confirmation.",
+            )
+        imported = {}
+        for collection_name in LOCAL_FIRST_IMPORT_COLLECTIONS:
+            docs = await source_db[collection_name].find({}, {"_id": 0}).to_list(500000)
+            safe_docs = [_json_safe_mongo_document(doc) for doc in docs]
+            if overwrite_local:
+                await raw_db[collection_name].delete_many({})
+            if safe_docs:
+                await raw_db[collection_name].insert_many(safe_docs)
+            imported[collection_name] = len(safe_docs)
+        local_after = await _local_collection_counts()
+        logger.info("Local first cloud import complete: cloud records found=%s", cloud_counts)
+        logger.info("Local first cloud import complete: local records before import=%s", local_before)
+        logger.info("Local first cloud import complete: local records after import=%s", local_after)
+        return {
+            **result,
+            "dry_run": False,
+            "imported": imported,
+            "local_records_after_import": local_after,
+            "message": "Cloud data imported into local SQLite. Source Atlas data was read only and not modified.",
+        }
+    finally:
+        source_client.close()
+
 def _load_backup_file_for_restore(backup_file: str, expected_sha256: Optional[str] = None) -> Tuple[Path, dict, str, int]:
     path = Path(backup_file).expanduser().resolve()
     if not path.exists() or not path.is_file():
@@ -9465,6 +9559,24 @@ async def google_drive_device_token(user: dict = Depends(require_role("admin")))
     data["expires_at"] = datetime.now(timezone.utc).timestamp() + int(data.get("expires_in", 3600))
     _save_google_token(data)
     return {"ok": True, "token_path": str(GOOGLE_DRIVE_TOKEN_PATH)}
+
+@api_router.post("/local-mode/import/dry-run")
+@api_router.post("/local/import/dry-run")
+async def local_mode_import_dry_run():
+    return await _cloud_to_local_import(dry_run=True, confirm=False, overwrite_local=False)
+
+
+@api_router.post("/local-mode/import/confirm")
+@api_router.post("/local/import/confirm")
+async def local_mode_import_confirm(overwrite_local: bool = Query(False)):
+    return await _cloud_to_local_import(dry_run=False, confirm=True, overwrite_local=overwrite_local)
+
+
+@api_router.post("/local-mode/import")
+@api_router.post("/local/import")
+async def local_mode_import(dry_run: bool = Query(True), confirm: bool = Query(False), overwrite_local: bool = Query(False)):
+    return await _cloud_to_local_import(dry_run=dry_run, confirm=confirm, overwrite_local=overwrite_local)
+
 
 @api_router.post("/backup/sync/retry")
 async def backup_sync_retry(dry_run: bool = Query(False), confirm: bool = Query(True), user: dict = Depends(require_role("admin"))):
