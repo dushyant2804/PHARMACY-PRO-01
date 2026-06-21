@@ -9,19 +9,19 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import os
 import re
-from typing import Literal, TypedDict
+from typing import Dict, List, Optional, Tuple, Literal, TypedDict
 
 UpdateType = Literal["patch", "minor", "major"]
-SUPPORTED_UPDATE_TYPES: tuple[UpdateType, ...] = ("patch", "minor", "major")
+SUPPORTED_UPDATE_TYPES: Tuple[UpdateType, ...] = ("patch", "minor", "major")
 
 SEMVER_RE = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)")
 BUILD_RE = re.compile(r"[0-9]{8}(?:[0-9]{6})?-[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 class ReleaseNotes(TypedDict):
-    new: list[str]
-    improved: list[str]
-    fixed: list[str]
+    new: List[str]
+    improved: List[str]
+    fixed: List[str]
 
 
 class ReleaseMetadata(TypedDict):
@@ -47,7 +47,7 @@ class VersionMetadata(TypedDict):
 
 LATEST_RELEASE_KEY = "3.1.1+20260620-7682338"
 
-RELEASES: dict[str, ReleaseMetadata] = {
+RELEASES: Dict[str, ReleaseMetadata] = {
     "3.1.1+20260620-7682338": {
         "semantic_version": "3.1.1",
         "build_id": "20260620-7682338",
@@ -104,7 +104,7 @@ def make_full_version(semantic_version: str, build_id: str) -> str:
     return f"{semantic_version}+{build_id}"
 
 
-def parse_semantic_version(version: str) -> tuple[int, int, int]:
+def parse_semantic_version(version: str) -> Tuple[int, int, int]:
     if not SEMVER_RE.fullmatch(version):
         raise ValueError(f"Version must use semantic versioning: {version}")
     return tuple(int(part) for part in version.split("."))  # type: ignore[return-value]
@@ -120,7 +120,7 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _deployed_build_id(explicit_build_id: str | None = None) -> str | None:
+def _deployed_build_id(explicit_build_id: Optional[str] = None) -> Optional[str]:
     return explicit_build_id or os.environ.get("PHARMACYOS_BUILD_ID") or os.environ.get("VITE_PHARMACYOS_BUILD_ID")
 
 
@@ -141,7 +141,7 @@ def validate_release(key: str, release: ReleaseMetadata) -> None:
             raise ValueError(f"Release note category {category} must be a list of strings")
 
 
-def find_release(semantic_version: str, build_id: str | None = None) -> ReleaseMetadata | None:
+def find_release(semantic_version: str, build_id: Optional[str] = None) -> Optional[ReleaseMetadata]:
     for release in RELEASES.values():
         if release["semantic_version"] == semantic_version and (build_id is None or release["build_id"] == build_id):
             return release
@@ -158,9 +158,9 @@ def is_update_available(current: ReleaseMetadata, latest: ReleaseMetadata) -> bo
 
 
 def get_version_metadata(
-    current_version: str | None = None,
-    current_build: str | None = None,
-    deployed_build_id: str | None = None,
+    current_version: Optional[str] = None,
+    current_build: Optional[str] = None,
+    deployed_build_id: Optional[str] = None,
 ) -> VersionMetadata:
     """Return Update Center metadata for the deployed/latest release.
 

@@ -27,7 +27,7 @@ from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta, date
 from calendar import monthrange
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Optional, Literal, Any
+from typing import Any, Dict, List, Optional, Set, Tuple, Literal
 from collections import Counter, defaultdict
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query
@@ -1185,7 +1185,7 @@ class PaymentCreate(BaseModel):
     amount: float
     mode: str = "cash"
     notes: str = ""
-    date: str | None = None
+    date: Optional[str] = None
     receipt_number: Optional[str] = None
     invoice_number: Optional[str] = None
     bill_number: Optional[str] = None
@@ -1677,7 +1677,7 @@ async def _resolve_demo_email() -> str:
     return candidate
 
 
-def _system_account_marker_query() -> list[dict]:
+def _system_account_marker_query() -> List[dict]:
     return [{marker: True} for marker in SYSTEM_ACCOUNT_MARKERS] + [
         {"id": DEMO_USER_ID},
         {"name": "Administrator", "role": "admin"},
@@ -2270,7 +2270,7 @@ def _fifo_expiry_key(batch: dict) -> tuple:
     )
 
 
-def _compact_billing_stock_summary(batches: list[dict]) -> dict:
+def _compact_billing_stock_summary(batches: List[dict]) -> dict:
     """Return the live, compact medicine stock shape used by quick billing."""
     ordered = sorted(batches, key=_fifo_expiry_key)
     sellable = [batch for batch in ordered if _available_stock(batch) > 0]
@@ -2945,7 +2945,7 @@ def _manual_sold_capacity(batch: dict) -> float:
     return round_qty(max(0.0, purchased - returned))
 
 
-def _manual_sold_allocations(batches: list[dict], requested_sold: float) -> list[tuple[dict, float]]:
+def _manual_sold_allocations(batches: List[dict], requested_sold: float) -> List[Tuple[dict, float]]:
     """Return a canonical FIFO sold allocation for one medicine's batches.
 
     Rebuilding the complete allocation (rather than applying the delta to one
@@ -3000,7 +3000,7 @@ def _manual_sold_derivatives(batch: dict, sold_units: float, today: date) -> dic
     }
 
 
-async def _set_manual_sold_allocations(allocations: list[tuple[dict, float]], session=None) -> list[dict]:
+async def _set_manual_sold_allocations(allocations: List[Tuple[dict, float]], session=None) -> List[dict]:
     today = datetime.now(timezone.utc).date()
     updated_batches = []
     for batch, sold_units in allocations:
@@ -3928,7 +3928,7 @@ async def _build_fifo_stock_plan(
 
 
 async def _apply_fifo_stock_plan(
-    plan: list[dict],
+    plan: List[dict],
     session=None,
     applied=None
 ):
@@ -3955,7 +3955,7 @@ async def _apply_fifo_stock_plan(
 
 
 async def _apply_fifo_stock_requests(
-    stock_requests: dict[str, float],
+    stock_requests: Dict[str, float],
     session=None,
     applied=None
 ):
@@ -3978,7 +3978,7 @@ async def _apply_fifo_stock_requests(
     return applied_steps
 
 
-async def _restore_fifo_stock(applied: list[dict]):
+async def _restore_fifo_stock(applied: List[dict]):
     for step in reversed(applied):
         result = await _set_rounded_stock_delta(
             step["medicine_id"], "sold_units", -step["deduct"]
@@ -3993,7 +3993,7 @@ async def _restore_fifo_stock(applied: list[dict]):
             )
 
 
-def _stock_deductions_from_steps(steps: list[dict]) -> list[dict]:
+def _stock_deductions_from_steps(steps: List[dict]) -> List[dict]:
     return [
         {
             "medicine_id": step["medicine_id"],
@@ -4007,7 +4007,7 @@ def _stock_deductions_from_steps(steps: list[dict]) -> list[dict]:
     ]
 
 
-def _stock_deductions_from_daily_sale(sale: dict) -> list[dict]:
+def _stock_deductions_from_daily_sale(sale: dict) -> List[dict]:
     deductions = sale.get("stock_deductions") or []
     if deductions:
         return _stock_deductions_from_steps(deductions)
@@ -4028,7 +4028,7 @@ def _stock_deductions_from_daily_sale(sale: dict) -> list[dict]:
 
 
 async def _restore_daily_sale_stock(
-    deductions: list[dict],
+    deductions: List[dict],
     session=None,
     restored=None
 ):
@@ -4055,7 +4055,7 @@ async def _restore_daily_sale_stock(
             restored.append(step)
 
 
-async def _reapply_daily_sale_stock(restored: list[dict]):
+async def _reapply_daily_sale_stock(restored: List[dict]):
     for step in reversed(restored):
         deduct = round_qty(step.get("deduct", 0))
         if deduct <= 0:
@@ -4123,7 +4123,7 @@ def _normalize_invoice(invoice: dict, include_internal: bool = False) -> dict:
     return _ensure_action_aliases(result, alias_id_fields=("invoice_id",))
 
 
-def _ensure_action_aliases(row: dict, *, alias_id_fields: tuple[str, ...] = ()) -> dict:
+def _ensure_action_aliases(row: dict, *, alias_id_fields: Tuple[str, ...] = ()) -> dict:
     """Add non-destructive stable aliases used by table row actions."""
     result = dict(row or {})
     stable_id = result.get("id") or result.get("_id")
@@ -4623,7 +4623,7 @@ DISTRIBUTOR_TRANSACTION_EDITABLE_FIELDS = {
 }
 
 
-def _distributor_transaction_update_date(changes: dict) -> str | None:
+def _distributor_transaction_update_date(changes: dict) -> Optional[str]:
     for field_name in ("opening_balance_date", "date", "transaction_date"):
         value = changes.get(field_name)
         if value:
@@ -4662,11 +4662,11 @@ def _strip_normal_transaction_date_changes(changes: dict) -> dict:
     }
 
 
-def _opening_balance_transaction_id(distributor_id: str | None) -> str:
+def _opening_balance_transaction_id(distributor_id: Optional[str]) -> str:
     return f"opening-balance-{distributor_id}"
 
 
-def _is_opening_balance_transaction(txn: dict, distributor_id: str | None = None) -> bool:
+def _is_opening_balance_transaction(txn: dict, distributor_id: Optional[str] = None) -> bool:
     txn_id = str(txn.get("id") or "")
     if distributor_id and txn_id == _opening_balance_transaction_id(distributor_id):
         return True
@@ -4710,7 +4710,7 @@ DISTRIBUTOR_OPENING_BALANCE_DATE_FIELDS = (
 )
 
 
-def _first_present_field(source: dict, field_names: tuple[str, ...]):
+def _first_present_field(source: dict, field_names: Tuple[str, ...]):
     for field_name in field_names:
         value = source.get(field_name)
         if value:
@@ -4735,7 +4735,7 @@ def _normalized_ledger_reference(value) -> str:
     return " ".join(str(value or "").strip().casefold().split())
 
 
-def _ledger_reference_values(source: dict, field_names: tuple[str, ...]) -> set[str]:
+def _ledger_reference_values(source: dict, field_names: Tuple[str, ...]) -> Set[str]:
     if not isinstance(source, dict):
         return set()
     return {
@@ -4745,7 +4745,7 @@ def _ledger_reference_values(source: dict, field_names: tuple[str, ...]) -> set[
     }
 
 
-def _opening_balance_reference_values(distributor: dict, opening_txn: dict | None = None) -> set[str]:
+def _opening_balance_reference_values(distributor: dict, opening_txn: Optional[dict] = None) -> Set[str]:
     values = _ledger_reference_values(
         distributor,
         (
@@ -4771,7 +4771,7 @@ def _opening_balance_reference_values(distributor: dict, opening_txn: dict | Non
     return values
 
 
-def _transaction_reference_values(txn: dict) -> set[str]:
+def _transaction_reference_values(txn: dict) -> Set[str]:
     return _ledger_reference_values(
         txn,
         (
@@ -4790,14 +4790,14 @@ def _transaction_reference_values(txn: dict) -> set[str]:
 def _opening_balance_duplicate_reference_matches(
     txn: dict,
     distributor: dict,
-    opening_txn: dict | None = None,
+    opening_txn: Optional[dict] = None,
 ) -> bool:
     opening_refs = _opening_balance_reference_values(distributor, opening_txn)
     txn_refs = _transaction_reference_values(txn)
     return not opening_refs or bool(opening_refs & txn_refs)
 
 
-def _is_duplicate_opening_balance_row(txn: dict, distributor: dict, opening_txn: dict | None = None) -> bool:
+def _is_duplicate_opening_balance_row(txn: dict, distributor: dict, opening_txn: Optional[dict] = None) -> bool:
     """Detect legacy synthetic purchase/payment rows that duplicate the distributor opening balance."""
     if not isinstance(txn, dict):
         return False
@@ -4827,7 +4827,7 @@ def _ledger_amount_key(value) -> float:
     return _round_ledger_money(_safe_float(value))
 
 
-def _ledger_reference_match_values(source: dict) -> set[str]:
+def _ledger_reference_match_values(source: dict) -> Set[str]:
     generic_opening_refs = {"opening balance", "opening_balance", "opening-balance"}
     return {
         value
@@ -4849,7 +4849,7 @@ def _ledger_reference_match_values(source: dict) -> set[str]:
     }
 
 
-def _ledger_amount_detail_key(txn: dict) -> tuple[float, float, float]:
+def _ledger_amount_detail_key(txn: dict) -> Tuple[float, float, float]:
     return (
         _ledger_amount_key(txn.get("bill_amount")),
         _ledger_amount_key(txn.get("paid_amount")),
@@ -4857,10 +4857,10 @@ def _ledger_amount_detail_key(txn: dict) -> tuple[float, float, float]:
     )
 
 
-def _dedupe_distributor_opening_balance_rows(transactions: list[dict], distributor_id: str | None) -> list[dict]:
+def _dedupe_distributor_opening_balance_rows(transactions: List[dict], distributor_id: Optional[str]) -> List[dict]:
     """Remove normal rows that duplicate an opening-balance bill before balances are calculated."""
-    opening_ref_keys: set[tuple[str, str, float, object]] = set()
-    opening_fallback_keys: set[tuple[str, float, object, tuple[float, float, float]]] = set()
+    opening_ref_keys: Set[Tuple[str, str, float, object]] = set()
+    opening_fallback_keys: Set[Tuple[str, float, object, Tuple[float, float, float]]] = set()
 
     for txn in transactions:
         if not _is_explicit_opening_balance_transaction(txn, distributor_id):
@@ -4910,7 +4910,7 @@ def _dedupe_distributor_opening_balance_rows(transactions: list[dict], distribut
 
     return deduped
 
-def _is_explicit_opening_balance_transaction(txn: dict, distributor_id: str | None = None) -> bool:
+def _is_explicit_opening_balance_transaction(txn: dict, distributor_id: Optional[str] = None) -> bool:
     if not isinstance(txn, dict):
         return False
     txn_id = str(txn.get("id") or "")
@@ -4925,7 +4925,7 @@ def _is_explicit_opening_balance_transaction(txn: dict, distributor_id: str | No
 def _opening_balance_row_duplicates_manual_ledger_transaction(
     opening_txn: dict,
     candidate: dict,
-    distributor_id: str | None = None,
+    distributor_id: Optional[str] = None,
 ) -> bool:
     """Prefer a manually entered debit over an opening-balance copy of that debit."""
     if not _is_explicit_opening_balance_transaction(opening_txn, distributor_id):
@@ -5073,7 +5073,7 @@ def _normalize_opening_balance_transaction(txn: dict, distributor: dict) -> dict
     return normalized
 
 
-def _parse_ledger_transaction_date(value: str | None):
+def _parse_ledger_transaction_date(value: Optional[str]):
     if not value:
         return None
 
@@ -5105,7 +5105,7 @@ def _current_financial_year() -> str:
     return _financial_year_for_date(datetime.now(timezone.utc).date())
 
 
-def _normalize_distributor_ledger_financial_year(financial_year: str | None) -> str | None:
+def _normalize_distributor_ledger_financial_year(financial_year: Optional[str]) -> Optional[str]:
     """Normalize all-year sentinels while preserving strict FY validation."""
     if financial_year is None:
         return None
@@ -5143,7 +5143,7 @@ def _financial_year_date_range(financial_year: str):
     )
 
 
-def _available_financial_years(transactions: list[dict]) -> list[str]:
+def _available_financial_years(transactions: List[dict]) -> List[str]:
     years = {
         _financial_year_for_date(txn_date)
         for txn in transactions
@@ -5153,9 +5153,9 @@ def _available_financial_years(transactions: list[dict]) -> list[str]:
 
 
 def _filter_transactions_by_financial_year(
-    transactions: list[dict],
+    transactions: List[dict],
     financial_year: str,
-) -> list[dict]:
+) -> List[dict]:
     start_date, end_date = _financial_year_date_range(financial_year)
     return [
         txn
@@ -5178,7 +5178,7 @@ def _next_financial_year(financial_year: str) -> str:
 
 
 def _distributor_balance_until_date(
-    transactions: list[dict],
+    transactions: List[dict],
     end_date,
     inclusive: bool = True,
 ) -> float:
@@ -5201,8 +5201,8 @@ def _distributor_balance_until_date(
 
 
 def _distributor_financial_year_metadata(
-    transactions: list[dict],
-    financial_year: str | None,
+    transactions: List[dict],
+    financial_year: Optional[str],
 ) -> dict:
     if not financial_year:
         return {
@@ -5342,7 +5342,7 @@ def _round_ledger_money(value: float) -> float:
     return _money_float(_to_decimal(value))
 
 
-def _serializable_transaction_id(value) -> str | None:
+def _serializable_transaction_id(value) -> Optional[str]:
     if value in (None, ""):
         return None
     return str(value)
@@ -5386,13 +5386,13 @@ def _fifo_debug_enabled(distributor_id: str) -> bool:
 
 
 def _build_distributor_fifo_metadata(
-    transactions: list[dict],
+    transactions: List[dict],
     distributor_id: str,
-) -> dict[str, dict]:
-    metadata_by_id: dict[str, dict] = {}
-    unpaid_bills: list[dict] = []
-    pending_credits: list[dict] = []
-    allocation_sequence: list[dict] = []
+) -> Dict[str, dict]:
+    metadata_by_id: Dict[str, dict] = {}
+    unpaid_bills: List[dict] = []
+    pending_credits: List[dict] = []
+    allocation_sequence: List[dict] = []
     debug_enabled = _fifo_debug_enabled(distributor_id)
 
     try:
@@ -5405,10 +5405,10 @@ def _build_distributor_fifo_metadata(
         return metadata_by_id
 
     def record_debug_row(
-        txn: dict | None,
-        txn_id: str | None,
+        txn: Optional[dict],
+        txn_id: Optional[str],
         stage: str,
-        sequence_no: int | None = None,
+        sequence_no: Optional[int] = None,
     ):
         if not debug_enabled:
             return
@@ -5605,9 +5605,9 @@ def _build_distributor_fifo_metadata(
     return _json_safe_ledger_value(metadata_by_id)
 
 def _distributor_fifo_metadata_transactions(
-    transactions: list[dict],
-    financial_year: str | None,
-) -> list[dict]:
+    transactions: List[dict],
+    financial_year: Optional[str],
+) -> List[dict]:
     if not financial_year:
         return list(transactions)
 
@@ -5618,7 +5618,7 @@ def _distributor_fifo_metadata_transactions(
         if (txn_date := _distributor_transaction_date(txn)) and txn_date <= end_date
     ]
 
-def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, str]:
+def _apply_distributor_transaction(balance: float, txn: dict) -> Tuple[float, str]:
     amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
     txn_type = txn.get("type") if isinstance(txn, dict) else None
 
@@ -5633,8 +5633,8 @@ def _apply_distributor_transaction(balance: float, txn: dict) -> tuple[float, st
 
 def _distributor_opening_balance_deduped_transactions(
     distributor: dict,
-    transactions: list[dict],
-) -> list[dict]:
+    transactions: List[dict],
+) -> List[dict]:
     """Return transactions without an opening-balance copy of a manual ledger debit."""
     distributor_id = str(distributor.get("id") or "")
     opening_txn = None
@@ -5676,7 +5676,7 @@ def _normalize_ledger_invoice_identity_value(value) -> str:
     return " ".join(str(value or "").strip().casefold().split())
 
 
-def _ledger_invoice_identity_variants(value) -> set[str]:
+def _ledger_invoice_identity_variants(value) -> Set[str]:
     """Return comparable invoice identities, including legacy prefix-stripped forms."""
     normalized = _normalize_ledger_invoice_identity_value(value)
     if not normalized:
@@ -5705,7 +5705,7 @@ def _ledger_invoice_identity_variants(value) -> set[str]:
     return variants
 
 
-def _purchase_invoice_reference_values(txn: dict) -> set[str]:
+def _purchase_invoice_reference_values(txn: dict) -> Set[str]:
     if not isinstance(txn, dict):
         return set()
     refs = set()
@@ -5725,7 +5725,7 @@ def _purchase_invoice_reference_values(txn: dict) -> set[str]:
     return refs
 
 
-def _purchase_invoice_identity_keys(txn: dict, distributor_id: str | None = None) -> list[tuple]:
+def _purchase_invoice_identity_keys(txn: dict, distributor_id: Optional[str] = None) -> List[tuple]:
     """Return robust identity keys for distributor purchase/invoice ledger rows."""
     if not isinstance(txn, dict):
         return []
@@ -5747,7 +5747,7 @@ def _purchase_invoice_identity_keys(txn: dict, distributor_id: str | None = None
     return keys
 
 
-def _purchase_invoice_row_score(txn: dict) -> tuple[int, int, int, int]:
+def _purchase_invoice_row_score(txn: dict) -> Tuple[int, int, int, int]:
     """Prefer richer canonical persisted purchase rows when duplicate invoices exist."""
     if not isinstance(txn, dict):
         return (0, 0, 0, 0)
@@ -5790,11 +5790,11 @@ def _canonical_purchase_invoice_display_row(existing: dict, candidate: dict) -> 
 
 
 
-def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distributor_id: str | None = None) -> list[dict]:
+def _dedupe_distributor_purchase_invoice_rows(transactions: List[dict], distributor_id: Optional[str] = None) -> List[dict]:
     """Keep one purchase ledger row per distributor invoice identity; never dedupe payments."""
-    selected_by_group: dict[int, dict] = {}
-    key_to_group: dict[tuple, int] = {}
-    group_order: list[tuple[str, object]] = []
+    selected_by_group: Dict[int, dict] = {}
+    key_to_group: Dict[tuple, int] = {}
+    group_order: List[Tuple[str, object]] = []
     next_group = 0
 
     for txn in transactions:
@@ -5858,14 +5858,14 @@ def _dedupe_distributor_purchase_invoice_rows(transactions: list[dict], distribu
 
 
 def _final_distributor_ledger_rows(
-    transactions: list[dict],
+    transactions: List[dict],
     distributor_id: str,
-) -> list[dict]:
+) -> List[dict]:
     """Return the authoritative post-dedupe rows for display and accounting."""
     return _dedupe_distributor_purchase_invoice_rows(transactions, distributor_id)
 
 
-def _ledger_row_persisted_id(txn: dict) -> str | None:
+def _ledger_row_persisted_id(txn: dict) -> Optional[str]:
     if not isinstance(txn, dict):
         return None
     for field_name in ("_id", "id"):
@@ -5892,7 +5892,7 @@ def _annotate_distributor_transaction_source(txn: dict) -> dict:
 
 
 
-def _current_distributor_balance(distributor: dict, transactions: list[dict]) -> float:
+def _current_distributor_balance(distributor: dict, transactions: List[dict]) -> float:
     balance = 0.0
 
     for txn in _distributor_opening_balance_deduped_transactions(distributor, transactions):
@@ -5901,7 +5901,7 @@ def _current_distributor_balance(distributor: dict, transactions: list[dict]) ->
     return round(balance, 2)
 
 
-def _distributor_identity_values(distributor: dict, requested_id: str | None = None) -> set[str]:
+def _distributor_identity_values(distributor: dict, requested_id: Optional[str] = None) -> Set[str]:
     values = set()
     for field in ("_id", "_legacy_object_id", "id", "distributor_id"):
         value = distributor.get(field)
@@ -5912,7 +5912,7 @@ def _distributor_identity_values(distributor: dict, requested_id: str | None = N
     return values
 
 
-def _belongs_to_distributor(row: dict, identity_values: set[str], names: set[str]) -> bool:
+def _belongs_to_distributor(row: dict, identity_values: Set[str], names: Set[str]) -> bool:
     linked_values = {
         str(row.get(field)).strip()
         for field in ("distributor_id", "distributor", "distributorId")
@@ -5936,10 +5936,10 @@ def _belongs_to_distributor(row: dict, identity_values: set[str], names: set[str
 
 async def _canonical_distributor_ledger_transactions(
     distributor: dict,
-    requested_id: str | None = None,
-    raw_transactions: list[dict] | None = None,
-    purchase_orders: list[dict] | None = None,
-) -> list[dict]:
+    requested_id: Optional[str] = None,
+    raw_transactions: Optional[List[dict]] = None,
+    purchase_orders: Optional[List[dict]] = None,
+) -> List[dict]:
     """Build the single canonical transaction set used for distributor accounting.
 
     This keeps the accounting transaction stream intact for existing balance
@@ -5970,15 +5970,15 @@ async def _canonical_distributor_ledger_transactions(
     return canonical
 
 
-def _debug_purchase_invoice_identity(txn: dict) -> list[str]:
+def _debug_purchase_invoice_identity(txn: dict) -> List[str]:
     return sorted(_purchase_invoice_reference_values(txn))
 
 
-def _debug_purchase_invoice_dedupe_key(txn: dict, distributor_id: str | None = None) -> list[str]:
+def _debug_purchase_invoice_dedupe_key(txn: dict, distributor_id: Optional[str] = None) -> List[str]:
     return [repr(key) for key in _purchase_invoice_identity_keys(txn, distributor_id)]
 
 
-def _with_distributor_ledger_debug_fields(txn: dict, distributor_id: str | None = None) -> dict:
+def _with_distributor_ledger_debug_fields(txn: dict, distributor_id: Optional[str] = None) -> dict:
     debugged = dict(txn if isinstance(txn, dict) else {})
     source = debugged.get("backend_row_source") or debugged.get("source") or "distributor_transactions"
     debugged["_debug_source"] = source
@@ -6016,7 +6016,7 @@ def _forensic_row_identity(txn: dict) -> str:
     ))
 
 
-def _forensic_row(txn: dict, distributor_id: str | None = None) -> dict:
+def _forensic_row(txn: dict, distributor_id: Optional[str] = None) -> dict:
     row = _with_distributor_ledger_debug_fields(txn, distributor_id)
     row_date = _distributor_transaction_date(row)
     invoice_variants = _debug_purchase_invoice_identity(row)
@@ -6056,7 +6056,7 @@ def _forensic_duplicate_fingerprint(row: dict) -> tuple:
     )
 
 
-def _forensic_removed_reason(before: dict, after_rows: list[dict], distributor_id: str) -> dict:
+def _forensic_removed_reason(before: dict, after_rows: List[dict], distributor_id: str) -> dict:
     after_keys = {
         key
         for row in after_rows
@@ -6082,7 +6082,7 @@ def _forensic_removed_reason(before: dict, after_rows: list[dict], distributor_i
     }
 
 
-def _admin_debug_distributor_ledger_row(txn: dict, distributor_id: str | None = None) -> dict:
+def _admin_debug_distributor_ledger_row(txn: dict, distributor_id: Optional[str] = None) -> dict:
     row = _with_distributor_ledger_debug_fields(txn, distributor_id)
     row_date = _distributor_transaction_date(row)
     return _json_safe_ledger_transaction({
@@ -6200,7 +6200,7 @@ async def admin_distributor_ledger_debug(
     return await _admin_distributor_ledger_debug_report(distributor_id)
 
 
-async def _distributor_ledger_forensic_audit_for_dist(dist: dict, requested_id: str | None = None) -> dict:
+async def _distributor_ledger_forensic_audit_for_dist(dist: dict, requested_id: Optional[str] = None) -> dict:
     did = str(dist.get("id") or requested_id or "")
     before = await _canonical_distributor_ledger_transactions(
         dist, requested_id
@@ -6218,7 +6218,7 @@ async def _distributor_ledger_forensic_audit_for_dist(dist: dict, requested_id: 
         report_row["removal_analysis"] = _forensic_removed_reason(row, after, did)
         removed.append(report_row)
 
-    grouped: dict[tuple, list[dict]] = defaultdict(list)
+    grouped: Dict[tuple, List[dict]] = defaultdict(list)
     for row in after_report:
         grouped[_forensic_duplicate_fingerprint(row)].append(row)
     surviving_duplicates = [
@@ -6261,7 +6261,7 @@ async def distributor_ledger_forensic_audit(user: dict = Depends(require_role("a
     return {"distributors": reports}
 
 
-def _distributor_ledger_totals(transactions: list[dict]) -> dict:
+def _distributor_ledger_totals(transactions: List[dict]) -> dict:
     balance = 0.0
     totals = {"total_purchases": 0.0, "total_paid": 0.0, "total_adjustments": 0.0, "balance": 0.0}
     for txn in transactions:
@@ -6790,7 +6790,7 @@ def _purchase_return_settlement_status(return_doc: dict) -> str:
 
 
 
-def _purchase_return_business_status(return_doc: dict) -> tuple[str, str, str]:
+def _purchase_return_business_status(return_doc: dict) -> Tuple[str, str, str]:
     settlement = _purchase_return_settlement_status(return_doc)
     if settlement == "deleted":
         return "Deleted / Voided", "deleted", "deleted"
@@ -6912,12 +6912,12 @@ def _purchase_return_quantity(return_doc: dict) -> float:
 
 
 def _match_purchase_return_medicine(
-    return_doc: dict, medicines: list[dict], tenant_id: Optional[str] = None
+    return_doc: dict, medicines: List[dict], tenant_id: Optional[str] = None
 ) -> Optional[dict]:
     """Safely resolve a legacy purchase return to one unambiguous medicine batch."""
     return_id = return_doc.get("id")
 
-    def unique_match(candidates: list[dict], method: str) -> Optional[dict]:
+    def unique_match(candidates: List[dict], method: str) -> Optional[dict]:
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) > 1:
@@ -7587,7 +7587,7 @@ async def purchase_return_report(
         add_summary(by_ledger_status, status_label, quantity, value)
         analytics_rows.append(analytics_row)
 
-    def finalize_summary(bucket: dict) -> list[dict]:
+    def finalize_summary(bucket: dict) -> List[dict]:
         output = []
         for key, values in bucket.items():
             output.append({
@@ -7660,7 +7660,7 @@ def _customer_transaction_sort_key(txn: dict):
     )
 
 
-def _apply_customer_transaction(balance: float, txn: dict) -> tuple[float, str]:
+def _apply_customer_transaction(balance: float, txn: dict) -> Tuple[float, str]:
     amount = _safe_float(txn.get("amount", 0) if isinstance(txn, dict) else 0)
     txn_type = str(txn.get("type") if isinstance(txn, dict) else "").strip().lower()
 
@@ -7673,7 +7673,7 @@ def _apply_customer_transaction(balance: float, txn: dict) -> tuple[float, str]:
     return balance, "ignored"
 
 
-def _customer_monthly_summary_from_transactions(transactions: list[dict]) -> list[dict]:
+def _customer_monthly_summary_from_transactions(transactions: List[dict]) -> List[dict]:
     monthly = defaultdict(lambda: {
         "month": "",
         "total_credit_sales": 0.0,
@@ -7927,7 +7927,7 @@ async def customer_ledger(cid: str, search: Optional[str] = None, invoice_number
     return {"customer": cust, "transactions": running, "balance": round(balance, 2), "monthly_summary": monthly_summary, "monthly_movement_summary": monthly_summary}
 
 
-def _ledger_export_csv(owner_type: str, ledger: dict, start_date: date | None, end_date: date | None) -> str:
+def _ledger_export_csv(owner_type: str, ledger: dict, start_date: Optional[date], end_date: Optional[date]) -> str:
     owner = ledger[owner_type]
     output = io.StringIO(newline="")
     writer = csv.writer(output)
@@ -8465,7 +8465,7 @@ async def stock_valuation(user: dict = Depends(get_current_user)):
             **expiry_values, "total_expiry_value_at_risk": expiry_values["expiry_value_at_risk"]}
 
 
-def _outstanding_aging(transactions: list[dict], charge_types: set[str], credit_types: set[str]) -> dict:
+def _outstanding_aging(transactions: List[dict], charge_types: Set[str], credit_types: Set[str]) -> dict:
     today = datetime.now(timezone.utc).date()
     charges = []
     credits = 0.0
@@ -8502,7 +8502,7 @@ def _purchase_order_as_distributor_transaction(po: dict) -> dict:
     return row
 
 
-def _distributor_monthly_outstanding_movement(distributors: list[dict], distributor_txns: list[dict]) -> list[dict]:
+def _distributor_monthly_outstanding_movement(distributors: List[dict], distributor_txns: List[dict]) -> List[dict]:
     """Build month-end distributor payable movement from real distributor payable sources."""
     distributor_by_id = {str(d.get("id") or ""): d for d in distributors if isinstance(d, dict)}
     raw_txns_by_distributor = defaultdict(list)
@@ -8792,7 +8792,7 @@ def _invoice_item_quantity(item: dict) -> float:
     return _safe_float(item.get("units_dispensed", item.get("quantity", 0)))
 
 
-async def _invoice_item_profit_rows() -> tuple[list[dict], dict]:
+async def _invoice_item_profit_rows() -> Tuple[List[dict], dict]:
     invoices = await db.invoices.find({}, {"_id": 0}).to_list(20000)
     medicine_ids = {item.get("medicine_id") for invoice in invoices for item in invoice.get("items", []) if item.get("medicine_id")}
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(20000)
@@ -8812,7 +8812,7 @@ async def _invoice_item_profit_rows() -> tuple[list[dict], dict]:
     return rows, by_id
 
 
-def _finalize_profit_rows(grouped: dict) -> list[dict]:
+def _finalize_profit_rows(grouped: dict) -> List[dict]:
     output = []
     for values in grouped.values():
         profit = values["revenue"] - values["cost"]
@@ -8850,7 +8850,7 @@ async def category_profitability(user: dict = Depends(get_current_user)):
     return {"items": sorted(items, key=lambda x: x["profit"], reverse=True)}
 
 
-async def _medicine_movement_items() -> list[dict]:
+async def _medicine_movement_items() -> List[dict]:
     rows, by_id = await _invoice_item_profit_rows()
     grouped = defaultdict(lambda: {"medicine": "Unknown", "units_sold": 0.0, "revenue": 0.0, "last_sale_date": None})
     for row in rows:
@@ -9094,7 +9094,7 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _uploads_backup_manifest() -> list[dict]:
+def _uploads_backup_manifest() -> List[dict]:
     files = []
     if not UPLOAD_DIR.exists():
         return files
@@ -9118,7 +9118,7 @@ async def _backup_payload() -> dict:
     }
 
 
-async def _queue_backup_destination(destination: str, reason: str, backup_file: str | None = None, checksum: str | None = None) -> None:
+async def _queue_backup_destination(destination: str, reason: str, backup_file: Optional[str] = None, checksum: Optional[str] = None) -> None:
     await raw_db[SYNC_QUEUE_COLLECTION].insert_one({
         "id": str(uuid.uuid4()),
         "type": f"{destination}_backup",
@@ -9132,7 +9132,7 @@ async def _queue_backup_destination(destination: str, reason: str, backup_file: 
     })
 
 
-async def _enqueue_cloud_sync(reason: str, backup_file: str | None = None, checksum: str | None = None) -> None:
+async def _enqueue_cloud_sync(reason: str, backup_file: Optional[str] = None, checksum: Optional[str] = None) -> None:
     await _queue_backup_destination("atlas", reason, backup_file, checksum)
     await _queue_backup_destination("google_drive", reason, backup_file, checksum)
 
@@ -9193,7 +9193,7 @@ def _mark_queue_failed_fields(exc: Exception) -> dict:
     return {"status": "pending", "last_error": str(exc), "last_attempt_at": datetime.now(timezone.utc).isoformat()}
 
 
-async def _upload_backup_to_atlas(backup_file: str, reason: str = "manual", queue_id: str | None = None) -> dict:
+async def _upload_backup_to_atlas(backup_file: str, reason: str = "manual", queue_id: Optional[str] = None) -> dict:
     if not ATLAS_BACKUP_MONGO_URL:
         raise RuntimeError("ATLAS_BACKUP_MONGO_URL is not configured")
     path, payload, checksum, file_size = _load_backup_file_for_restore(backup_file)
@@ -9219,7 +9219,7 @@ async def _upload_backup_to_atlas(backup_file: str, reason: str = "manual", queu
         atlas_client.close()
 
 
-def _load_google_token() -> dict | None:
+def _load_google_token() -> Optional[dict]:
     if GOOGLE_DRIVE_TOKEN_PATH.exists():
         try:
             return json.loads(GOOGLE_DRIVE_TOKEN_PATH.read_text(encoding="utf-8"))
@@ -9237,7 +9237,7 @@ def _save_google_token(token: dict) -> None:
         pass
 
 
-def _google_api_request(url: str, token: str | None = None, data: bytes | None = None, headers: dict | None = None, method: str | None = None) -> dict:
+def _google_api_request(url: str, token: Optional[str] = None, data: Optional[bytes] = None, headers: Optional[dict] = None, method: Optional[str] = None) -> dict:
     req_headers = dict(headers or {})
     if token:
         req_headers["Authorization"] = f"Bearer {token}"
@@ -9264,7 +9264,7 @@ async def _google_access_token() -> str:
     return token["access_token"]
 
 
-async def _upload_backup_to_google_drive(backup_file: str, reason: str = "manual", queue_id: str | None = None) -> dict:
+async def _upload_backup_to_google_drive(backup_file: str, reason: str = "manual", queue_id: Optional[str] = None) -> dict:
     path = Path(backup_file).expanduser().resolve()
     if not path.exists():
         raise RuntimeError("Backup file not found for Google Drive upload")
@@ -9287,8 +9287,8 @@ async def _upload_backup_to_google_drive(backup_file: str, reason: str = "manual
     return {"ok": True, "status": "uploaded", "drive_file_id": uploaded.get("id"), "drive_file_name": uploaded.get("name")}
 
 
-async def _process_pending_backup_queue(destination: str | None = None) -> dict:
-    query: dict[str, Any] = {"status": "pending"}
+async def _process_pending_backup_queue(destination: Optional[str] = None) -> dict:
+    query: Dict[str, Any] = {"status": "pending"}
     if destination:
         query["destination"] = destination
     rows = await raw_db[SYNC_QUEUE_COLLECTION].find(query, {"_id": 0}).sort("created_at", 1).to_list(100)
@@ -9340,7 +9340,7 @@ async def _last_backup_metadata() -> Optional[dict]:
     return items[0] if items else None
 
 
-async def _pending_backup_count(destination: str | None = None) -> int:
+async def _pending_backup_count(destination: Optional[str] = None) -> int:
     query = {"status": "pending"}
     if destination:
         query["destination"] = destination
@@ -9358,7 +9358,7 @@ async def _verify_import_counts(payload: dict) -> dict:
     return {name: {"source": len(source.get(name, [])), "target": await db[name].count_documents({})} for name in names}
 
 
-def _load_backup_file_for_restore(backup_file: str, expected_sha256: Optional[str] = None) -> tuple[Path, dict, str, int]:
+def _load_backup_file_for_restore(backup_file: str, expected_sha256: Optional[str] = None) -> Tuple[Path, dict, str, int]:
     path = Path(backup_file).expanduser().resolve()
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Backup file not found")
@@ -9529,15 +9529,15 @@ class POItem(BaseModel):
     batch_no: str
     quantity: float
     free_quantity: float = 0
-    pack_size: str | None = None
+    pack_size: Optional[str] = None
 
     purchase_price: float
     mrp: float
 
-    manufacturer: str | None = None
-    category: str | None = None
+    manufacturer: Optional[str] = None
+    category: Optional[str] = None
 
-    expiry_date: str | None = None
+    expiry_date: Optional[str] = None
     gst_rate: float = 5
 
 class POReturnCreditRow(BaseModel):
@@ -9577,11 +9577,11 @@ class POCreate(BaseModel):
     distributor_name: str
     invoice_ref: str
 
-    po_date: str | None = None   # 👈 ADD THIS
+    po_date: Optional[str] = None   # 👈 ADD THIS
 
-    items: list[POItem]
+    items: List[POItem]
 
-    notes: str | None = None
+    notes: Optional[str] = None
     sub_total: float = 0
     scheme_discount: float = 0
     cash_discount: float = 0
@@ -9589,8 +9589,8 @@ class POCreate(BaseModel):
     total_sgst: float = 0
     round_off: float = 0
     grand_total: float = 0
-    purchase_return_ids: list[str] = Field(default_factory=list)
-    purchase_returns: list[POReturnCreditRow] = Field(default_factory=list)
+    purchase_return_ids: List[str] = Field(default_factory=list)
+    purchase_returns: List[POReturnCreditRow] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -9630,7 +9630,7 @@ def _money_float(value: Decimal) -> float:
 
 def _calculate_purchase_order_totals(payload: POCreate) -> dict:
     """Calculate PO totals with order discount applied slab-wise before GST."""
-    slab_subtotals: dict[Decimal, Decimal] = defaultdict(Decimal)
+    slab_subtotals: Dict[Decimal, Decimal] = defaultdict(Decimal)
 
     for item in payload.items:
         # Free quantity is intentionally excluded from the PO taxable subtotal.
@@ -9699,7 +9699,7 @@ def _purchase_return_credit(item: dict) -> float:
     )
 
 
-async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[str] = None) -> tuple[list[dict], float]:
+async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[str] = None) -> Tuple[List[dict], float]:
     """Resolve selected IDs and inline PO credit rows to one physical return each."""
     return_ids = list(dict.fromkeys(payload.purchase_return_ids))
     returns = []
@@ -9824,7 +9824,7 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
     return returns, credit
 
 
-def _apply_po_return_credit(po_totals: dict, returns: list[dict], credit: float) -> dict:
+def _apply_po_return_credit(po_totals: dict, returns: List[dict], credit: float) -> dict:
     credit = _money_float(_to_decimal(credit))
     payable_base = _to_decimal(po_totals.get("sub_total", po_totals["grand_total"]))
     payable = _money_float(max(Decimal("0"), payable_base - _to_decimal(credit)))
@@ -10564,7 +10564,7 @@ def _empty_daily_closing_splits() -> dict:
     }
 
 
-def _daily_sale_split_signature(row: dict) -> tuple[float, float, float, float]:
+def _daily_sale_split_signature(row: dict) -> Tuple[float, float, float, float]:
     return tuple(_money(row.get(field)) for field in (
         "cash_sales", "upi_sales", "card_sales", "outstanding_sales"
     ))
@@ -10584,13 +10584,13 @@ def _invoice_daily_closing_splits(invoice: dict) -> dict:
     return {key: _money(value) for key, value in splits.items()}
 
 
-def _invoice_split_signature(splits: dict) -> tuple[float, float, float, float]:
+def _invoice_split_signature(splits: dict) -> Tuple[float, float, float, float]:
     return tuple(_money(splits.get(field)) for field in (
         "cash_sales", "upi_sales", "card_sales", "credit_sales"
     ))
 
 
-def _daily_sale_invoice_reference_values(row: dict) -> set[str]:
+def _daily_sale_invoice_reference_values(row: dict) -> Set[str]:
     return {
         str(row.get(field)).strip()
         for field in (
@@ -10601,7 +10601,7 @@ def _daily_sale_invoice_reference_values(row: dict) -> set[str]:
     }
 
 
-def _invoice_reference_values(invoice: dict) -> set[str]:
+def _invoice_reference_values(invoice: dict) -> Set[str]:
     return {
         str(invoice.get(field)).strip()
         for field in ("id", "invoice_no", "invoice_number", "reference", "reference_number")
@@ -10609,7 +10609,7 @@ def _invoice_reference_values(invoice: dict) -> set[str]:
     }
 
 
-def _daily_sale_is_invoice_backed(row: dict, invoice_refs: set[str]) -> bool:
+def _daily_sale_is_invoice_backed(row: dict, invoice_refs: Set[str]) -> bool:
     source = str(row.get("source") or row.get("source_type") or "").strip().lower()
     if source in {"invoice", "billing", "bill", "pos"}:
         return True

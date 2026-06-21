@@ -20,7 +20,7 @@ import os
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Set, Tuple
 
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_environment(args: argparse.Namespace) -> tuple[str, str]:
+def configure_environment(args: argparse.Namespace) -> Tuple[str, str]:
     load_dotenv(REPO_ROOT / ".env")
     mongo_url = args.mongo_url or os.environ.get("MONGO_URL")
     db_name = args.db_name or os.environ.get("DB_NAME")
@@ -95,7 +95,7 @@ def amount_matches(value: Any) -> bool:
         return False
 
 
-def opening_metadata(row: dict[str, Any]) -> dict[str, Any]:
+def opening_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         key: json_safe(value)
         for key, value in row.items()
@@ -103,7 +103,7 @@ def opening_metadata(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def row_matches(row: dict[str, Any], requested_references: set[str]) -> list[str]:
+def row_matches(row: Dict[str, Any], requested_references: Set[str]) -> List[str]:
     reasons = []
     if amount_matches(row.get("amount")):
         reasons.append("amount=±92082")
@@ -130,10 +130,10 @@ def row_matches(row: dict[str, Any], requested_references: set[str]) -> list[str
 
 
 def diagnostic_row(
-    row: dict[str, Any],
-    distributor: dict[str, Any],
-    match_reasons: list[str],
-) -> dict[str, Any]:
+    row: Dict[str, Any],
+    distributor: Dict[str, Any],
+    match_reasons: List[str],
+) -> Dict[str, Any]:
     return {
         "match_reasons": match_reasons,
         "_id": json_safe(row.get("_id")),
@@ -165,7 +165,7 @@ def diagnostic_row(
     }
 
 
-def distributor_identity_values(distributor: dict[str, Any]) -> set[str]:
+def distributor_identity_values(distributor: Dict[str, Any]) -> Set[str]:
     return {
         normalized(distributor.get(field))
         for field in ("_id", "id", "distributor_id")
@@ -173,7 +173,7 @@ def distributor_identity_values(distributor: dict[str, Any]) -> set[str]:
     }
 
 
-def belongs_to_distributor(row: dict[str, Any], identities: set[str], names: set[str]) -> bool:
+def belongs_to_distributor(row: Dict[str, Any], identities: Set[str], names: Set[str]) -> bool:
     linked = {
         normalized(row.get(field))
         for field in ("distributor_id", "distributor", "distributorId")
@@ -192,8 +192,8 @@ def belongs_to_distributor(row: dict[str, Any], identities: set[str], names: set
 async def run_diagnostic(
     mongo_url: str,
     db_name: str,
-    requested_references: set[str],
-) -> dict[str, Any]:
+    requested_references: Set[str],
+) -> Dict[str, Any]:
     client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=15000)
     try:
         database = client[db_name]

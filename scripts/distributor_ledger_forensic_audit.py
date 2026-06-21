@@ -14,7 +14,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
@@ -66,7 +66,7 @@ def configure_environment(args: argparse.Namespace) -> None:
         )
 
 
-def row_label(row: dict[str, Any]) -> str:
+def row_label(row: Dict[str, Any]) -> str:
     return (
         f"source={row.get('source')} transaction_id={row.get('transaction_id')} "
         f"purchase_order_id={row.get('purchase_order_id')} amount={row.get('amount')} "
@@ -74,7 +74,7 @@ def row_label(row: dict[str, Any]) -> str:
     )
 
 
-def matching_focus_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
+def matching_focus_rows(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     distributor_name = str(report.get("distributor", {}).get("name") or "")
     needles = [needle.casefold() for needle in TARGET_INVOICES.get(distributor_name, [])]
     if not needles:
@@ -94,7 +94,7 @@ def matching_focus_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def render_summary(audit: dict[str, Any]) -> str:
+def render_summary(audit: Dict[str, Any]) -> str:
     lines = ["# Distributor Ledger Forensic Audit", ""]
     lines.append("This report is generated from the live database using backend ledger code, before any frontend caching or rendering.")
     lines.append("")
@@ -141,7 +141,7 @@ def render_summary(audit: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-async def run_audit() -> dict[str, Any]:
+async def run_audit() -> Dict[str, Any]:
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
 
