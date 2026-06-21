@@ -1911,23 +1911,36 @@ async def _send_signup_otp(method: str, identifier: str, otp: str) -> bool:
     return bool(await asyncio.to_thread(send_sms))
 
 
+def _set_update_metadata_no_cache_headers(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+
+
+def _log_update_metadata_check(label: str, metadata: dict, response: Response) -> None:
+    logger.info(
+        "%s: current_version=%s current_build=%s latest_version=%s latest_build=%s release_timestamp=%s update_available=%s cache_control=%s",
+        label,
+        metadata["current_version"],
+        metadata["current_build"],
+        metadata["latest_version"],
+        metadata["latest_build"],
+        metadata["release_timestamp"],
+        metadata["update_available"],
+        response.headers.get("Cache-Control"),
+    )
+
+
 @api_router.get("/version")
+@api_router.get("/version.json")
 async def version(
     response: Response,
     current_version: Optional[str] = Query(default=None),
     current_build: Optional[str] = Query(default=None),
 ):
-    response.headers["Cache-Control"] = "no-store"
+    _set_update_metadata_no_cache_headers(response)
     metadata = get_version_metadata(current_version=current_version, current_build=current_build)
-    logger.info(
-        "Version metadata check: current_version=%s current_build=%s latest_version=%s latest_build=%s update_available=%s cache_control=%s",
-        metadata["current_version"],
-        metadata["current_build"],
-        metadata["latest_version"],
-        metadata["latest_build"],
-        metadata["update_available"],
-        response.headers.get("Cache-Control"),
-    )
+    _log_update_metadata_check("Version metadata check", metadata, response)
     return metadata
 
 
@@ -1938,18 +1951,10 @@ async def check_updates(
     current_version: Optional[str] = Query(default=None),
     current_build: Optional[str] = Query(default=None),
 ):
-    response.headers["Cache-Control"] = "no-store"
+    _set_update_metadata_no_cache_headers(response)
     try:
         metadata = get_version_metadata(current_version=current_version, current_build=current_build)
-        logger.info(
-            "Update check: current_version=%s current_build=%s latest_version=%s latest_build=%s update_available=%s cache_control=%s",
-            metadata["current_version"],
-            metadata["current_build"],
-            metadata["latest_version"],
-            metadata["latest_build"],
-            metadata["update_available"],
-            response.headers.get("Cache-Control"),
-        )
+        _log_update_metadata_check("Update check", metadata, response)
         return {**metadata, "status": "ok"}
     except Exception as exc:
         reason = f"{type(exc).__name__}: {exc}"
