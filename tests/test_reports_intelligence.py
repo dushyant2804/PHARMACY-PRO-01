@@ -127,9 +127,9 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("server.db", fake_db):
             result = await dashboard_summary(user={})
-        self.assertEqual(result["purchase_return_summary"], {"count": 2, "total_quantity": 5.0, "total_value": 65.0})
+        self.assertEqual(result["purchase_return_summary"], {"return_records": 2, "units_returned": 5.0, "returned_value": 65.0})
 
-    async def test_outstanding_movement_uses_purchase_orders_when_ledger_purchase_missing(self):
+    async def test_outstanding_movement_ignores_purchase_orders_when_ledger_purchase_missing(self):
         db = SimpleNamespace(
             customers=Collection([]),
             distributors=Collection([{"id":"d1", "name":"D", "opening_balance":10, "created_at":"2026-05-01T00:00:00+00:00"}]),
@@ -146,7 +146,7 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
             result = await outstanding_report(user={})
         self.assertEqual(result["distributor_outstanding_movement"], [
             {"month":"2026-05", "purchases":0.0, "payments":0.0, "adjustments":0.0, "opening_distributor_payable":0.0, "closing_distributor_payable":10.0, "outstanding_payable":10.0, "net_movement":10.0, "outstanding_increase":10.0, "outstanding_decrease":0.0},
-            {"month":"2026-06", "purchases":100.0, "payments":25.0, "adjustments":5.0, "opening_distributor_payable":10.0, "closing_distributor_payable":80.0, "outstanding_payable":80.0, "net_movement":70.0, "outstanding_increase":70.0, "outstanding_decrease":0.0},
+            {"month":"2026-06", "purchases":0.0, "payments":25.0, "adjustments":5.0, "opening_distributor_payable":10.0, "closing_distributor_payable":0.0, "outstanding_payable":0.0, "net_movement":-10.0, "outstanding_increase":0.0, "outstanding_decrease":10.0},
         ])
 
     async def test_purchase_return_summary_uses_hardened_settlement(self):
