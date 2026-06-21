@@ -7985,6 +7985,34 @@ async def add_customer_sale(
 
     return txn
 
+
+
+async def _dashboard_purchase_return_summary(start: Optional[str] = None, end: Optional[str] = None) -> dict:
+    """Return compact dashboard purchase-return totals with count always present."""
+    summary = {"count": 0, "total_quantity": 0, "total_value": 0}
+    if not hasattr(db, "purchase_returns"):
+        return summary
+
+    query = _purchase_return_query(start=start, end=end)
+    returns = await db.purchase_returns.find(query, {"_id": 0}).to_list(10000)
+    for item in returns:
+        if _purchase_return_settlement_status(item) == "deleted":
+            continue
+        quantity = _safe_float(item.get("return_quantity"))
+        value = _safe_float(item.get("total_value"), None)
+        if value is None:
+            value = _money_float(_to_decimal(quantity) * _to_decimal(_safe_float(item.get("purchase_rate"))))
+        summary["count"] += 1
+        summary["total_quantity"] += quantity
+        summary["total_value"] += value
+
+    return {
+        "count": int(summary["count"]),
+        "total_quantity": round_qty(summary["total_quantity"]),
+        "total_value": _round_ledger_money(summary["total_value"]),
+    }
+
+
 # ---------------- Dashboard & Reports ----------------
 @api_router.get("/dashboard/summary")
 async def dashboard_summary(
@@ -8204,6 +8232,8 @@ async def dashboard_summary(
         for po in purchase_orders
     )
 
+    purchase_return_summary = await _dashboard_purchase_return_summary(start=start, end=end)
+
     patient_alerts = await _get_patient_alerts(today)
 
     return {
@@ -8262,6 +8292,8 @@ async def dashboard_summary(
         "patient_alerts": patient_alerts,
         "patient_due_alerts_count": len(patient_alerts),
         "patient_due_alerts": patient_alerts,
+
+        "purchase_return_summary": purchase_return_summary,
     }
     
 @api_router.get("/reports/sales")
@@ -8387,8 +8419,21 @@ def _outstanding_aging(transactions: list[dict], charge_types: set[str], credit_
             "urgency": "critical" if oldest > 90 else "high" if oldest > 60 else "medium" if oldest > 30 else "normal"}
 
 
-def _distributor_monthly_outstanding_movement(distributors: list[dict], distributor_txns: list[dict]) -> list[dict]:
-    """Build month-end distributor payable movement from Distributor Ledger rows only."""
+def _purchase_order_as_distributor_transaction(po: dict) -> dict:
+    row = dict(po)
+    row["type"] = "purchase"
+    row["amount"] = _safe_float(po.get("grand_total", po.get("total", po.get("amount", 0))))
+    row["transaction_date"] = po.get("po_date") or po.get("created_at") or po.get("date")
+    row.setdefault("created_at", po.get("created_at") or po.get("po_date"))
+    row.setdefault("purchase_order_id", po.get("id") or po.get("purchase_order_id"))
+    row.setdefault("source", "purchase_order")
+    row.setdefault("backend_row_source", "purchase_orders")
+    row.setdefault("is_synthetic", True)
+    return row
+
+
+def _distributor_monthly_outstanding_movement(distributors: list[dict], distributor_txns: list[dict], purchase_orders: list[dict] | None = None) -> list[dict]:
+    """Build month-end distributor payable movement from real distributor payable sources."""
     distributor_by_id = {str(d.get("id") or ""): d for d in distributors if isinstance(d, dict)}
     raw_txns_by_distributor = defaultdict(list)
     for txn in distributor_txns:
@@ -8396,10 +8441,16 @@ def _distributor_monthly_outstanding_movement(distributors: list[dict], distribu
             continue
         raw_txns_by_distributor[str(txn.get("distributor_id") or "")].append(txn)
 
+    purchase_orders_by_distributor = defaultdict(list)
+    for po in purchase_orders or []:
+        if not isinstance(po, dict):
+            continue
+        purchase_orders_by_distributor[str(po.get("distributor_id") or po.get("distributor") or "")].append(po)
+
     rows_by_month = defaultdict(lambda: {"purchases": 0.0, "payments": 0.0, "adjustments": 0.0})
     txns_by_month = defaultdict(list)
     running_balance_by_distributor = defaultdict(float)
-    distributor_ids = set(distributor_by_id) | set(raw_txns_by_distributor)
+    distributor_ids = set(distributor_by_id) | set(raw_txns_by_distributor) | set(purchase_orders_by_distributor)
 
     for distributor_id in sorted(distributor_ids):
         distributor = distributor_by_id.get(distributor_id, {"id": distributor_id})
@@ -8428,6 +8479,20 @@ def _distributor_monthly_outstanding_movement(distributors: list[dict], distribu
                             break
         else:
             ledger_txns = list(raw_distributor_txns)
+
+        existing_purchase_keys = {
+            key
+            for ledger_txn in ledger_txns
+            for key in _purchase_invoice_identity_keys(ledger_txn, distributor_id)
+        }
+        for po in purchase_orders_by_distributor.get(distributor_id, []):
+            po_txn = _purchase_order_as_distributor_transaction(po)
+            po_txn.setdefault("distributor_id", distributor_id)
+            po_keys = set(_purchase_invoice_identity_keys(po_txn, distributor_id))
+            if po_keys and po_keys & existing_purchase_keys:
+                continue
+            ledger_txns.append(po_txn)
+            existing_purchase_keys.update(po_keys)
 
         for txn in sorted(ledger_txns, key=_distributor_fifo_sort_key):
             month = _month_key(txn.get("transaction_date") or txn.get("date") or txn.get("created_at"))
@@ -8518,7 +8583,8 @@ async def outstanding_report(user: dict = Depends(get_current_user)):
             dist_out.append({"id": distributor["id"], "name": distributor["name"], "distributor": distributor["name"], "balance": _round_ledger_money(balance), "outstanding": _round_ledger_money(balance), "age": aging["oldest_due_days"], "aging_days": aging["oldest_due_days"], "last_purchase": last_purchase.isoformat() if last_purchase else None, **aging})
             for key, value in aging["buckets"].items(): distributor_aging[key] += value
     customer_total = sum(row["balance"] for row in cust_out); distributor_total = sum(row["balance"] for row in dist_out)
-    distributor_outstanding_movement = _distributor_monthly_outstanding_movement(distributors, distributor_txns)
+    purchase_orders = await db.purchase_orders.find({}, {"_id": 0}).to_list(10000) if hasattr(db, "purchase_orders") else []
+    distributor_outstanding_movement = _distributor_monthly_outstanding_movement(distributors, distributor_txns, purchase_orders)
     trends = [
         {
             "month": row["month"],
