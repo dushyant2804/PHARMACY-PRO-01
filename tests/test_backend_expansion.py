@@ -28,7 +28,7 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             set(response),
             {"current_version", "latest_version", "current_build", "latest_build",
-             "full_version", "update_available", "release_date", "release_notes"},
+             "full_version", "update_available", "release_date", "release_timestamp", "release_notes"},
         )
         self.assertEqual(response["latest_version"], APP_VERSION)
         self.assertEqual(response["current_version"], APP_VERSION)
@@ -39,9 +39,10 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(response["release_notes"].values()))
         self.assertFalse(response["update_available"])
         self.assertTrue(response["release_date"].endswith("Z"))
+        self.assertEqual(response["release_timestamp"], response["release_date"])
         self.assertRegex(response["latest_version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(response["full_version"], f"{response['latest_version']}+{response['latest_build']}")
-        self.assertEqual(http_response.headers["cache-control"], "no-store")
+        self.assertEqual(http_response.headers["cache-control"], "no-store, no-cache, must-revalidate, max-age=0")
 
     def test_version_config_supports_expected_update_types_and_returns_a_copy(self):
         from version_config import SUPPORTED_UPDATE_TYPES, VERSION_METADATA, get_version_metadata
@@ -51,7 +52,7 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         metadata["release_notes"]["fixed"].append("changed by caller")
         self.assertNotEqual(metadata["release_notes"], VERSION_METADATA["release_notes"])
 
-    def test_version_update_availability_ignores_build_only_changes_with_same_notes(self):
+    def test_version_update_availability_detects_build_only_deployments(self):
         from version_config import get_version_metadata
 
         old_release = get_version_metadata(current_version="3.1.0", current_build="20260611-stock-repair")
@@ -61,7 +62,7 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
             current_version=APP_VERSION,
             current_build="20260620-different",
         )
-        self.assertFalse(same_semantic_unknown_build["update_available"])
+        self.assertTrue(same_semantic_unknown_build["update_available"])
 
 
     async def test_update_check_logs_comparison_and_cache_control(self):
@@ -80,13 +81,38 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["current_version"], "3.1.0")
         self.assertEqual(response["latest_version"], APP_VERSION)
         self.assertTrue(response["update_available"])
-        self.assertEqual(http_response.headers["cache-control"], "no-store")
+        self.assertEqual(http_response.headers["cache-control"], "no-store, no-cache, must-revalidate, max-age=0")
         joined = "\n".join(logs.output)
         self.assertIn("Update check:", joined)
         self.assertIn("current_version=3.1.0", joined)
         self.assertIn(f"latest_version={APP_VERSION}", joined)
+        self.assertIn("release_timestamp=", joined)
         self.assertIn("update_available=True", joined)
-        self.assertIn("cache_control=no-store", joined)
+        self.assertIn("cache_control=no-store, no-cache, must-revalidate, max-age=0", joined)
+
+
+    def test_deployed_build_id_override_changes_returned_metadata(self):
+        from version_config import get_version_metadata
+
+        metadata = get_version_metadata(deployed_build_id="20260621-deploytest")
+
+        self.assertEqual(metadata["latest_build"], "20260621-deploytest")
+        self.assertEqual(metadata["full_version"], f"{metadata['latest_version']}+20260621-deploytest")
+        self.assertTrue(metadata["release_timestamp"].endswith("Z"))
+
+    async def test_version_json_endpoint_returns_deployed_metadata_without_cache(self):
+        from fastapi import Response
+        from server import version
+
+        http_response = Response()
+        response = await version(http_response)
+
+        self.assertEqual(response["latest_version"], APP_VERSION)
+        self.assertTrue(response["latest_build"])
+        self.assertTrue(response["release_timestamp"].endswith("Z"))
+        self.assertEqual(http_response.headers["cache-control"], "no-store, no-cache, must-revalidate, max-age=0")
+        self.assertEqual(http_response.headers["pragma"], "no-cache")
+        self.assertEqual(http_response.headers["expires"], "0")
 
     async def test_backup_health_uses_database_health_for_cloud_mode(self):
         import server
