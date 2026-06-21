@@ -63,6 +63,55 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(same_semantic_unknown_build["update_available"])
 
+
+    async def test_update_check_logs_comparison_and_cache_control(self):
+        from fastapi import Response
+        from server import check_updates
+
+        http_response = Response()
+        with self.assertLogs("pharmacy", level="INFO") as logs:
+            response = await check_updates(
+                http_response,
+                current_version="3.1.0",
+                current_build="20260611-stock-repair",
+            )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["current_version"], "3.1.0")
+        self.assertEqual(response["latest_version"], APP_VERSION)
+        self.assertTrue(response["update_available"])
+        self.assertEqual(http_response.headers["cache-control"], "no-store")
+        joined = "\n".join(logs.output)
+        self.assertIn("Update check:", joined)
+        self.assertIn("current_version=3.1.0", joined)
+        self.assertIn(f"latest_version={APP_VERSION}", joined)
+        self.assertIn("update_available=True", joined)
+        self.assertIn("cache_control=no-store", joined)
+
+    async def test_backup_health_uses_database_health_for_cloud_mode(self):
+        import server
+
+        class HealthyRawDb:
+            async def command(self, command):
+                self.command_seen = command
+                return {"ok": 1}
+
+            def __getattr__(self, name):
+                raise AssertionError(f"unexpected collection access: {name}")
+
+        original_raw_db = server.raw_db
+        original_local_mode = server.LOCAL_MODE
+        original_runtime_mode = server.RUNTIME_MODE
+        try:
+            server.raw_db = HealthyRawDb()
+            server.LOCAL_MODE = False
+            server.RUNTIME_MODE = "CLOUD_MODE"
+            self.assertTrue(await server._database_connected())
+        finally:
+            server.raw_db = original_raw_db
+            server.LOCAL_MODE = original_local_mode
+            server.RUNTIME_MODE = original_runtime_mode
+
     def test_old_and_new_business_settings_are_normalized_without_data_loss(self):
         from server import normalize_settings
 
