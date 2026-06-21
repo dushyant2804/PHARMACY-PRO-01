@@ -1817,6 +1817,7 @@ async def startup():
         backup_task = asyncio.create_task(_scheduled_local_backup_loop())
         _background_tasks.add(backup_task)
         backup_task.add_done_callback(_background_tasks.discard)
+        logger.info("Local PharmacyOS server running at http://localhost:8000")
 
 
 @app.on_event("shutdown")
@@ -9053,6 +9054,28 @@ async def _database_connected() -> bool:
         return False
 
 
+async def _server_health_payload() -> dict:
+    database_connected = await _database_connected()
+    return {
+        "status": "ok" if database_connected else "degraded",
+        "runtime_mode": RUNTIME_MODE,
+        "local_mode": LOCAL_MODE,
+        "local_backend_running": True,
+        "local_database_connected": database_connected,
+        "local_database_path": str(LOCAL_DB_PATH) if LOCAL_MODE else None,
+    }
+
+
+@app.get("/health")
+async def health():
+    return await _server_health_payload()
+
+
+@api_router.get("/health")
+async def api_health():
+    return await _server_health_payload()
+
+
 async def _internet_available() -> bool:
     if LOCAL_MODE and not mongo_url:
         return False
@@ -9381,6 +9404,7 @@ async def backup_manual(user: dict = Depends(require_role("admin"))):
 
 
 @api_router.get("/backup/health")
+@api_router.get("/backup/status")
 async def backup_health(user: dict = Depends(get_current_user)):
     last_local = await _last_backup_metadata()
     atlas_status = await _last_destination_status("atlas")
@@ -11051,7 +11075,13 @@ async def rebuild_inventory():
 app.add_middleware(
     CORSMiddleware,
      allow_origins=[
-         "https://pharmacy-pro-01-frontend.onrender.com"
+         "https://pharmacy-pro-01-frontend.onrender.com",
+         "http://localhost:3000",
+         "http://127.0.0.1:3000",
+         "http://localhost:5173",
+         "http://127.0.0.1:5173",
+         "http://localhost:8000",
+         "http://127.0.0.1:8000",
      ],
     allow_credentials=True,
     allow_methods=["*"],

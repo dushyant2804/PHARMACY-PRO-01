@@ -39,6 +39,8 @@ PharmacyOS supports two runtime modes without changing existing API contracts:
 
 Local mode stores JSON documents in SQLite through a Mongo-like adapter so the existing routes, fields, calculations, invoices, ledgers, reports, auth, and settings continue to call the same collection methods. Cloud mode still uses Motor/MongoDB unchanged.
 
+When the local backend is running on the default port, the frontend health check should target `http://localhost:8000/api/health`. The root health alias `GET /health` returns the same local server status for compatibility, and startup logs include `Local PharmacyOS server running at http://localhost:8000`.
+
 ### Backup and sync safety
 
 Local mode writes timestamped JSON backups locally first, then attempts non-destructive cloud backups to MongoDB Atlas and Google Drive. Cloud mode remains unchanged.
@@ -49,6 +51,7 @@ Local mode writes timestamped JSON backups locally first, then attempts non-dest
 - App shutdown creates an exit backup when local mode is active.
 - A scheduled backup runs every 30 minutes while the backend is open.
 - `GET /api/backup/health` reports local, Atlas, and Google Drive status, last successful timestamps, and pending queue counts.
+- `GET /api/backup/status` is a compatibility alias for `GET /api/backup/health`.
 - `POST /api/backup/sync/retry` retries pending Atlas and Google Drive queue entries.
 - `POST /api/backup/google-drive/device-login` starts Google OAuth device-code login for a local Windows desktop, and `POST /api/backup/google-drive/device-token` stores the resulting token locally.
 

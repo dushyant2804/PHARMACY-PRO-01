@@ -1,4 +1,5 @@
 import os
+import asyncio
 import unittest
 
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
@@ -137,6 +138,28 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
             server.raw_db = original_raw_db
             server.LOCAL_MODE = original_local_mode
             server.RUNTIME_MODE = original_runtime_mode
+
+    def test_local_health_routes_match_frontend_expectation_without_auth(self):
+        import server
+
+        original_database_connected = server._database_connected
+
+        async def healthy_database():
+            return True
+
+        try:
+            server._database_connected = healthy_database
+            payload = asyncio.run(server.api_health())
+            self.assertEqual(payload["status"], "ok")
+            self.assertTrue(payload["local_backend_running"])
+
+            route_paths = {route.path for route in server.app.routes}
+            self.assertIn("/health", route_paths)
+            self.assertIn("/api/health", route_paths)
+            self.assertIn("/api/backup/health", route_paths)
+            self.assertIn("/api/backup/status", route_paths)
+        finally:
+            server._database_connected = original_database_connected
 
     def test_old_and_new_business_settings_are_normalized_without_data_loss(self):
         from server import normalize_settings
