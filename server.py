@@ -1918,7 +1918,17 @@ async def version(
     current_build: Optional[str] = Query(default=None),
 ):
     response.headers["Cache-Control"] = "no-store"
-    return get_version_metadata(current_version=current_version, current_build=current_build)
+    metadata = get_version_metadata(current_version=current_version, current_build=current_build)
+    logger.info(
+        "Version metadata check: current_version=%s current_build=%s latest_version=%s latest_build=%s update_available=%s cache_control=%s",
+        metadata["current_version"],
+        metadata["current_build"],
+        metadata["latest_version"],
+        metadata["latest_build"],
+        metadata["update_available"],
+        response.headers.get("Cache-Control"),
+    )
+    return metadata
 
 
 @api_router.get("/updates/check")
@@ -1931,6 +1941,15 @@ async def check_updates(
     response.headers["Cache-Control"] = "no-store"
     try:
         metadata = get_version_metadata(current_version=current_version, current_build=current_build)
+        logger.info(
+            "Update check: current_version=%s current_build=%s latest_version=%s latest_build=%s update_available=%s cache_control=%s",
+            metadata["current_version"],
+            metadata["current_build"],
+            metadata["latest_version"],
+            metadata["latest_build"],
+            metadata["update_available"],
+            response.headers.get("Cache-Control"),
+        )
         return {**metadata, "status": "ok"}
     except Exception as exc:
         reason = f"{type(exc).__name__}: {exc}"
@@ -9014,6 +9033,21 @@ async def report_analytics_section(report_name: Literal["monthly-sales-trend", "
 
 
 # ---------------- Local-first health, backup, and migration helpers ----------------
+async def _database_connected() -> bool:
+    if LOCAL_MODE:
+        try:
+            return LOCAL_DB_PATH.exists() and raw_db.conn.execute("SELECT 1").fetchone()[0] == 1
+        except Exception:
+            logger.exception("Local database health check failed")
+            return False
+    try:
+        await raw_db.command("ping")
+        return True
+    except Exception:
+        logger.exception("Cloud database health check failed")
+        return False
+
+
 async def _internet_available() -> bool:
     if LOCAL_MODE and not mongo_url:
         return False
@@ -9349,7 +9383,7 @@ async def backup_health(user: dict = Depends(get_current_user)):
     return {
         "runtime_mode": RUNTIME_MODE,
         "local_backend_running": True,
-        "local_database_connected": LOCAL_MODE and LOCAL_DB_PATH.exists(),
+        "local_database_connected": await _database_connected(),
         "local_database_path": str(LOCAL_DB_PATH) if LOCAL_MODE else None,
         "local_backup_status": "ok" if last_local else "never_run",
         "atlas_backup_status": atlas_status.get("status", "pending"),
