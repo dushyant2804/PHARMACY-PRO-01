@@ -20,12 +20,14 @@ import csv
 import io
 import base64
 import urllib.request
+import urllib.parse
+import zipfile
 from contextvars import ContextVar
 from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta, date
 from calendar import monthrange
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Any
 from collections import Counter, defaultdict
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query
@@ -58,6 +60,12 @@ LOCAL_DB_PATH = Path(os.environ.get("LOCAL_DB_PATH", ROOT_DIR / "local_data" / "
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", ROOT_DIR / "backups")).resolve()
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 SYNC_QUEUE_COLLECTION = "sync_queue"
+ATLAS_BACKUP_MONGO_URL = os.environ.get("ATLAS_BACKUP_MONGO_URL", "")
+ATLAS_BACKUP_DB_NAME = os.environ.get("ATLAS_BACKUP_DB_NAME", os.environ.get("DB_NAME", "pharmacyos_local_backups"))
+GOOGLE_DRIVE_CLIENT_ID = os.environ.get("GOOGLE_DRIVE_CLIENT_ID", "")
+GOOGLE_DRIVE_CLIENT_SECRET = os.environ.get("GOOGLE_DRIVE_CLIENT_SECRET", "")
+GOOGLE_DRIVE_TOKEN_PATH = Path(os.environ.get("GOOGLE_DRIVE_TOKEN_PATH", ROOT_DIR / "local_data" / "google_drive_token.json"))
+BACKUP_ENCRYPTION_KEY = os.environ.get("BACKUP_ENCRYPTION_KEY", os.environ.get("JWT_SECRET", ""))
 BACKUP_COLLECTIONS = [
     "medicines", "invoices", "purchase_orders", "distributors", "customers",
     "customer_transactions", "distributor_transactions", "purchase_returns",
@@ -1814,7 +1822,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     if LOCAL_MODE:
-        await _create_local_backup("app_exit")
+        await _create_and_sync_backup("app_exit")
     if client is not None:
         client.close()
 
@@ -9048,16 +9056,53 @@ async def _backup_payload() -> dict:
     }
 
 
-async def _enqueue_cloud_sync(reason: str, backup_file: str | None = None) -> None:
+async def _queue_backup_destination(destination: str, reason: str, backup_file: str | None = None, checksum: str | None = None) -> None:
     await raw_db[SYNC_QUEUE_COLLECTION].insert_one({
         "id": str(uuid.uuid4()),
-        "type": "cloud_backup",
+        "type": f"{destination}_backup",
+        "destination": destination,
         "reason": reason,
         "backup_file": backup_file,
+        "backup_sha256": checksum,
         "status": "pending",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "attempts": 0,
     })
+
+
+async def _enqueue_cloud_sync(reason: str, backup_file: str | None = None, checksum: str | None = None) -> None:
+    await _queue_backup_destination("atlas", reason, backup_file, checksum)
+    await _queue_backup_destination("google_drive", reason, backup_file, checksum)
+
+
+def _backup_record_id(checksum: str, reason: str) -> str:
+    return hashlib.sha256(f"{checksum}:{reason}".encode("utf-8")).hexdigest()
+
+
+def _derive_backup_key() -> bytes:
+    seed = (BACKUP_ENCRYPTION_KEY or "pharmacyos-local-backup").encode("utf-8")
+    return hashlib.sha256(seed).digest()
+
+
+def _xor_crypt(data: bytes) -> bytes:
+    key = _derive_backup_key()
+    return bytes(byte ^ key[index % len(key)] for index, byte in enumerate(data))
+
+
+def _write_encrypted_backup_package(json_backup: Path, checksum: str, reason: str, timestamp: str) -> Path:
+    package = json_backup.with_suffix(".zip")
+    metadata = {
+        "reason": reason,
+        "created_at": timestamp,
+        "source_backup_file": str(json_backup),
+        "source_sha256": checksum,
+        "encryption": "sha256-derived-xor" if BACKUP_ENCRYPTION_KEY else "not_encrypted_set_BACKUP_ENCRYPTION_KEY",
+    }
+    encrypted_bytes = _xor_crypt(json_backup.read_bytes()) if BACKUP_ENCRYPTION_KEY else json_backup.read_bytes()
+    with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(json_backup.name + (".enc" if BACKUP_ENCRYPTION_KEY else ""), encrypted_bytes)
+        zf.writestr("backup_metadata.json", json.dumps(metadata, indent=2))
+    return package
 
 
 async def _create_local_backup(reason: str = "manual") -> dict:
@@ -9069,22 +9114,161 @@ async def _create_local_backup(reason: str = "manual") -> dict:
         raise RuntimeError(f"Backup integrity check failed for {backup_file}")
     file_size = backup_file.stat().st_size
     checksum = _file_sha256(backup_file)
+    package_file = _write_encrypted_backup_package(backup_file, checksum, reason, payload["exported_at"])
     await raw_db.backup_metadata.insert_one({
         "id": str(uuid.uuid4()), "reason": reason, "file": str(backup_file),
+        "package_file": str(package_file),
         "created_at": payload["exported_at"], "timestamp": payload["exported_at"],
-        "sha256": checksum, "size": file_size,
+        "sha256": checksum, "package_sha256": _file_sha256(package_file), "size": file_size,
         "collection_counts": {k: len(v) for k, v in payload["collections"].items()},
         "upload_file_count": len(payload.get("uploads", [])),
     })
-    await _enqueue_cloud_sync(reason, str(backup_file))
-    return {"ok": True, "backup_file": str(backup_file), "sha256": checksum, "size": file_size, "timestamp": payload["exported_at"], "queued_for_cloud_sync": True, "collection_counts": {k: len(v) for k, v in payload["collections"].items()}, "upload_file_count": len(payload.get("uploads", []))}
+    await _enqueue_cloud_sync(reason, str(backup_file), checksum)
+    return {"ok": True, "backup_file": str(backup_file), "package_file": str(package_file), "sha256": checksum, "size": file_size, "timestamp": payload["exported_at"], "queued_for_cloud_sync": True, "collection_counts": {k: len(v) for k, v in payload["collections"].items()}, "upload_file_count": len(payload.get("uploads", []))}
+
+
+def _mark_queue_failed_fields(exc: Exception) -> dict:
+    return {"status": "pending", "last_error": str(exc), "last_attempt_at": datetime.now(timezone.utc).isoformat()}
+
+
+async def _upload_backup_to_atlas(backup_file: str, reason: str = "manual", queue_id: str | None = None) -> dict:
+    if not ATLAS_BACKUP_MONGO_URL:
+        raise RuntimeError("ATLAS_BACKUP_MONGO_URL is not configured")
+    path, payload, checksum, file_size = _load_backup_file_for_restore(backup_file)
+    record_id = _backup_record_id(checksum, reason)
+    atlas_client = AsyncIOMotorClient(ATLAS_BACKUP_MONGO_URL, serverSelectionTimeoutMS=5000)
+    try:
+        await atlas_client.admin.command("ping")
+        atlas_db = atlas_client[ATLAS_BACKUP_DB_NAME]
+        existing = await atlas_db.local_backup_snapshots.find_one({"id": record_id}, {"_id": 0})
+        if existing:
+            status = "already_uploaded"
+        else:
+            await atlas_db.local_backup_snapshots.insert_one({
+                "id": record_id, "reason": reason, "created_at": datetime.now(timezone.utc).isoformat(),
+                "source_exported_at": payload.get("exported_at"), "sha256": checksum, "size": file_size,
+                "mode": payload.get("mode"), "collection_counts": {k: len(v) for k, v in payload.get("collections", {}).items()},
+                "upload_file_count": len(payload.get("uploads", [])), "payload": payload,
+            })
+            status = "uploaded"
+        await raw_db.backup_status.update_one({"id": "atlas"}, {"$set": {"id": "atlas", "status": status, "last_successful_atlas_backup": datetime.now(timezone.utc).isoformat(), "last_backup_file": str(path), "last_sha256": checksum}}, upsert=True)
+        return {"ok": True, "status": status, "record_id": record_id, "sha256": checksum}
+    finally:
+        atlas_client.close()
+
+
+def _load_google_token() -> dict | None:
+    if GOOGLE_DRIVE_TOKEN_PATH.exists():
+        try:
+            return json.loads(GOOGLE_DRIVE_TOKEN_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+def _save_google_token(token: dict) -> None:
+    GOOGLE_DRIVE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GOOGLE_DRIVE_TOKEN_PATH.write_text(json.dumps(token, indent=2), encoding="utf-8")
+    try:
+        GOOGLE_DRIVE_TOKEN_PATH.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _google_api_request(url: str, token: str | None = None, data: bytes | None = None, headers: dict | None = None, method: str | None = None) -> dict:
+    req_headers = dict(headers or {})
+    if token:
+        req_headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body) if body else {}
+
+
+async def _google_access_token() -> str:
+    token = _load_google_token()
+    if not token:
+        raise RuntimeError("Google Drive is not authenticated. Configure GOOGLE_DRIVE_TOKEN_PATH with OAuth device-code token.")
+    expires_at = float(token.get("expires_at", 0))
+    if token.get("access_token") and expires_at > datetime.now(timezone.utc).timestamp() + 60:
+        return token["access_token"]
+    if not token.get("refresh_token") or not GOOGLE_DRIVE_CLIENT_ID:
+        raise RuntimeError("Google Drive token is expired and cannot be refreshed")
+    form = urllib.parse.urlencode({"client_id": GOOGLE_DRIVE_CLIENT_ID, "client_secret": GOOGLE_DRIVE_CLIENT_SECRET, "refresh_token": token["refresh_token"], "grant_type": "refresh_token"}).encode()
+    refreshed = await asyncio.to_thread(_google_api_request, "https://oauth2.googleapis.com/token", None, form, {"Content-Type": "application/x-www-form-urlencoded"}, "POST")
+    token.update(refreshed)
+    token["expires_at"] = datetime.now(timezone.utc).timestamp() + int(refreshed.get("expires_in", 3600))
+    _save_google_token(token)
+    return token["access_token"]
+
+
+async def _upload_backup_to_google_drive(backup_file: str, reason: str = "manual", queue_id: str | None = None) -> dict:
+    path = Path(backup_file).expanduser().resolve()
+    if not path.exists():
+        raise RuntimeError("Backup file not found for Google Drive upload")
+    metadata = await _last_backup_metadata() or {}
+    package = Path(metadata.get("package_file") or _write_encrypted_backup_package(path, _file_sha256(path), reason, datetime.now(timezone.utc).isoformat()))
+    access_token = await _google_access_token()
+    folder_query = urllib.parse.quote("name='PharmacyOS' and mimeType='application/vnd.google-apps.folder' and trashed=false")
+    found = await asyncio.to_thread(_google_api_request, f"https://www.googleapis.com/drive/v3/files?q={folder_query}&fields=files(id,name)", access_token)
+    files = found.get("files", [])
+    if files:
+        folder_id = files[0]["id"]
+    else:
+        folder = await asyncio.to_thread(_google_api_request, "https://www.googleapis.com/drive/v3/files", access_token, json.dumps({"name": "PharmacyOS", "mimeType": "application/vnd.google-apps.folder"}).encode(), {"Content-Type": "application/json"}, "POST")
+        folder_id = folder["id"]
+    boundary = "pharmacyosbackup"
+    meta = {"name": package.name, "parents": [folder_id], "description": f"PharmacyOS {reason} backup sha256={_file_sha256(package)}"}
+    body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(meta)}\r\n--{boundary}\r\nContent-Type: application/zip\r\n\r\n").encode() + package.read_bytes() + f"\r\n--{boundary}--".encode()
+    uploaded = await asyncio.to_thread(_google_api_request, "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink", access_token, body, {"Content-Type": f"multipart/related; boundary={boundary}"}, "POST")
+    await raw_db.backup_status.update_one({"id": "google_drive"}, {"$set": {"id": "google_drive", "status": "uploaded", "last_successful_google_drive_backup": datetime.now(timezone.utc).isoformat(), "last_backup_file": str(path), "last_drive_file_id": uploaded.get("id")}}, upsert=True)
+    return {"ok": True, "status": "uploaded", "drive_file_id": uploaded.get("id"), "drive_file_name": uploaded.get("name")}
+
+
+async def _process_pending_backup_queue(destination: str | None = None) -> dict:
+    query: dict[str, Any] = {"status": "pending"}
+    if destination:
+        query["destination"] = destination
+    rows = await raw_db[SYNC_QUEUE_COLLECTION].find(query, {"_id": 0}).sort("created_at", 1).to_list(100)
+    result = {"attempted": 0, "succeeded": 0, "failed": 0, "errors": []}
+    for row in rows:
+        result["attempted"] += 1
+        dest = row.get("destination") or ("atlas" if row.get("type") == "cloud_backup" else row.get("type", "").replace("_backup", ""))
+        try:
+            if dest == "atlas":
+                upload = await _upload_backup_to_atlas(row["backup_file"], row.get("reason", "queued"), row.get("id"))
+            elif dest == "google_drive":
+                upload = await _upload_backup_to_google_drive(row["backup_file"], row.get("reason", "queued"), row.get("id"))
+            else:
+                continue
+            await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row["id"]}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat(), "result": upload}, "$inc": {"attempts": 1}})
+            result["succeeded"] += 1
+        except Exception as exc:
+            await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row["id"]}, {"$set": _mark_queue_failed_fields(exc), "$inc": {"attempts": 1}})
+            result["failed"] += 1
+            result["errors"].append({"id": row.get("id"), "destination": dest, "error": str(exc)})
+    return result
+
+
+async def _create_and_sync_backup(reason: str) -> dict:
+    backup = await _create_local_backup(reason)
+    sync = await _process_pending_backup_queue()
+    return {**backup, "atlas_backup_status": _destination_status(sync, "atlas"), "google_drive_backup_status": _destination_status(sync, "google_drive"), "sync": sync}
+
+
+def _destination_status(sync: dict, destination: str) -> str:
+    if sync.get("succeeded") and not sync.get("failed"):
+        return "uploaded"
+    if sync.get("failed"):
+        return "pending"
+    return "pending"
 
 
 async def _scheduled_local_backup_loop() -> None:
     while True:
         await asyncio.sleep(30 * 60)
         try:
-            await _create_local_backup("scheduled_30m")
+            await _create_and_sync_backup("scheduled_30m")
         except Exception:
             logger.exception("Scheduled local backup failed")
 
@@ -9094,8 +9278,16 @@ async def _last_backup_metadata() -> Optional[dict]:
     return items[0] if items else None
 
 
-async def _pending_backup_count() -> int:
-    return await raw_db[SYNC_QUEUE_COLLECTION].count_documents({"status": "pending"})
+async def _pending_backup_count(destination: str | None = None) -> int:
+    query = {"status": "pending"}
+    if destination:
+        query["destination"] = destination
+    return await raw_db[SYNC_QUEUE_COLLECTION].count_documents(query)
+
+
+async def _last_destination_status(destination: str) -> dict:
+    row = await raw_db.backup_status.find_one({"id": destination}, {"_id": 0})
+    return row or {"id": destination, "status": "not_configured" if destination == "atlas" and not ATLAS_BACKUP_MONGO_URL else "pending"}
 
 
 async def _verify_import_counts(payload: dict) -> dict:
@@ -9146,30 +9338,79 @@ async def backup_export(user: dict = Depends(require_role("admin"))):
 
 @api_router.post("/backup/manual")
 async def backup_manual(user: dict = Depends(require_role("admin"))):
-    return await _create_local_backup("manual")
+    return await _create_and_sync_backup("manual")
 
 
 @api_router.get("/backup/health")
 async def backup_health(user: dict = Depends(get_current_user)):
+    last_local = await _last_backup_metadata()
+    atlas_status = await _last_destination_status("atlas")
+    google_status = await _last_destination_status("google_drive")
     return {
         "runtime_mode": RUNTIME_MODE,
         "local_backend_running": True,
         "local_database_connected": LOCAL_MODE and LOCAL_DB_PATH.exists(),
         "local_database_path": str(LOCAL_DB_PATH) if LOCAL_MODE else None,
-        "last_backup": await _last_backup_metadata(),
+        "local_backup_status": "ok" if last_local else "never_run",
+        "atlas_backup_status": atlas_status.get("status", "pending"),
+        "google_drive_backup_status": google_status.get("status", "pending"),
+        "last_local_backup_at": (last_local or {}).get("created_at"),
+        "last_atlas_backup_at": atlas_status.get("last_successful_atlas_backup"),
+        "last_google_drive_backup_at": google_status.get("last_successful_google_drive_backup"),
+        "pending_atlas_sync_count": await _pending_backup_count("atlas"),
+        "pending_google_drive_upload_count": await _pending_backup_count("google_drive"),
+        "last_backup": last_local,
         "pending_backup_count": await _pending_backup_count(),
         "cloud_sync_status": "online" if await _internet_available() else "queued_offline",
     }
 
 
+@api_router.post("/backup/exit")
+async def backup_exit(user: dict = Depends(require_role("admin"))):
+    return await _create_and_sync_backup("app_exit")
+
+
+
+@api_router.post("/backup/google-drive/device-login")
+async def google_drive_device_login(user: dict = Depends(require_role("admin"))):
+    if not GOOGLE_DRIVE_CLIENT_ID:
+        raise HTTPException(status_code=400, detail="GOOGLE_DRIVE_CLIENT_ID is not configured")
+    form = urllib.parse.urlencode({
+        "client_id": GOOGLE_DRIVE_CLIENT_ID,
+        "scope": "https://www.googleapis.com/auth/drive.file",
+    }).encode()
+    data = await asyncio.to_thread(_google_api_request, "https://oauth2.googleapis.com/device/code", None, form, {"Content-Type": "application/x-www-form-urlencoded"}, "POST")
+    _save_google_token({"device_code": data.get("device_code"), "created_at": datetime.now(timezone.utc).isoformat()})
+    return {"verification_url": data.get("verification_url") or data.get("verification_uri"), "user_code": data.get("user_code"), "expires_in": data.get("expires_in"), "interval": data.get("interval", 5)}
+
+
+@api_router.post("/backup/google-drive/device-token")
+async def google_drive_device_token(user: dict = Depends(require_role("admin"))):
+    token = _load_google_token() or {}
+    if not token.get("device_code"):
+        raise HTTPException(status_code=400, detail="Start device login first")
+    form = urllib.parse.urlencode({
+        "client_id": GOOGLE_DRIVE_CLIENT_ID,
+        "client_secret": GOOGLE_DRIVE_CLIENT_SECRET,
+        "device_code": token["device_code"],
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    }).encode()
+    try:
+        data = await asyncio.to_thread(_google_api_request, "https://oauth2.googleapis.com/token", None, form, {"Content-Type": "application/x-www-form-urlencoded"}, "POST")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Google device authorization is not complete: {exc}")
+    data["expires_at"] = datetime.now(timezone.utc).timestamp() + int(data.get("expires_in", 3600))
+    _save_google_token(data)
+    return {"ok": True, "token_path": str(GOOGLE_DRIVE_TOKEN_PATH)}
+
 @api_router.post("/backup/sync/retry")
-async def backup_sync_retry(dry_run: bool = Query(True), confirm: bool = Query(False), user: dict = Depends(require_role("admin"))):
+async def backup_sync_retry(dry_run: bool = Query(False), confirm: bool = Query(True), user: dict = Depends(require_role("admin"))):
     online = await _internet_available()
     pending = await _pending_backup_count()
-    if dry_run or not confirm:
-        return {"cloud_available": online, "pending_backup_count": pending, "dry_run": True, "requires_confirm": True, "message": "Cloud sync is verification-only by default and never overwrites newer cloud data blindly."}
-    return {"cloud_available": online, "pending_backup_count": pending, "dry_run": False, "synced": 0, "message": "No destructive cloud write was performed; implement conflict-reviewed upload after comparing cloud timestamps."}
-
+    if dry_run:
+        return {"cloud_available": online, "pending_backup_count": pending, "dry_run": True, "requires_confirm": False, "message": "Pending backups are timestamped inserts and never overwrite existing cloud data."}
+    sync = await _process_pending_backup_queue()
+    return {"cloud_available": online, "pending_backup_count": pending, "dry_run": False, **sync}
 
 @api_router.post("/backup/restore")
 async def backup_restore(payload: dict, dry_run: bool = Query(True), confirm: bool = Query(False), user: dict = Depends(require_role("admin"))):
@@ -10424,7 +10665,7 @@ async def create_daily_closing(
     })
     await db.daily_closings.insert_one(closing)
     if LOCAL_MODE:
-        asyncio.create_task(_create_local_backup("daily_closing"))
+        asyncio.create_task(_create_and_sync_backup("daily_closing"))
     return _daily_closing_public(closing)
 
 

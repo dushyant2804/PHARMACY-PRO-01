@@ -41,14 +41,18 @@ Local mode stores JSON documents in SQLite through a Mongo-like adapter so the e
 
 ### Backup and sync safety
 
-Local mode writes timestamped JSON backups and queues cloud-sync work instead of overwriting cloud data blindly:
+Local mode writes timestamped JSON backups locally first, then attempts non-destructive cloud backups to MongoDB Atlas and Google Drive. Cloud mode remains unchanged.
 
-- `POST /api/backup/manual` creates a manual backup.
-- Creating a Daily Closing triggers a background backup.
+- `POST /api/backup/manual` creates a manual backup and attempts Atlas plus Google Drive upload.
+- `POST /api/backup/exit` creates an app-exit backup and attempts Atlas plus Google Drive upload.
+- Creating a Daily Closing triggers a background local backup and cloud upload attempt.
 - App shutdown creates an exit backup when local mode is active.
 - A scheduled backup runs every 30 minutes while the backend is open.
-- `GET /api/backup/health` reports local backend/database status, last backup, pending backup count, and cloud reachability.
-- `POST /api/backup/sync/retry` performs a safe dry-run queue check; destructive cloud restore remains intentionally manual.
+- `GET /api/backup/health` reports local, Atlas, and Google Drive status, last successful timestamps, and pending queue counts.
+- `POST /api/backup/sync/retry` retries pending Atlas and Google Drive queue entries.
+- `POST /api/backup/google-drive/device-login` starts Google OAuth device-code login for a local Windows desktop, and `POST /api/backup/google-drive/device-token` stores the resulting token locally.
+
+Atlas backup uses `ATLAS_BACKUP_MONGO_URL` and stores timestamped records in `local_backup_snapshots` without replacing existing snapshots. Google Drive backup uses `GOOGLE_DRIVE_CLIENT_ID`, optional `GOOGLE_DRIVE_CLIENT_SECRET`, and `GOOGLE_DRIVE_TOKEN_PATH`; uploaded backup packages go into a `PharmacyOS` Drive folder. Set `BACKUP_ENCRYPTION_KEY` to encrypt the packaged JSON backup before Drive upload. Failed Atlas or Google Drive uploads remain queued locally and are retried by scheduled/manual/exit backup flows or `/api/backup/sync/retry`.
 
 ### Migration/export flow
 
@@ -64,4 +68,4 @@ Every local backup is checked immediately after creation: the backend verifies t
 
 `POST /api/backup/restore` is dry-run by default. It validates the backup path, JSON structure, optional `expected_sha256`, collection counts, and upload checksums before any data is changed. A confirmed restore (`dry_run=false&confirm=true`) first creates a `pre_restore` backup of the active local database, then restores supported collections and upload files.
 
-Cloud sync retry remains dry-run unless explicitly confirmed and is intentionally non-destructive: the endpoint reports pending queue state and refuses blind overwrite semantics so newer cloud data cannot be replaced without a future conflict-reviewed sync implementation.
+Cloud sync retry is intentionally non-destructive: retry inserts timestamped backup records/files only, marks successful queue items complete, and keeps failed Atlas or Google Drive uploads pending for the next retry.
