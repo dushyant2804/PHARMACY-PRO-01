@@ -18,6 +18,7 @@ import smtplib
 import json
 import csv
 import io
+import base64
 import urllib.request
 from contextvars import ContextVar
 from email.message import EmailMessage
@@ -37,6 +38,7 @@ from starlette.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
+from local_database import LocalSQLiteDatabase
 from bson import BSON
 from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator, model_validator
 from starlette.datastructures import UploadFile
@@ -44,10 +46,36 @@ from starlette.datastructures import UploadFile
 from version_config import VERSION_METADATA, get_version_metadata
 
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-raw_db = client[os.environ['DB_NAME']]
+# Runtime database mode
+# CLOUD_MODE preserves the existing Render + MongoDB Atlas behavior.
+# LOCAL_MODE uses a SQLite-backed local adapter that exposes the same async
+# collection methods used by the existing API routes, so route contracts and
+# business logic remain unchanged.
+RUNTIME_MODE = os.environ.get("PHARMACYOS_MODE", os.environ.get("RUNTIME_MODE", "CLOUD_MODE")).upper()
+LOCAL_MODE = RUNTIME_MODE == "LOCAL_MODE"
+CLOUD_MODE = not LOCAL_MODE
+LOCAL_DB_PATH = Path(os.environ.get("LOCAL_DB_PATH", ROOT_DIR / "local_data" / "pharmacyos.sqlite3"))
+BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", ROOT_DIR / "backups")).resolve()
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+SYNC_QUEUE_COLLECTION = "sync_queue"
+BACKUP_COLLECTIONS = [
+    "medicines", "invoices", "purchase_orders", "distributors", "customers",
+    "customer_transactions", "distributor_transactions", "purchase_returns",
+    "stock_adjustments", "daily_closings", "daily_sales", "expenses",
+    "regular_patients", "settings",
+]
+
+if LOCAL_MODE:
+    mongo_url = os.environ.get("MONGO_URL", "")
+    client = None
+    try:
+        raw_db = LocalSQLiteDatabase(LOCAL_DB_PATH)
+    except Exception as exc:
+        raise RuntimeError(f"LOCAL_MODE database could not be opened at {LOCAL_DB_PATH}: {exc}") from exc
+else:
+    mongo_url = os.environ['MONGO_URL']
+    client = AsyncIOMotorClient(mongo_url)
+    raw_db = client[os.environ['DB_NAME']]
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", ROOT_DIR / "uploads")).resolve()
 BRANDING_UPLOAD_DIR = UPLOAD_DIR / "branding"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1777,11 +1805,18 @@ async def startup():
     task = asyncio.create_task(_run_startup_purchase_return_stock_recalculation())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    if LOCAL_MODE:
+        backup_task = asyncio.create_task(_scheduled_local_backup_loop())
+        _background_tasks.add(backup_task)
+        backup_task.add_done_callback(_background_tasks.discard)
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    client.close()
+    if LOCAL_MODE:
+        await _create_local_backup("app_exit")
+    if client is not None:
+        client.close()
 
 
 # ---------------- Auth routes ----------------
@@ -3768,6 +3803,8 @@ def _is_transaction_unsupported(exc: Exception) -> bool:
 
 
 async def _run_with_transaction(operation, fallback):
+    if client is None:
+        return await fallback()
     try:
         async with await client.start_session() as session:
             async with session.start_transaction():
@@ -8967,35 +9004,219 @@ async def report_analytics_section(report_name: Literal["monthly-sales-trend", "
     return {"data": (await _analytics_snapshot(months, limit))[key]}
 
 
+
+# ---------------- Local-first health, backup, and migration helpers ----------------
+async def _internet_available() -> bool:
+    if LOCAL_MODE and not mongo_url:
+        return False
+    try:
+        await asyncio.to_thread(urllib.request.urlopen, "https://www.google.com/generate_204", timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _uploads_backup_manifest() -> list[dict]:
+    files = []
+    if not UPLOAD_DIR.exists():
+        return files
+    for path in sorted(p for p in UPLOAD_DIR.rglob("*") if p.is_file()):
+        rel_path = path.relative_to(UPLOAD_DIR).as_posix()
+        files.append({
+            "relative_path": rel_path,
+            "size": path.stat().st_size,
+            "sha256": _file_sha256(path),
+            "content_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        })
+    return files
+
+
+async def _backup_payload() -> dict:
+    return {
+        "mode": RUNTIME_MODE,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "collections": {name: await db[name].find({}, {"_id": 0}).to_list(100000) for name in BACKUP_COLLECTIONS},
+        "uploads": _uploads_backup_manifest(),
+    }
+
+
+async def _enqueue_cloud_sync(reason: str, backup_file: str | None = None) -> None:
+    await raw_db[SYNC_QUEUE_COLLECTION].insert_one({
+        "id": str(uuid.uuid4()),
+        "type": "cloud_backup",
+        "reason": reason,
+        "backup_file": backup_file,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "attempts": 0,
+    })
+
+
+async def _create_local_backup(reason: str = "manual") -> dict:
+    payload = await _backup_payload()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_file = BACKUP_DIR / f"pharmacyos-{reason}-{stamp}.json"
+    backup_file.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    if not backup_file.exists() or backup_file.stat().st_size <= 0:
+        raise RuntimeError(f"Backup integrity check failed for {backup_file}")
+    file_size = backup_file.stat().st_size
+    checksum = _file_sha256(backup_file)
+    await raw_db.backup_metadata.insert_one({
+        "id": str(uuid.uuid4()), "reason": reason, "file": str(backup_file),
+        "created_at": payload["exported_at"], "timestamp": payload["exported_at"],
+        "sha256": checksum, "size": file_size,
+        "collection_counts": {k: len(v) for k, v in payload["collections"].items()},
+        "upload_file_count": len(payload.get("uploads", [])),
+    })
+    await _enqueue_cloud_sync(reason, str(backup_file))
+    return {"ok": True, "backup_file": str(backup_file), "sha256": checksum, "size": file_size, "timestamp": payload["exported_at"], "queued_for_cloud_sync": True, "collection_counts": {k: len(v) for k, v in payload["collections"].items()}, "upload_file_count": len(payload.get("uploads", []))}
+
+
+async def _scheduled_local_backup_loop() -> None:
+    while True:
+        await asyncio.sleep(30 * 60)
+        try:
+            await _create_local_backup("scheduled_30m")
+        except Exception:
+            logger.exception("Scheduled local backup failed")
+
+
+async def _last_backup_metadata() -> Optional[dict]:
+    items = await raw_db.backup_metadata.find({}, {"_id": 0}).sort("created_at", -1).to_list(1)
+    return items[0] if items else None
+
+
+async def _pending_backup_count() -> int:
+    return await raw_db[SYNC_QUEUE_COLLECTION].count_documents({"status": "pending"})
+
+
+async def _verify_import_counts(payload: dict) -> dict:
+    source = payload.get("collections", payload)
+    names = ["medicines", "invoices", "purchase_orders", "distributors", "customers", "customer_transactions", "distributor_transactions", "purchase_returns", "settings"]
+    return {name: {"source": len(source.get(name, [])), "target": await db[name].count_documents({})} for name in names}
+
+
+def _load_backup_file_for_restore(backup_file: str, expected_sha256: Optional[str] = None) -> tuple[Path, dict, str, int]:
+    path = Path(backup_file).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Backup file not found")
+    if path.stat().st_size <= 0:
+        raise HTTPException(status_code=400, detail="Backup file is empty")
+    checksum = _file_sha256(path)
+    if expected_sha256 and checksum != expected_sha256:
+        raise HTTPException(status_code=400, detail="Backup checksum does not match expected_sha256")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Backup JSON is invalid: {exc}")
+    if not isinstance(payload.get("collections"), dict):
+        raise HTTPException(status_code=400, detail="Backup file is missing collections")
+    return path, payload, checksum, path.stat().st_size
+
+
+def _restore_upload_files(payload: dict) -> int:
+    restored = 0
+    for item in payload.get("uploads", []):
+        rel_path = Path(str(item.get("relative_path") or ""))
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise HTTPException(status_code=400, detail="Backup contains unsafe upload path")
+        target = UPLOAD_DIR / rel_path
+        content = base64.b64decode(item.get("content_b64") or "")
+        if hashlib.sha256(content).hexdigest() != item.get("sha256"):
+            raise HTTPException(status_code=400, detail=f"Upload checksum mismatch: {rel_path.as_posix()}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        restored += 1
+    return restored
+
 # ---------------- Backup ----------------
 @api_router.get("/backup/export")
 async def backup_export(user: dict = Depends(require_role("admin"))):
-    data = {
-        "exported_at": datetime.now(timezone.utc).isoformat(),
-        "medicines": await db.medicines.find({}, {"_id": 0}).to_list(10000),
-        "distributors": await db.distributors.find({}, {"_id": 0}).to_list(10000),
-        "customers": await db.customers.find({}, {"_id": 0}).to_list(10000),
-        "invoices": await db.invoices.find({}, {"_id": 0}).to_list(10000),
-        "customer_transactions": await db.customer_transactions.find({}, {"_id": 0}).to_list(10000),
-        "distributor_transactions": await db.distributor_transactions.find({}, {"_id": 0}).to_list(10000),
-        "purchase_returns": await db.purchase_returns.find({}, {"_id": 0}).to_list(10000),
+    payload = await _backup_payload()
+    return {"exported_at": payload["exported_at"], **payload["collections"]}
+
+
+@api_router.post("/backup/manual")
+async def backup_manual(user: dict = Depends(require_role("admin"))):
+    return await _create_local_backup("manual")
+
+
+@api_router.get("/backup/health")
+async def backup_health(user: dict = Depends(get_current_user)):
+    return {
+        "runtime_mode": RUNTIME_MODE,
+        "local_backend_running": True,
+        "local_database_connected": LOCAL_MODE and LOCAL_DB_PATH.exists(),
+        "local_database_path": str(LOCAL_DB_PATH) if LOCAL_MODE else None,
+        "last_backup": await _last_backup_metadata(),
+        "pending_backup_count": await _pending_backup_count(),
+        "cloud_sync_status": "online" if await _internet_available() else "queued_offline",
     }
-    return data
+
+
+@api_router.post("/backup/sync/retry")
+async def backup_sync_retry(dry_run: bool = Query(True), confirm: bool = Query(False), user: dict = Depends(require_role("admin"))):
+    online = await _internet_available()
+    pending = await _pending_backup_count()
+    if dry_run or not confirm:
+        return {"cloud_available": online, "pending_backup_count": pending, "dry_run": True, "requires_confirm": True, "message": "Cloud sync is verification-only by default and never overwrites newer cloud data blindly."}
+    return {"cloud_available": online, "pending_backup_count": pending, "dry_run": False, "synced": 0, "message": "No destructive cloud write was performed; implement conflict-reviewed upload after comparing cloud timestamps."}
+
+
+@api_router.post("/backup/restore")
+async def backup_restore(payload: dict, dry_run: bool = Query(True), confirm: bool = Query(False), user: dict = Depends(require_role("admin"))):
+    path, backup_payload, checksum, file_size = _load_backup_file_for_restore(
+        payload.get("backup_file", ""),
+        payload.get("expected_sha256"),
+    )
+    verification = await _verify_import_counts(backup_payload)
+    result = {
+        "backup_file": str(path),
+        "sha256": checksum,
+        "size": file_size,
+        "dry_run": dry_run or not confirm,
+        "requires_confirm": True,
+        "verification": verification,
+        "upload_file_count": len(backup_payload.get("uploads", [])),
+    }
+    if dry_run or not confirm:
+        return result
+
+    pre_restore = await _create_local_backup("pre_restore")
+    source = backup_payload.get("collections", {})
+    for collection_name, items in source.items():
+        if collection_name in BACKUP_COLLECTIONS:
+            await db[collection_name].delete_many({})
+            if items:
+                await db[collection_name].insert_many(items)
+    restored_uploads = _restore_upload_files(backup_payload)
+    return {**result, "dry_run": False, "pre_restore_backup": pre_restore, "restored_upload_file_count": restored_uploads, "verification": await _verify_import_counts(backup_payload)}
 
 
 @api_router.post("/backup/import")
-async def backup_import(payload: dict, user: dict = Depends(require_role("admin"))):
-    collections = ["medicines", "distributors", "customers", "invoices", "customer_transactions", "distributor_transactions", "purchase_returns"]
+async def backup_import(payload: dict, dry_run: bool = Query(True), user: dict = Depends(require_role("admin"))):
+    source = payload.get("collections", payload)
+    collections = ["medicines", "distributors", "customers", "invoices", "customer_transactions", "distributor_transactions", "purchase_returns", "purchase_orders", "stock_adjustments", "daily_closings", "settings"]
     counts = {}
+    if dry_run:
+        return {"dry_run": True, "verification": {c: len(source.get(c, [])) for c in collections}}
     for c in collections:
-        items = payload.get(c, [])
+        items = source.get(c, [])
         if c == "medicines":
             items = [_normalize_inventory_quantities(item) for item in items]
         if items:
             await db[c].delete_many({})
             await db[c].insert_many(items)
             counts[c] = len(items)
-    return {"imported": counts}
+    return {"dry_run": False, "imported": counts, "verification": await _verify_import_counts(source)}
 
 
 # ---------------- Purchase Orders / GRN ----------------
@@ -10202,6 +10423,8 @@ async def create_daily_closing(
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     await db.daily_closings.insert_one(closing)
+    if LOCAL_MODE:
+        asyncio.create_task(_create_local_backup("daily_closing"))
     return _daily_closing_public(closing)
 
 
