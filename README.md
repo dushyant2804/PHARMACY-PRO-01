@@ -41,6 +41,19 @@ Local mode stores JSON documents in SQLite through a Mongo-like adapter so the e
 
 When the local backend is running on the default port, the frontend health check should target `http://localhost:8000/api/health`. The root health alias `GET /health` returns the same local server status for compatibility, and startup logs include `Local PharmacyOS server running at http://localhost:8000`.
 
+### Windows one-click local server launcher
+
+Windows desktop users do not need to type terminal commands to start the local backend:
+
+1. Double click `start-pharmacyos-local.bat`.
+2. Wait for the message `Local PharmacyOS server running at http://localhost:8000`.
+3. Open the PharmacyOS Chrome window.
+4. Go to **Settings → Backup & Restore**.
+5. Click **Test Local Server**.
+6. Switch to **Local Mode** only after the local server test passes.
+
+The launcher starts FastAPI/uvicorn on `http://localhost:8000`, sets `PHARMACYOS_MODE=LOCAL_MODE`, and stores local runtime data beside the application in `local_data\pharmacyos.sqlite3`, `backups\`, and `uploads\`. To stop the local server, close the launcher window or double click `stop-pharmacyos-local.bat`.
+
 ### Backup and sync safety
 
 Local mode writes timestamped JSON backups locally first, then attempts non-destructive cloud backups to MongoDB Atlas and Google Drive. Cloud mode remains unchanged.
