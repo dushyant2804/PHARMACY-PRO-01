@@ -112,6 +112,43 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["net_exposure"], -65.0)
         self.assertEqual(result["customer_recovery_ranking"][0]["outstanding"], 75.0)
 
+
+    async def test_dashboard_purchase_return_summary_always_includes_count(self):
+        today = datetime.now(timezone.utc).date()
+        fake_db = SimpleNamespace(
+            invoices=Collection([]), expenses=Collection([]), medicines=Collection([]),
+            customer_transactions=Collection([]), distributors=Collection([]), distributor_transactions=Collection([]),
+            purchase_orders=Collection([]), regular_patients=Collection([]),
+            purchase_returns=Collection([
+                {"id":"r1", "return_quantity":2, "purchase_rate":10, "return_date":today.isoformat()},
+                {"id":"r2", "return_quantity":3, "total_value":45, "return_date":today.isoformat()},
+                {"id":"r3", "return_quantity":99, "purchase_rate":99, "settlement_status":"deleted", "return_date":today.isoformat()},
+            ]),
+        )
+        with patch("server.db", fake_db):
+            result = await dashboard_summary(user={})
+        self.assertEqual(result["purchase_return_summary"], {"count": 2, "total_quantity": 5.0, "total_value": 65.0})
+
+    async def test_outstanding_movement_uses_purchase_orders_when_ledger_purchase_missing(self):
+        db = SimpleNamespace(
+            customers=Collection([]),
+            distributors=Collection([{"id":"d1", "name":"D", "opening_balance":10, "created_at":"2026-05-01T00:00:00+00:00"}]),
+            customer_transactions=Collection([]),
+            distributor_transactions=Collection([
+                {"distributor_id":"d1", "type":"payment", "amount":25, "created_at":"2026-06-15T00:00:00+00:00"},
+                {"distributor_id":"d1", "type":"purchase_return", "amount":5, "created_at":"2026-06-20T00:00:00+00:00"},
+            ]),
+            purchase_orders=Collection([
+                {"id":"po1", "distributor_id":"d1", "grand_total":100, "po_date":"2026-06-01", "invoice_ref":"INV-1"},
+            ]),
+        )
+        with patch("server.db", db):
+            result = await outstanding_report(user={})
+        self.assertEqual(result["distributor_outstanding_movement"], [
+            {"month":"2026-05", "purchases":0.0, "payments":0.0, "adjustments":0.0, "opening_distributor_payable":0.0, "closing_distributor_payable":10.0, "outstanding_payable":10.0, "net_movement":10.0, "outstanding_increase":10.0, "outstanding_decrease":0.0},
+            {"month":"2026-06", "purchases":100.0, "payments":25.0, "adjustments":5.0, "opening_distributor_payable":10.0, "closing_distributor_payable":80.0, "outstanding_payable":80.0, "net_movement":70.0, "outstanding_increase":70.0, "outstanding_decrease":0.0},
+        ])
+
     async def test_purchase_return_summary_uses_hardened_settlement(self):
         db = SimpleNamespace(purchase_returns=Collection([{"return_quantity":2,"purchase_rate":10.125,"ledger_adjusted":True}, {"return_quantity":1,"purchase_rate":5.555}]))
         with patch("server.db", db): result = await purchase_return_report(user={})
