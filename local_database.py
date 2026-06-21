@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Dict, List, Optional, Union
 
 
 class LocalInsertOneResult(SimpleNamespace):
@@ -27,15 +27,15 @@ class LocalDeleteResult(SimpleNamespace):
 class LocalUpdateResult(SimpleNamespace):
     matched_count: int = 0
     modified_count: int = 0
-    upserted_id: str | None = None
+    upserted_id: Optional[str] = None
 
 
 class LocalCursor:
-    def __init__(self, docs: list[dict[str, Any]]):
+    def __init__(self, docs: List[Dict[str, Any]]):
         self.docs = docs
         self._index = 0
 
-    def sort(self, key, direction: int | None = None):
+    def sort(self, key, direction: Optional[int] = None):
         if isinstance(key, list):
             sort_keys = key
         else:
@@ -55,7 +55,7 @@ class LocalCursor:
             self.docs = self.docs[:n]
         return self
 
-    async def to_list(self, length: int | None):
+    async def to_list(self, length: Optional[int]):
         return copy.deepcopy(self.docs if length is None else self.docs[:length])
 
     def __aiter__(self):
@@ -169,7 +169,7 @@ class LocalCollection:
 
 
 class LocalSQLiteDatabase:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: Union[str, Path]):
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
