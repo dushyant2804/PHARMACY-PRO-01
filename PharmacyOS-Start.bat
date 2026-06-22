@@ -47,7 +47,7 @@ echo [%date% %time%] Database=%LOCAL_DB_PATH% Backups=%BACKUP_DIR% Uploads=%UPLO
 echo [%date% %time%] Health URL=%HEALTH_URL%>>"%LOG_FILE%"
 echo [%date% %time%] Launch command: %UVICORN_CMD%>>"%LOG_FILE%"
 
-call :CHECK_HEALTH >nul 2>nul
+call :CHECK_HEALTH
 if errorlevel 1 (
     echo Starting local backend on http://127.0.0.1:8000 ...
     echo Launch command:
@@ -74,12 +74,13 @@ if errorlevel 1 (
 ) else (
     echo Local backend is already running.
     echo [%date% %time%] Backend already running; health check succeeded before launch.>>"%LOG_FILE%"
+    goto :OPEN_APP
 )
 
 echo Waiting for PharmacyOS health check: %HEALTH_URL%
 set "READY="
 for /L %%I in (1,1,60) do (
-    call :CHECK_HEALTH >nul 2>nul
+    call :CHECK_HEALTH
     if not errorlevel 1 (
         set "READY=1"
         goto :OPEN_APP
@@ -153,8 +154,35 @@ if exist "%BACKEND_CMD_FILE%" (
 exit /b 1
 
 :CHECK_HEALTH
-python -c "import json, sys, urllib.request; r = urllib.request.urlopen(sys.argv[1], timeout=2); data = json.loads(r.read().decode('utf-8')); sys.exit(0 if 200 <= r.getcode() ^< 300 and data.get('status') == 'ok' else 1)" "%HEALTH_URL%"
-exit /b %errorlevel%
+set "HEALTH_STDOUT=%TEMP%\pharmacyos-health-stdout-%RANDOM%.log"
+set "HEALTH_STDERR=%TEMP%\pharmacyos-health-stderr-%RANDOM%.log"
+echo Health-check command: python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); sys.exit(0 if r.getcode() in range(200, 300) and data.get('status') == 'ok' else 1)" "%HEALTH_URL%"
+echo [%date% %time%] Health-check command: python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); sys.exit(0 if r.getcode() in range(200, 300) and data.get('status') == 'ok' else 1)" "%HEALTH_URL%">>"%LOG_FILE%"
+python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); sys.exit(0 if r.getcode() in range(200, 300) and data.get('status') == 'ok' else 1)" "%HEALTH_URL%" > "%HEALTH_STDOUT%" 2> "%HEALTH_STDERR%"
+set "HEALTH_EXIT=%errorlevel%"
+echo Health-check exit code: %HEALTH_EXIT%
+echo [%date% %time%] Health-check exit code: %HEALTH_EXIT%>>"%LOG_FILE%"
+echo Health-check stdout:
+echo [%date% %time%] Health-check stdout:>>"%LOG_FILE%"
+if exist "%HEALTH_STDOUT%" (
+    type "%HEALTH_STDOUT%"
+    type "%HEALTH_STDOUT%" >> "%LOG_FILE%"
+) else (
+    echo ^<stdout file missing^>
+    echo ^<stdout file missing^>>>"%LOG_FILE%"
+)
+echo Health-check stderr:
+echo [%date% %time%] Health-check stderr:>>"%LOG_FILE%"
+if exist "%HEALTH_STDERR%" (
+    type "%HEALTH_STDERR%"
+    type "%HEALTH_STDERR%" >> "%LOG_FILE%"
+) else (
+    echo ^<stderr file missing^>
+    echo ^<stderr file missing^>>>"%LOG_FILE%"
+)
+if exist "%HEALTH_STDOUT%" del "%HEALTH_STDOUT%" >nul 2>nul
+if exist "%HEALTH_STDERR%" del "%HEALTH_STDERR%" >nul 2>nul
+exit /b %HEALTH_EXIT%
 
 :DONE
 echo PharmacyOS is ready.
