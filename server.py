@@ -30,7 +30,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Set, Tuple, Literal
 from collections import Counter, defaultdict
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query, Body
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.encoders import jsonable_encoder
@@ -927,6 +927,10 @@ def require_role(*roles: str):
 
 
 # ---------------- Models ----------------
+class LocalImportConfirmRequest(BaseModel):
+    overwrite_local: bool = False
+
+
 class UserRegister(BaseModel):
     email: EmailStr
     password: str
@@ -9646,15 +9650,37 @@ async def local_mode_import_dry_run(request: Request = None):
 
 @api_router.post("/local-mode/import/confirm")
 @api_router.post("/local/import/confirm")
-async def local_mode_import_confirm(request: Request = None, overwrite_local: bool = Query(False)):
+async def local_mode_import_confirm(
+    request: Request = None,
+    payload: Optional[LocalImportConfirmRequest] = Body(None),
+    overwrite_local: Optional[bool] = Query(None),
+):
+    raw_body = "<direct-call>"
+    if request:
+        try:
+            raw_body_bytes = await request.body()
+            raw_body = raw_body_bytes.decode("utf-8", errors="replace") if raw_body_bytes else "<empty>"
+        except Exception as exc:
+            raw_body = f"<unavailable: {exc}>"
+
+    parsed_body = payload.model_dump() if isinstance(payload, LocalImportConfirmRequest) else None
+    final_overwrite_local = (
+        payload.overwrite_local
+        if isinstance(payload, LocalImportConfirmRequest)
+        else (overwrite_local if overwrite_local is not None else False)
+    )
     logger.info(
-        "Local import confirm POST handler: origin=%s auth=%s overwrite_local=%s",
+        "Local import confirm POST handler: origin=%s auth=%s raw_body=%s parsed_body=%s overwrite_local_query=%s final_overwrite_local=%s",
         request.headers.get("origin", "<missing>") if request else "<direct-call>",
         "present" if request and (request.headers.get("Authorization") or request.cookies.get("access_token")) else "missing",
+        raw_body,
+        parsed_body,
         overwrite_local,
+        final_overwrite_local,
     )
     try:
-        return await _cloud_to_local_import(dry_run=False, confirm=True, overwrite_local=overwrite_local)
+        logger.info("Local import confirm import logic overwrite_local=%s", final_overwrite_local)
+        return await _cloud_to_local_import(dry_run=False, confirm=True, overwrite_local=final_overwrite_local)
     except HTTPException:
         raise
     except Exception:
