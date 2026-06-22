@@ -42,6 +42,7 @@ echo.
 echo [%date% %time%] PharmacyOS launcher starting.>>"%LOG_FILE%"
 echo [%date% %time%] Log file=%LOG_FILE%>>"%LOG_FILE%"
 echo [%date% %time%] Backend output log=%BACKEND_OUTPUT_LOG%>>"%LOG_FILE%"
+echo [%date% %time%] Backend command file=%BACKEND_CMD_FILE%>>"%LOG_FILE%"
 echo [%date% %time%] Database=%LOCAL_DB_PATH% Backups=%BACKUP_DIR% Uploads=%UPLOAD_DIR%>>"%LOG_FILE%"
 echo [%date% %time%] Health URL=%HEALTH_URL%>>"%LOG_FILE%"
 echo [%date% %time%] Launch command: %UVICORN_CMD%>>"%LOG_FILE%"
@@ -53,6 +54,7 @@ if errorlevel 1 (
     echo %UVICORN_CMD%
     echo [%date% %time%] Starting backend with Windows start command.>>"%LOG_FILE%"
     echo Backend output log: %BACKEND_OUTPUT_LOG%
+    echo Backend command file: %BACKEND_CMD_FILE%
     call :WRITE_BACKEND_CMD
     if errorlevel 1 (
         echo ERROR: Could not create backend command file: %BACKEND_CMD_FILE%
@@ -60,6 +62,7 @@ if errorlevel 1 (
         pause
         exit /b 1
     )
+    echo Backend command file created: yes
     start "PharmacyOS Backend" /MIN cmd.exe /c ""%BACKEND_CMD_FILE%""
     if errorlevel 1 (
         echo ERROR: Windows could not start the backend process.
@@ -133,7 +136,21 @@ goto :DONE
     echo %UVICORN_CMD% ^>^> "%BACKEND_OUTPUT_LOG%" 2^>^&1
     echo echo [%%date%% %%time%%] Backend command exited with errorlevel %%errorlevel%%. ^>^> "%BACKEND_OUTPUT_LOG%"
 ) > "%BACKEND_CMD_FILE%"
-exit /b %errorlevel%
+set "BACKEND_CMD_CREATED=no"
+set "BACKEND_CMD_SIZE="
+if exist "%BACKEND_CMD_FILE%" (
+    set "BACKEND_CMD_CREATED=yes"
+    for %%A in ("%BACKEND_CMD_FILE%") do set "BACKEND_CMD_SIZE=%%~zA"
+)
+echo [%date% %time%] Backend command file path=%BACKEND_CMD_FILE%>>"%LOG_FILE%"
+echo [%date% %time%] Backend command file created=!BACKEND_CMD_CREATED!>>"%LOG_FILE%"
+if defined BACKEND_CMD_SIZE echo [%date% %time%] Backend command file size=!BACKEND_CMD_SIZE! bytes>>"%LOG_FILE%"
+if exist "%BACKEND_CMD_FILE%" (
+    if defined BACKEND_CMD_SIZE (
+        if !BACKEND_CMD_SIZE! GTR 0 exit /b 0
+    )
+)
+exit /b 1
 
 :CHECK_HEALTH
 python -c "import json, sys, urllib.request; r = urllib.request.urlopen(sys.argv[1], timeout=2); data = json.loads(r.read().decode('utf-8')); sys.exit(0 if 200 <= r.getcode() ^< 300 and data.get('status') == 'ok' else 1)" "%HEALTH_URL%"
