@@ -9,26 +9,18 @@ cd /d "%BASE_DIR%"
 
 set "APP_DIR=%BASE_DIR%"
 set "PHARMACYOS_MODE=LOCAL_MODE"
-set "LOCAL_DB_PATH=%APP_DIR%local_data\pharmacyos.sqlite3"
-set "BACKUP_DIR=%APP_DIR%backups"
-set "UPLOAD_DIR=%APP_DIR%uploads"
-set "LOG_DIR=%APP_DIR%logs"
-set "LOG_FILE=%LOG_DIR%pharmacyos-local.log"
-set "BACKEND_CMD_FILE=%LOG_DIR%pharmacyos-backend.cmd"
-set "UVICORN_CMD=python -m uvicorn server:app --host 127.0.0.1 --port 8000"
-set "HEALTH_URL=http://127.0.0.1:8000/api/health"
-set "APP_URL=http://127.0.0.1:8000"
-set "DATA_DIR=%BASE_DIR%\data"
-set "LOCAL_DATA_DIR=%BASE_DIR%\local_data"
+set "DATA_DIR=%APP_DIR%\data"
+set "LOCAL_DATA_DIR=%APP_DIR%\local_data"
 set "LOCAL_DB_PATH=%LOCAL_DATA_DIR%\pharmacyos.sqlite3"
-set "BACKUP_DIR=%BASE_DIR%\backups"
-set "UPLOAD_DIR=%BASE_DIR%\uploads"
-set "LOG_DIR=%BASE_DIR%\logs"
+set "BACKUP_DIR=%APP_DIR%\backups"
+set "UPLOAD_DIR=%APP_DIR%\uploads"
+set "LOG_DIR=%APP_DIR%\logs"
 set "LOG_FILE=%LOG_DIR%\pharmacyos-local.log"
 set "BACKEND_CMD_FILE=%LOG_DIR%\pharmacyos-backend.cmd"
 set "BACKEND_OUTPUT_LOG=%LOG_DIR%\pharmacyos-backend-output.log"
-set "HEALTH_URL=http://localhost:8000/api/health"
-set "APP_URL=http://localhost:8000"
+set "UVICORN_CMD=python -m uvicorn server:app --host 127.0.0.1 --port 8000"
+set "HEALTH_URL=http://127.0.0.1:8000/api/health"
+set "APP_URL=http://127.0.0.1:8000"
 
 if not exist "%LOCAL_DATA_DIR%" mkdir "%LOCAL_DATA_DIR%"
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
@@ -59,27 +51,23 @@ if errorlevel 1 (
     echo Starting local backend on http://127.0.0.1:8000 ...
     echo Launch command:
     echo %UVICORN_CMD%
-    echo [%date% %time%] Starting backend.>>"%LOG_FILE%"
+    echo [%date% %time%] Starting backend with Windows start command.>>"%LOG_FILE%"
     echo Backend output log: %BACKEND_OUTPUT_LOG%
-    echo @echo off>"%BACKEND_CMD_FILE%"
-    echo cd /d "%BASE_DIR%">>"%BACKEND_CMD_FILE%"
-    echo set PHARMACYOS_MODE=LOCAL_MODE>>"%BACKEND_CMD_FILE%"
-    echo set LOCAL_DB_PATH=%LOCAL_DB_PATH%>>"%BACKEND_CMD_FILE%"
-    echo set BACKUP_DIR=%BACKUP_DIR%>>"%BACKEND_CMD_FILE%"
-    echo set UPLOAD_DIR=%UPLOAD_DIR%>>"%BACKEND_CMD_FILE%"
-    echo %UVICORN_CMD% ^>^> "%BACKEND_OUTPUT_LOG%" 2^>^&1>>"%BACKEND_CMD_FILE%"
-    wmic process call create "cmd.exe /c ""%BACKEND_CMD_FILE%""" > "%TEMP%\pharmacyos-wmic.txt" 2>nul
-    set "BACKEND_PID="
-    for /F "tokens=2 delims=;=" %%P in ('find "ProcessId" ^< "%TEMP%\pharmacyos-wmic.txt"') do set "BACKEND_PID=%%P"
-    if defined BACKEND_PID (
-        set "BACKEND_PID=!BACKEND_PID: =!"
-        set "BACKEND_PID=!BACKEND_PID:.=!"
-        echo Backend launcher process id: !BACKEND_PID!
-        echo [%date% %time%] Backend launcher process id: !BACKEND_PID!>>"%LOG_FILE%"
-    ) else (
-        echo Backend process id unavailable.
-        echo [%date% %time%] Backend process id unavailable.>>"%LOG_FILE%"
+    call :WRITE_BACKEND_CMD
+    if errorlevel 1 (
+        echo ERROR: Could not create backend command file: %BACKEND_CMD_FILE%
+        echo [%date% %time%] Failed to create backend command file.>>"%LOG_FILE%"
+        pause
+        exit /b 1
     )
+    start "PharmacyOS Backend" /MIN cmd.exe /c ""%BACKEND_CMD_FILE%""
+    if errorlevel 1 (
+        echo ERROR: Windows could not start the backend process.
+        echo [%date% %time%] start command failed with errorlevel !errorlevel!.>>"%LOG_FILE%"
+        pause
+        exit /b 1
+    )
+    echo [%date% %time%] Backend start command issued.>>"%LOG_FILE%"
 ) else (
     echo Local backend is already running.
     echo [%date% %time%] Backend already running; health check succeeded before launch.>>"%LOG_FILE%"
@@ -104,7 +92,7 @@ echo Backend output log: %BACKEND_OUTPUT_LOG%
 if exist "%BACKEND_OUTPUT_LOG%" (
     echo.
     echo Last backend output log lines:
-    powershell -NoProfile -Command "Get-Content -LiteralPath '%BACKEND_OUTPUT_LOG%' -Tail 40"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath '%BACKEND_OUTPUT_LOG%' -Tail 40"
 ) else (
     echo Backend output log was not created.
 )
@@ -132,13 +120,28 @@ if defined CHROME_EXE (
 echo.
 goto :DONE
 
+:WRITE_BACKEND_CMD
+(
+    echo @echo off
+    echo cd /d "%BASE_DIR%"
+    echo set "PHARMACYOS_MODE=LOCAL_MODE"
+    echo set "LOCAL_DB_PATH=%LOCAL_DB_PATH%"
+    echo set "BACKUP_DIR=%BACKUP_DIR%"
+    echo set "UPLOAD_DIR=%UPLOAD_DIR%"
+    echo echo [%%date%% %%time%%] Backend command starting. ^>^> "%BACKEND_OUTPUT_LOG%"
+    echo echo Command: %UVICORN_CMD% ^>^> "%BACKEND_OUTPUT_LOG%"
+    echo %UVICORN_CMD% ^>^> "%BACKEND_OUTPUT_LOG%" 2^>^&1
+    echo echo [%%date%% %%time%%] Backend command exited with errorlevel %%errorlevel%%. ^>^> "%BACKEND_OUTPUT_LOG%"
+) > "%BACKEND_CMD_FILE%"
+exit /b %errorlevel%
+
 :CHECK_HEALTH
-python -c "import sys, urllib.request; r = urllib.request.urlopen(sys.argv[1], timeout=2); sys.exit(0 if 200 <= r.getcode() ^< 500 else 1)" "%HEALTH_URL%"
+python -c "import json, sys, urllib.request; r = urllib.request.urlopen(sys.argv[1], timeout=2); data = json.loads(r.read().decode('utf-8')); sys.exit(0 if 200 <= r.getcode() ^< 300 and data.get('status') == 'ok' else 1)" "%HEALTH_URL%"
 exit /b %errorlevel%
 
 :DONE
 echo PharmacyOS is ready.
-echo Keep the backend window running while using PharmacyOS.
+echo Keep the backend running while using PharmacyOS.
 echo To stop safely, double click PharmacyOS-Stop.bat.
 echo.
 pause
