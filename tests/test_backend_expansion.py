@@ -1,6 +1,7 @@
 import os
 import asyncio
 import unittest
+from typing import Optional
 
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "test_pharmacy")
@@ -216,6 +217,57 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(headers.get("access-control-allow-origin"), origin)
                 self.assertIn("POST", headers.get("access-control-allow-methods", ""))
                 self.assertIn("authorization", headers.get("access-control-allow-headers", "").lower())
+
+
+    async def test_local_import_confirm_accepts_json_body_and_logs_final_overwrite_value(self):
+        import server
+
+        class FakeRequest:
+            headers = {"origin": "https://pharmacy-pro-01-frontend.onrender.com", "Authorization": "Bearer token"}
+            cookies = {}
+
+            async def body(self):
+                return b'{"overwrite_local": true}'
+
+        seen = {}
+        original_import = server._cloud_to_local_import
+
+        async def fake_import(dry_run, confirm, overwrite_local):
+            seen["dry_run"] = dry_run
+            seen["confirm"] = confirm
+            seen["overwrite_local"] = overwrite_local
+            return {"ok": True, "overwrite_local": overwrite_local}
+
+        try:
+            server._cloud_to_local_import = fake_import
+            with self.assertLogs("pharmacy", level="INFO") as logs:
+                response = await server.local_mode_import_confirm(
+                    request=FakeRequest(),
+                    payload=server.LocalImportConfirmRequest(overwrite_local=True),
+                )
+        finally:
+            server._cloud_to_local_import = original_import
+
+        self.assertEqual(response["overwrite_local"], True)
+        self.assertEqual(seen, {"dry_run": False, "confirm": True, "overwrite_local": True})
+        joined_logs = "\n".join(logs.output)
+        self.assertIn('raw_body={"overwrite_local": true}', joined_logs)
+        self.assertIn("parsed_body={'overwrite_local': True}", joined_logs)
+        self.assertIn("final_overwrite_local=True", joined_logs)
+        self.assertIn("import logic overwrite_local=True", joined_logs)
+
+    def test_local_import_confirm_alias_routes_share_request_model(self):
+        import server
+
+        routes = {
+            route.path: route
+            for route in server.api_router.routes
+            if getattr(route, "endpoint", None) is server.local_mode_import_confirm
+        }
+        self.assertIn("/api/local/import/confirm", routes)
+        self.assertIn("/api/local-mode/import/confirm", routes)
+        self.assertEqual(routes["/api/local/import/confirm"].body_field.type_, Optional[server.LocalImportConfirmRequest])
+        self.assertEqual(routes["/api/local-mode/import/confirm"].body_field.type_, Optional[server.LocalImportConfirmRequest])
 
     def test_old_and_new_business_settings_are_normalized_without_data_loss(self):
         from server import normalize_settings
