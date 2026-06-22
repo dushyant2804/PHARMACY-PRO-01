@@ -9,6 +9,15 @@ cd /d "%BASE_DIR%"
 
 set "APP_DIR=%BASE_DIR%"
 set "PHARMACYOS_MODE=LOCAL_MODE"
+set "LOCAL_DB_PATH=%APP_DIR%local_data\pharmacyos.sqlite3"
+set "BACKUP_DIR=%APP_DIR%backups"
+set "UPLOAD_DIR=%APP_DIR%uploads"
+set "LOG_DIR=%APP_DIR%logs"
+set "LOG_FILE=%LOG_DIR%pharmacyos-local.log"
+set "BACKEND_CMD_FILE=%LOG_DIR%pharmacyos-backend.cmd"
+set "UVICORN_CMD=python -m uvicorn server:app --host 127.0.0.1 --port 8000"
+set "HEALTH_URL=http://127.0.0.1:8000/api/health"
+set "APP_URL=http://127.0.0.1:8000"
 set "DATA_DIR=%BASE_DIR%\data"
 set "LOCAL_DATA_DIR=%BASE_DIR%\local_data"
 set "LOCAL_DB_PATH=%LOCAL_DATA_DIR%\pharmacyos.sqlite3"
@@ -38,21 +47,39 @@ echo.
 echo [%date% %time%] PharmacyOS launcher starting.>>"%LOG_FILE%"
 echo [%date% %time%] Log file=%LOG_FILE%>>"%LOG_FILE%"
 echo [%date% %time%] Database=%LOCAL_DB_PATH% Backups=%BACKUP_DIR% Uploads=%UPLOAD_DIR%>>"%LOG_FILE%"
+echo [%date% %time%] Health URL=%HEALTH_URL%>>"%LOG_FILE%"
+echo [%date% %time%] Launch command: %UVICORN_CMD%>>"%LOG_FILE%"
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -UseBasicParsing '%HEALTH_URL%' -TimeoutSec 2 | Out-Null; exit 0 } catch { exit 1 }" >nul 2>nul
+call :CHECK_HEALTH >nul 2>nul
 if errorlevel 1 (
-    echo Starting local backend on http://localhost:8000 ...
+    echo Starting local backend on http://127.0.0.1:8000 ...
+    echo Launch command:
+    echo %UVICORN_CMD%
     echo [%date% %time%] Starting backend.>>"%LOG_FILE%"
-    start "PharmacyOS Local Backend" /min cmd /c ""cd /d "%APP_DIR%" && python -m uvicorn server:app --host 127.0.0.1 --port 8000 >> "%LOG_FILE%" 2>>&1""
+    echo @echo off>"%BACKEND_CMD_FILE%"
+    echo cd /d "%APP_DIR%">>"%BACKEND_CMD_FILE%"
+    echo %UVICORN_CMD% ^>^> "%LOG_FILE%" 2^>^&1>>"%BACKEND_CMD_FILE%"
+    wmic process call create "cmd.exe /c ""%BACKEND_CMD_FILE%""" > "%TEMP%\pharmacyos-wmic.txt" 2>nul
+    set "BACKEND_PID="
+    for /F "tokens=2 delims=;=" %%P in ('find "ProcessId" ^< "%TEMP%\pharmacyos-wmic.txt"') do set "BACKEND_PID=%%P"
+    if defined BACKEND_PID (
+        set "BACKEND_PID=!BACKEND_PID: =!"
+        set "BACKEND_PID=!BACKEND_PID:.=!"
+        echo Backend launcher process id: !BACKEND_PID!
+        echo [%date% %time%] Backend launcher process id: !BACKEND_PID!>>"%LOG_FILE%"
+    ) else (
+        echo Backend process id unavailable.
+        echo [%date% %time%] Backend process id unavailable.>>"%LOG_FILE%"
+    )
 ) else (
     echo Local backend is already running.
-    echo [%date% %time%] Backend already running.>>"%LOG_FILE%"
+    echo [%date% %time%] Backend already running; health check succeeded before launch.>>"%LOG_FILE%"
 )
 
 echo Waiting for PharmacyOS health check: %HEALTH_URL%
 set "READY="
 for /L %%I in (1,1,60) do (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $r = Invoke-WebRequest -UseBasicParsing '%HEALTH_URL%' -TimeoutSec 2; if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>nul
+    call :CHECK_HEALTH >nul 2>nul
     if not errorlevel 1 (
         set "READY=1"
         goto :OPEN_APP
@@ -64,13 +91,13 @@ for /L %%I in (1,1,60) do (
 echo.
 echo ERROR: PharmacyOS did not become healthy within 2 minutes.
 echo Check %LOG_FILE% for details. No data was deleted or changed by this launcher.
-echo [%date% %time%] Health check timeout.>>"%LOG_FILE%"
+echo [%date% %time%] Health check failure: timeout waiting for %HEALTH_URL%.>>"%LOG_FILE%"
 pause
 exit /b 1
 
 :OPEN_APP
 echo PharmacyOS local backend is healthy.
-echo [%date% %time%] Backend healthy. Opening app window.>>"%LOG_FILE%"
+echo [%date% %time%] Health check success: %HEALTH_URL%. Opening app window.>>"%LOG_FILE%"
 
 set "CHROME_EXE="
 if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" set "CHROME_EXE=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
@@ -82,10 +109,17 @@ if defined CHROME_EXE (
     start "PharmacyOS" "%CHROME_EXE%" --app="%APP_URL%" --new-window
 ) else (
     echo Chrome was not found in the standard locations. Opening default browser instead.
-    start "" "%APP_URL%"
+    start "PharmacyOS" "%APP_URL%"
 )
 
 echo.
+goto :DONE
+
+:CHECK_HEALTH
+python -c "import sys, urllib.request; r = urllib.request.urlopen(sys.argv[1], timeout=2); sys.exit(0 if 200 <= r.getcode() ^< 500 else 1)" "%HEALTH_URL%"
+exit /b %errorlevel%
+
+:DONE
 echo PharmacyOS is ready.
 echo Keep the backend window running while using PharmacyOS.
 echo To stop safely, double click PharmacyOS-Stop.bat.
