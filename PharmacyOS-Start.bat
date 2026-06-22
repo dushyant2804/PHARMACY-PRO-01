@@ -3,9 +3,11 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM PharmacyOS Windows desktop launcher.
 REM Starts the existing local backend/database, waits for health, then opens Chrome app mode.
-cd /d "%~dp0"
+set "BASE_DIR=%~dp0"
+if "%BASE_DIR:~-1%"=="\" set "BASE_DIR=%BASE_DIR:~0,-1%"
+cd /d "%BASE_DIR%"
 
-set "APP_DIR=%~dp0"
+set "APP_DIR=%BASE_DIR%"
 set "PHARMACYOS_MODE=LOCAL_MODE"
 set "LOCAL_DB_PATH=%APP_DIR%local_data\pharmacyos.sqlite3"
 set "BACKUP_DIR=%APP_DIR%backups"
@@ -16,9 +18,18 @@ set "BACKEND_CMD_FILE=%LOG_DIR%pharmacyos-backend.cmd"
 set "UVICORN_CMD=python -m uvicorn server:app --host 127.0.0.1 --port 8000"
 set "HEALTH_URL=http://127.0.0.1:8000/api/health"
 set "APP_URL=http://127.0.0.1:8000"
+set "DATA_DIR=%BASE_DIR%\data"
+set "LOCAL_DATA_DIR=%BASE_DIR%\local_data"
+set "LOCAL_DB_PATH=%LOCAL_DATA_DIR%\pharmacyos.sqlite3"
+set "BACKUP_DIR=%BASE_DIR%\backups"
+set "UPLOAD_DIR=%BASE_DIR%\uploads"
+set "LOG_DIR=%BASE_DIR%\logs"
+set "LOG_FILE=%LOG_DIR%\pharmacyos-local.log"
+set "HEALTH_URL=http://localhost:8000/api/health"
+set "APP_URL=http://localhost:8000"
 
-if not exist "%APP_DIR%local_data" mkdir "%APP_DIR%local_data"
-if not exist "%APP_DIR%data" mkdir "%APP_DIR%data"
+if not exist "%LOCAL_DATA_DIR%" mkdir "%LOCAL_DATA_DIR%"
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 if not exist "%BACKUP_DIR%" mkdir "%BACKUP_DIR%"
 if not exist "%UPLOAD_DIR%" mkdir "%UPLOAD_DIR%"
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
@@ -34,6 +45,7 @@ echo Uploads:  %UPLOAD_DIR%
 echo Log file: %LOG_FILE%
 echo.
 echo [%date% %time%] PharmacyOS launcher starting.>>"%LOG_FILE%"
+echo [%date% %time%] Log file=%LOG_FILE%>>"%LOG_FILE%"
 echo [%date% %time%] Database=%LOCAL_DB_PATH% Backups=%BACKUP_DIR% Uploads=%UPLOAD_DIR%>>"%LOG_FILE%"
 echo [%date% %time%] Health URL=%HEALTH_URL%>>"%LOG_FILE%"
 echo [%date% %time%] Launch command: %UVICORN_CMD%>>"%LOG_FILE%"
