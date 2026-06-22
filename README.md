@@ -41,18 +41,29 @@ Local mode stores JSON documents in SQLite through a Mongo-like adapter so the e
 
 When the local backend is running on the default port, the frontend health check should target `http://localhost:8000/api/health`. The root health alias `GET /health` returns the same local server status for compatibility, and startup logs include `Local PharmacyOS server running at http://localhost:8000`.
 
-### Windows one-click local server launcher
+### Windows one-click local desktop launcher
 
 Windows desktop users do not need to type terminal commands to start the local backend:
 
-1. Double click `start-pharmacyos-local.bat`.
-2. Wait for the message `Local PharmacyOS server running at http://localhost:8000`.
-3. Open the PharmacyOS Chrome window.
-4. Go to **Settings → Backup & Restore**.
-5. Click **Test Local Server**.
-6. Switch to **Local Mode** only after the local server test passes.
+1. Double click `PharmacyOS-Start.bat`.
+2. The launcher sets `PHARMACYOS_MODE=LOCAL_MODE`, starts FastAPI/uvicorn on `http://localhost:8000`, and waits until `http://localhost:8000/api/health` responds.
+3. After the server is healthy, the launcher opens PharmacyOS in a Chrome app window. If Chrome is not installed in a standard Windows location, it falls back to the default browser.
+4. Keep the backend window running while using PharmacyOS.
+5. To stop safely, double click `PharmacyOS-Stop.bat`; it asks the local backend to create an app-exit backup before stopping the backend process.
 
-The launcher starts FastAPI/uvicorn on `http://localhost:8000`, sets `PHARMACYOS_MODE=LOCAL_MODE`, and stores local runtime data beside the application in `local_data\pharmacyos.sqlite3`, `backups\`, and `uploads\`. To stop the local server, close the launcher window or double click `stop-pharmacyos-local.bat`.
+Existing shortcuts remain compatible: `start-pharmacyos-local.bat` calls `PharmacyOS-Start.bat`, and `stop-pharmacyos-local.bat` calls `PharmacyOS-Stop.bat`.
+
+The launcher uses the existing SQLite local database path `local_data\pharmacyos.sqlite3` so existing local data is untouched. It also keeps the existing backup and upload paths beside the application: `backups\` and `uploads\`. Startup and stop status messages are appended to `logs\pharmacyos-local.log`.
+
+### Local desktop folder structure
+
+The Windows desktop package keeps local runtime folders beside the application:
+
+- `local_data\` stores the active SQLite database (`pharmacyos.sqlite3`) and local auth/sync tokens. This is the existing local database location and must not be deleted during launch, stop, or future updates.
+- `data\` is reserved for future desktop-package metadata and updater staging. Auto-update is not implemented yet.
+- `backups\` stores timestamped local JSON and package backups.
+- `uploads\` stores local upload files such as branding, logo, and signature assets.
+- `logs\` stores launcher/backend logs, including `logs\pharmacyos-local.log`.
 
 ### Backup and sync safety
 

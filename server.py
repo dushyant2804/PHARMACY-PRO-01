@@ -9584,6 +9584,15 @@ async def backup_exit(user: dict = Depends(require_role("admin"))):
     return await _create_and_sync_backup("app_exit")
 
 
+@api_router.post("/local/app-exit")
+async def local_app_exit_backup(request: Request):
+    if not LOCAL_MODE:
+        raise HTTPException(status_code=404, detail="Local app-exit backup is only available in LOCAL_MODE")
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="Local app-exit backup is restricted to this computer")
+    return await _create_and_sync_backup("app_exit")
+
 
 @api_router.post("/backup/google-drive/device-login")
 async def google_drive_device_login(user: dict = Depends(require_role("admin"))):
