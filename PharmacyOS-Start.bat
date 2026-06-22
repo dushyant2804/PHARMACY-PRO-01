@@ -25,6 +25,8 @@ set "BACKUP_DIR=%BASE_DIR%\backups"
 set "UPLOAD_DIR=%BASE_DIR%\uploads"
 set "LOG_DIR=%BASE_DIR%\logs"
 set "LOG_FILE=%LOG_DIR%\pharmacyos-local.log"
+set "BACKEND_CMD_FILE=%LOG_DIR%\pharmacyos-backend.cmd"
+set "BACKEND_OUTPUT_LOG=%LOG_DIR%\pharmacyos-backend-output.log"
 set "HEALTH_URL=http://localhost:8000/api/health"
 set "APP_URL=http://localhost:8000"
 
@@ -43,9 +45,11 @@ echo Database: %LOCAL_DB_PATH%
 echo Backups:  %BACKUP_DIR%
 echo Uploads:  %UPLOAD_DIR%
 echo Log file: %LOG_FILE%
+echo Backend output log: %BACKEND_OUTPUT_LOG%
 echo.
 echo [%date% %time%] PharmacyOS launcher starting.>>"%LOG_FILE%"
 echo [%date% %time%] Log file=%LOG_FILE%>>"%LOG_FILE%"
+echo [%date% %time%] Backend output log=%BACKEND_OUTPUT_LOG%>>"%LOG_FILE%"
 echo [%date% %time%] Database=%LOCAL_DB_PATH% Backups=%BACKUP_DIR% Uploads=%UPLOAD_DIR%>>"%LOG_FILE%"
 echo [%date% %time%] Health URL=%HEALTH_URL%>>"%LOG_FILE%"
 echo [%date% %time%] Launch command: %UVICORN_CMD%>>"%LOG_FILE%"
@@ -56,9 +60,14 @@ if errorlevel 1 (
     echo Launch command:
     echo %UVICORN_CMD%
     echo [%date% %time%] Starting backend.>>"%LOG_FILE%"
+    echo Backend output log: %BACKEND_OUTPUT_LOG%
     echo @echo off>"%BACKEND_CMD_FILE%"
-    echo cd /d "%APP_DIR%">>"%BACKEND_CMD_FILE%"
-    echo %UVICORN_CMD% ^>^> "%LOG_FILE%" 2^>^&1>>"%BACKEND_CMD_FILE%"
+    echo cd /d "%BASE_DIR%">>"%BACKEND_CMD_FILE%"
+    echo set PHARMACYOS_MODE=LOCAL_MODE>>"%BACKEND_CMD_FILE%"
+    echo set LOCAL_DB_PATH=%LOCAL_DB_PATH%>>"%BACKEND_CMD_FILE%"
+    echo set BACKUP_DIR=%BACKUP_DIR%>>"%BACKEND_CMD_FILE%"
+    echo set UPLOAD_DIR=%UPLOAD_DIR%>>"%BACKEND_CMD_FILE%"
+    echo %UVICORN_CMD% ^>^> "%BACKEND_OUTPUT_LOG%" 2^>^&1>>"%BACKEND_CMD_FILE%"
     wmic process call create "cmd.exe /c ""%BACKEND_CMD_FILE%""" > "%TEMP%\pharmacyos-wmic.txt" 2>nul
     set "BACKEND_PID="
     for /F "tokens=2 delims=;=" %%P in ('find "ProcessId" ^< "%TEMP%\pharmacyos-wmic.txt"') do set "BACKEND_PID=%%P"
@@ -90,7 +99,15 @@ for /L %%I in (1,1,60) do (
 
 echo.
 echo ERROR: PharmacyOS did not become healthy within 2 minutes.
-echo Check %LOG_FILE% for details. No data was deleted or changed by this launcher.
+echo Check %LOG_FILE% for launcher details. No data was deleted or changed by this launcher.
+echo Backend output log: %BACKEND_OUTPUT_LOG%
+if exist "%BACKEND_OUTPUT_LOG%" (
+    echo.
+    echo Last backend output log lines:
+    powershell -NoProfile -Command "Get-Content -LiteralPath '%BACKEND_OUTPUT_LOG%' -Tail 40"
+) else (
+    echo Backend output log was not created.
+)
 echo [%date% %time%] Health check failure: timeout waiting for %HEALTH_URL%.>>"%LOG_FILE%"
 pause
 exit /b 1
