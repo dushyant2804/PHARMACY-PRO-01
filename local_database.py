@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Union
+
+
+logger = logging.getLogger("pharmacy")
 
 
 class LocalInsertOneResult(SimpleNamespace):
@@ -182,10 +186,25 @@ class LocalSQLiteDatabase:
     def _ensure_collection(self, name):
         return None
 
+    def _sqlite_json1_available(self) -> bool:
+        try:
+            self.conn.execute("SELECT json_extract('{\"ok\": 1}', '$.ok')").fetchone()
+            return True
+        except sqlite3.OperationalError:
+            return False
+
     def _ensure_local_indexes(self):
+        # Non-JSON indexes are safe on all supported SQLite builds.
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_collection_updated ON documents(collection, updated_at)")
+
         # JSON expression indexes keep common Local Mode lookups responsive on
         # low-spec Windows 7 PCs while preserving the document storage model.
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_collection_updated ON documents(collection, updated_at)")
+        # Older Windows 7 SQLite builds may not include JSON1, so these indexes
+        # must be opportunistic and must never block LOCAL_MODE startup.
+        if not self._sqlite_json1_available():
+            logger.warning("SQLite JSON1 unavailable, skipping JSON indexes")
+            return
+
         indexed_fields = {
             "medicines": ["id", "medicine_key", "name", "batch_no", "barcode", "manufacturer", "category", "expiry_date", "distributor_id"],
             "invoices": ["id", "invoice_no", "customer_id", "created_at", "payment_mode"],
@@ -202,9 +221,15 @@ class LocalSQLiteDatabase:
             for field in fields:
                 safe = f"idx_{collection}_{field}".replace("-", "_")
                 path = f"$.{field}"
-                self.conn.execute(
-                    f"CREATE INDEX IF NOT EXISTS {safe} ON documents(json_extract(data, '{path}')) WHERE collection='{collection}'"
-                )
+                try:
+                    self.conn.execute(
+                        f"CREATE INDEX IF NOT EXISTS {safe} ON documents(json_extract(data, '{path}')) WHERE collection='{collection}'"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "json_extract" in str(exc).lower() or "no such function" in str(exc).lower():
+                        logger.warning("SQLite JSON1 unavailable, skipping JSON indexes")
+                        return
+                    raise
 
     def __getattr__(self, name):
         return LocalCollection(self, name)

@@ -144,6 +144,54 @@ def test_local_mode_database_open_failure_is_explicit(tmp_path):
 
 
 
+def test_sqlite_adapter_skips_json_indexes_when_json1_unavailable(tmp_path, monkeypatch, caplog):
+    import logging
+    import sqlite3
+
+    import local_database
+    from local_database import LocalSQLiteDatabase
+
+    real_connect = sqlite3.connect
+
+    class NoJsonConnection:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def execute(self, sql, *args, **kwargs):
+            if "json_extract" in sql.lower():
+                raise sqlite3.OperationalError("no such function: json_extract")
+            return self._wrapped.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+    def connect_without_json1(*args, **kwargs):
+        return NoJsonConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(local_database.sqlite3, "connect", connect_without_json1)
+
+    with caplog.at_level(logging.WARNING, logger="pharmacy"):
+        db = LocalSQLiteDatabase(tmp_path / "no-json1.sqlite3")
+
+    awaitable = db.items.insert_one({"id": "item-1", "name": "Legacy SQLite"})
+    import asyncio
+    asyncio.run(awaitable)
+    stored = asyncio.run(db.items.find_one({"id": "item-1"}))
+
+    assert stored["name"] == "Legacy SQLite"
+    assert "SQLite JSON1 unavailable, skipping JSON indexes" in caplog.text
+
+
+def test_sqlite_adapter_creates_json_indexes_when_json1_available(tmp_path):
+    from local_database import LocalSQLiteDatabase
+
+    db = LocalSQLiteDatabase(tmp_path / "json1.sqlite3")
+    indexes = db.conn.execute("SELECT name, sql FROM sqlite_master WHERE type='index'").fetchall()
+
+    assert any(name == "idx_documents_collection_updated" for name, _ in indexes)
+    assert any("json_extract" in (sql or "") for _, sql in indexes)
+
+
 def test_sqlite_adapter_query_and_update_patterns(tmp_path):
     import asyncio
 
