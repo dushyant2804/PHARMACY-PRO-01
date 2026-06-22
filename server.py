@@ -4,6 +4,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import os
+import copy
 import uuid
 import logging
 import math
@@ -28,11 +29,11 @@ from datetime import datetime, timezone, timedelta, date
 from calendar import monthrange
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Set, Tuple, Literal
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query, Body
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
@@ -73,6 +74,23 @@ BACKUP_COLLECTIONS = [
     "stock_adjustments", "daily_closings", "daily_sales", "expenses",
     "regular_patients", "settings",
 ]
+
+
+LOCAL_PERFORMANCE_MAX_RECENT = int(os.environ.get("LOCAL_PERFORMANCE_MAX_RECENT", "200"))
+LOCAL_SLOW_REQUEST_MS = int(os.environ.get("LOCAL_SLOW_REQUEST_MS", "500"))
+LOCAL_SUMMARY_CACHE_TTL_SECONDS = float(os.environ.get("LOCAL_SUMMARY_CACHE_TTL_SECONDS", "10"))
+LOCAL_BUSY_PATH_PREFIXES = (
+    "/api/invoices",
+    "/api/purchase-orders",
+    "/api/stock-adjustments",
+    "/api/ledger/customer/",
+    "/api/ledger/distributor/",
+    "/api/daily-closings",
+)
+LOCAL_BUSY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+FRONTEND_BUILD_DIR = Path(os.environ.get("FRONTEND_BUILD_DIR", ROOT_DIR / "frontend" / "build")).resolve()
+if not FRONTEND_BUILD_DIR.exists():
+    FRONTEND_BUILD_DIR = Path(os.environ.get("FRONTEND_DIST_DIR", ROOT_DIR / "frontend" / "dist")).resolve()
 
 LOCAL_IMPORT_PATHS = {
     "/api/local/import/dry-run",
@@ -308,8 +326,57 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 @app.get("/")
 def home():
+    if LOCAL_MODE and (FRONTEND_BUILD_DIR / "index.html").exists():
+        return FileResponse(str(FRONTEND_BUILD_DIR / "index.html"))
     return {"message": "Pharmacy backend is running"}
 api_router = APIRouter(prefix="/api")
+
+
+@app.middleware("http")
+async def local_mode_request_timing(request: Request, call_next):
+    global _local_busy_request_count
+    start = asyncio.get_running_loop().time()
+    path = request.url.path
+    method = request.method.upper()
+    cacheable = LOCAL_MODE and method == "GET" and (path == "/api/dashboard/summary" or path.startswith("/api/reports/"))
+    cache_key = f"{method}:{path}?{request.url.query}"
+    if cacheable:
+        now = asyncio.get_running_loop().time()
+        cached = _local_summary_cache.get(cache_key)
+        if cached and now - cached[0] <= LOCAL_SUMMARY_CACHE_TTL_SECONDS:
+            body, status_code, headers, media_type = cached[1]
+            return Response(content=body, status_code=status_code, headers=headers, media_type=media_type)
+    busy = _is_local_busy_path(method, path)
+    if LOCAL_MODE and busy:
+        _local_busy_request_count += 1
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        if cacheable and status_code == 200:
+            body = b""
+            async for chunk in response.body_iterator:
+                body += chunk
+            headers = dict(response.headers)
+            headers.pop("content-length", None)
+            _local_summary_cache[cache_key] = (asyncio.get_running_loop().time(), (body, status_code, headers, response.media_type))
+            return Response(content=body, status_code=status_code, headers=headers, media_type=response.media_type)
+        if LOCAL_MODE and busy and 200 <= status_code < 400:
+            _invalidate_local_summary_cache()
+        return response
+    finally:
+        duration_ms = round((asyncio.get_running_loop().time() - start) * 1000, 2)
+        if LOCAL_MODE:
+            record = {
+                "method": method, "path": path, "status_code": status_code,
+                "duration_ms": duration_ms, "at": datetime.now(timezone.utc).isoformat(),
+            }
+            _local_recent_requests.append(record)
+            logger.info("LOCAL_MODE request %s %s completed status=%s duration_ms=%.2f", method, path, status_code, duration_ms)
+            if duration_ms > LOCAL_SLOW_REQUEST_MS:
+                logger.warning("LOCAL_MODE slow request %s %s status=%s duration_ms=%.2f", method, path, status_code, duration_ms)
+        if LOCAL_MODE and busy:
+            _local_busy_request_count = max(0, _local_busy_request_count - 1)
 
 
 @app.exception_handler(RequestValidationError)
@@ -355,6 +422,40 @@ if not JWT_SECRET:
 logger = logging.getLogger("pharmacy")
 logging.basicConfig(level=logging.INFO)
 _background_tasks = set()
+_local_recent_requests = deque(maxlen=LOCAL_PERFORMANCE_MAX_RECENT)
+_local_summary_cache: Dict[str, Tuple[float, Any]] = {}
+_local_busy_request_count = 0
+_local_backup_sync_lock = asyncio.Lock()
+
+
+def _is_local_busy_path(method: str, path: str) -> bool:
+    return method.upper() in LOCAL_BUSY_METHODS and any(path.startswith(prefix) for prefix in LOCAL_BUSY_PATH_PREFIXES)
+
+
+def _local_request_busy() -> bool:
+    return LOCAL_MODE and _local_busy_request_count > 0
+
+
+def _local_summary_cache_key(name: str, *args, **kwargs) -> str:
+    return json.dumps([name, args, sorted(kwargs.items())], default=str, sort_keys=True)
+
+
+async def _local_cached_summary(name: str, producer, *args, **kwargs):
+    if not LOCAL_MODE:
+        return await producer(*args, **kwargs)
+    key = _local_summary_cache_key(name, *args, **kwargs)
+    now = asyncio.get_running_loop().time()
+    cached = _local_summary_cache.get(key)
+    if cached and now - cached[0] <= LOCAL_SUMMARY_CACHE_TTL_SECONDS:
+        return copy.deepcopy(cached[1])
+    value = await producer(*args, **kwargs)
+    _local_summary_cache[key] = (now, copy.deepcopy(value))
+    return value
+
+
+def _invalidate_local_summary_cache() -> None:
+    if LOCAL_MODE:
+        _local_summary_cache.clear()
 
 EXPIRY_WARNING_DAYS = 90
 DASHBOARD_RECENTLY_EXPIRED_DAYS = 90
@@ -1887,6 +1988,9 @@ async def startup():
         backup_task = asyncio.create_task(_scheduled_local_backup_loop())
         _background_tasks.add(backup_task)
         backup_task.add_done_callback(_background_tasks.discard)
+        idle_sync_task = asyncio.create_task(_local_idle_backup_sync_loop())
+        _background_tasks.add(idle_sync_task)
+        idle_sync_task.add_done_callback(_background_tasks.discard)
         logger.info("Local PharmacyOS server running at http://localhost:8000")
 
 
@@ -9384,7 +9488,14 @@ async def _process_pending_backup_queue(destination: Optional[str] = None) -> di
 
 async def _create_and_sync_backup(reason: str) -> dict:
     backup = await _create_local_backup(reason)
-    sync = await _process_pending_backup_queue()
+    if LOCAL_MODE and _local_request_busy():
+        logger.info("LOCAL_MODE backup %s queued; cloud sync deferred while system is busy", reason)
+        return {**backup, "atlas_backup_status": "queued_busy", "google_drive_backup_status": "queued_busy", "sync": {"deferred": True, "reason": "busy"}}
+    async with _local_backup_sync_lock:
+        if LOCAL_MODE and _local_request_busy():
+            logger.info("LOCAL_MODE backup %s queued; cloud sync deferred while system became busy", reason)
+            return {**backup, "atlas_backup_status": "queued_busy", "google_drive_backup_status": "queued_busy", "sync": {"deferred": True, "reason": "busy"}}
+        sync = await _process_pending_backup_queue()
     return {**backup, "atlas_backup_status": _destination_status(sync, "atlas"), "google_drive_backup_status": _destination_status(sync, "google_drive"), "sync": sync}
 
 
@@ -9400,9 +9511,27 @@ async def _scheduled_local_backup_loop() -> None:
     while True:
         await asyncio.sleep(30 * 60)
         try:
+            if LOCAL_MODE and _local_request_busy():
+                logger.info("LOCAL_MODE scheduled backup skipped while busy; pending cloud sync remains queued")
+                continue
             await _create_and_sync_backup("scheduled_30m")
         except Exception:
             logger.exception("Scheduled local backup failed")
+
+
+async def _local_idle_backup_sync_loop() -> None:
+    while True:
+        await asyncio.sleep(15)
+        if not LOCAL_MODE or _local_request_busy() or _local_backup_sync_lock.locked():
+            continue
+        try:
+            if await _pending_backup_count():
+                async with _local_backup_sync_lock:
+                    if not _local_request_busy():
+                        logger.info("LOCAL_MODE idle system detected; processing pending cloud backup queue")
+                        await _process_pending_backup_queue()
+        except Exception:
+            logger.exception("LOCAL_MODE idle backup sync failed")
 
 
 async def _last_backup_metadata() -> Optional[dict]:
@@ -9543,6 +9672,24 @@ def _restore_upload_files(payload: dict) -> int:
     return restored
 
 # ---------------- Backup ----------------
+@api_router.get("/local/performance")
+async def local_performance(user: dict = Depends(require_role("admin"))):
+    recent = list(_local_recent_requests)
+    slowest = sorted(recent, key=lambda item: item.get("duration_ms", 0), reverse=True)[:20]
+    grouped = defaultdict(lambda: {"count": 0, "total_ms": 0.0, "max_ms": 0.0})
+    for row in recent:
+        key = f"{row.get('method')} {row.get('path')}"
+        grouped[key]["count"] += 1
+        grouped[key]["total_ms"] += float(row.get("duration_ms") or 0)
+        grouped[key]["max_ms"] = max(grouped[key]["max_ms"], float(row.get("duration_ms") or 0))
+    endpoints = [
+        {"endpoint": key, "count": data["count"], "avg_ms": round(data["total_ms"] / data["count"], 2), "max_ms": round(data["max_ms"], 2)}
+        for key, data in grouped.items() if data["count"]
+    ]
+    endpoints.sort(key=lambda item: item["max_ms"], reverse=True)
+    return {"local_mode": LOCAL_MODE, "slow_threshold_ms": LOCAL_SLOW_REQUEST_MS, "busy": _local_request_busy(), "recent_count": len(recent), "slowest_recent_requests": slowest, "slowest_endpoints": endpoints[:20]}
+
+
 @api_router.get("/backup/export")
 async def backup_export(user: dict = Depends(require_role("admin"))):
     payload = await _backup_payload()
@@ -11320,3 +11467,9 @@ app.add_middleware(
 app.add_middleware(LocalImportRequestLoggingMiddleware)
 
 app.include_router(api_router)
+
+
+if LOCAL_MODE and FRONTEND_BUILD_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_BUILD_DIR / "assets")), name="frontend-assets") if (FRONTEND_BUILD_DIR / "assets").exists() else None
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_BUILD_DIR / "static")), name="frontend-static") if (FRONTEND_BUILD_DIR / "static").exists() else None
+    app.mount("/", StaticFiles(directory=str(FRONTEND_BUILD_DIR), html=True), name="frontend")

@@ -174,11 +174,37 @@ class LocalSQLiteDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("CREATE TABLE IF NOT EXISTS documents (collection TEXT NOT NULL, doc_id TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(collection, doc_id))")
+        self._ensure_local_indexes()
         self.conn.commit()
 
     def _ensure_collection(self, name):
         return None
+
+    def _ensure_local_indexes(self):
+        # JSON expression indexes keep common Local Mode lookups responsive on
+        # low-spec Windows 7 PCs while preserving the document storage model.
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_collection_updated ON documents(collection, updated_at)")
+        indexed_fields = {
+            "medicines": ["id", "medicine_key", "name", "batch_no", "barcode", "manufacturer", "category", "expiry_date", "distributor_id"],
+            "invoices": ["id", "invoice_no", "customer_id", "created_at", "payment_mode"],
+            "purchase_orders": ["id", "po_no", "distributor_id", "created_at", "po_date", "invoice_ref"],
+            "customers": ["id", "name", "mobile", "phone", "created_at"],
+            "distributors": ["id", "name", "mobile", "phone", "created_at"],
+            "customer_transactions": ["id", "customer_id", "type", "created_at", "invoice_number", "reference_number"],
+            "distributor_transactions": ["id", "distributor_id", "type", "created_at", "invoice_number", "reference_number", "purchase_order_id"],
+            "stock_adjustments": ["id", "medicine_id", "medicine_name", "batch_no", "adjustment_date", "adjustment_type", "created_at"],
+            "purchase_returns": ["id", "distributor_id", "distributor", "medicine_id", "medicine_name", "batch_number", "return_date", "reason", "ledger_adjusted", "po_adjustment_id"],
+            "daily_closings": ["id", "closing_date", "created_at"],
+        }
+        for collection, fields in indexed_fields.items():
+            for field in fields:
+                safe = f"idx_{collection}_{field}".replace("-", "_")
+                path = f"$.{field}"
+                self.conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS {safe} ON documents(json_extract(data, '{path}')) WHERE collection='{collection}'"
+                )
 
     def __getattr__(self, name):
         return LocalCollection(self, name)
