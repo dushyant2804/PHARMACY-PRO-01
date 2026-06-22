@@ -161,6 +161,62 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         finally:
             server._database_connected = original_database_connected
 
+
+    def test_local_import_cors_preflight_allows_deployed_frontend_and_localhost_origins(self):
+        import server
+
+        async def asgi_options(path, origin):
+            messages = []
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "OPTIONS",
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode(),
+                "query_string": b"",
+                "headers": [
+                    (b"host", b"localhost:8000"),
+                    (b"origin", origin.encode()),
+                    (b"access-control-request-method", b"POST"),
+                    (b"access-control-request-headers", b"authorization,content-type"),
+                ],
+                "client": ("127.0.0.1", 12345),
+                "server": ("localhost", 8000),
+            }
+
+            received = False
+
+            async def receive():
+                nonlocal received
+                if received:
+                    return {"type": "http.disconnect"}
+                received = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                messages.append(message)
+
+            await server.app(scope, receive, send)
+            start = next(message for message in messages if message["type"] == "http.response.start")
+            headers = {key.decode().lower(): value.decode() for key, value in start["headers"]}
+            return start["status"], headers
+
+        origins = [
+            "https://pharmacy-pro-01-frontend.onrender.com",
+            "http://localhost",
+            "http://localhost:3000",
+            "http://127.0.0.1",
+        ]
+        for path in ("/api/local/import/dry-run", "/api/local/import/confirm"):
+            for origin in origins:
+                status, headers = asyncio.run(asgi_options(path, origin))
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("access-control-allow-origin"), origin)
+                self.assertIn("POST", headers.get("access-control-allow-methods", ""))
+                self.assertIn("authorization", headers.get("access-control-allow-headers", "").lower())
+
     def test_old_and_new_business_settings_are_normalized_without_data_loss(self):
         from server import normalize_settings
 
