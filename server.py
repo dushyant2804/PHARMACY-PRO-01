@@ -36,6 +36,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
@@ -72,6 +73,58 @@ BACKUP_COLLECTIONS = [
     "stock_adjustments", "daily_closings", "daily_sales", "expenses",
     "regular_patients", "settings",
 ]
+
+LOCAL_IMPORT_PATHS = {
+    "/api/local/import/dry-run",
+    "/api/local/import/confirm",
+    "/api/local-mode/import/dry-run",
+    "/api/local-mode/import/confirm",
+}
+
+
+def _allowed_cors_origins() -> List[str]:
+    origins = {
+        "https://pharmacy-pro-01-frontend.onrender.com",
+        "http://localhost",
+        "http://localhost:3000",
+        "http://127.0.0.1",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    }
+    for env_name in ("FRONTEND_URL", "FRONTEND_ORIGIN", "RENDER_FRONTEND_ORIGIN"):
+        value = os.environ.get(env_name, "")
+        origins.update(origin.strip().rstrip("/") for origin in value.split(",") if origin.strip())
+    return sorted(origins)
+
+
+class LocalImportRequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in LOCAL_IMPORT_PATHS and request.method.upper() in {"OPTIONS", "POST"}:
+            auth_header = request.headers.get("Authorization", "")
+            cookie_auth = bool(request.cookies.get("access_token"))
+            logger.info(
+                "Local import request received: method=%s path=%s origin=%s auth=%s",
+                request.method.upper(),
+                request.url.path,
+                request.headers.get("origin", "<missing>"),
+                "present" if auth_header or cookie_auth else "missing",
+            )
+            try:
+                return await call_next(request)
+            except Exception:
+                logger.exception(
+                    "Local import request failed: method=%s path=%s origin=%s auth=%s",
+                    request.method.upper(),
+                    request.url.path,
+                    request.headers.get("origin", "<missing>"),
+                    "present" if auth_header or cookie_auth else "missing",
+                )
+                raise
+        return await call_next(request)
+
 LOCAL_FIRST_IMPORT_COLLECTIONS = [
     # Auth, roles, tenant bootstrap data. Password hashes are copied verbatim.
     "users", "roles", "pending_signups", "password_reset_requests",
@@ -9560,16 +9613,53 @@ async def google_drive_device_token(user: dict = Depends(require_role("admin")))
     _save_google_token(data)
     return {"ok": True, "token_path": str(GOOGLE_DRIVE_TOKEN_PATH)}
 
+@api_router.options("/local-mode/import/dry-run")
+@api_router.options("/local/import/dry-run")
+@api_router.options("/local-mode/import/confirm")
+@api_router.options("/local/import/confirm")
+async def local_mode_import_options(request: Request):
+    logger.info(
+        "Local import OPTIONS fallback: path=%s origin=%s auth=%s",
+        request.url.path,
+        request.headers.get("origin", "<missing>"),
+        "present" if request.headers.get("Authorization") or request.cookies.get("access_token") else "missing",
+    )
+    return {"ok": True}
+
+
 @api_router.post("/local-mode/import/dry-run")
 @api_router.post("/local/import/dry-run")
-async def local_mode_import_dry_run():
-    return await _cloud_to_local_import(dry_run=True, confirm=False, overwrite_local=False)
+async def local_mode_import_dry_run(request: Request = None):
+    logger.info(
+        "Local import dry-run POST handler: origin=%s auth=%s",
+        request.headers.get("origin", "<missing>") if request else "<direct-call>",
+        "present" if request and (request.headers.get("Authorization") or request.cookies.get("access_token")) else "missing",
+    )
+    try:
+        return await _cloud_to_local_import(dry_run=True, confirm=False, overwrite_local=False)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Local import dry-run failed with unexpected exception")
+        raise HTTPException(status_code=500, detail="Local import dry-run failed; check local backend logs for details")
 
 
 @api_router.post("/local-mode/import/confirm")
 @api_router.post("/local/import/confirm")
-async def local_mode_import_confirm(overwrite_local: bool = Query(False)):
-    return await _cloud_to_local_import(dry_run=False, confirm=True, overwrite_local=overwrite_local)
+async def local_mode_import_confirm(request: Request = None, overwrite_local: bool = Query(False)):
+    logger.info(
+        "Local import confirm POST handler: origin=%s auth=%s overwrite_local=%s",
+        request.headers.get("origin", "<missing>") if request else "<direct-call>",
+        "present" if request and (request.headers.get("Authorization") or request.cookies.get("access_token")) else "missing",
+        overwrite_local,
+    )
+    try:
+        return await _cloud_to_local_import(dry_run=False, confirm=True, overwrite_local=overwrite_local)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Local import confirm failed with unexpected exception")
+        raise HTTPException(status_code=500, detail="Local import confirm failed; check local backend logs for details")
 
 
 @api_router.post("/local-mode/import")
@@ -11186,18 +11276,12 @@ async def rebuild_inventory():
 
 app.add_middleware(
     CORSMiddleware,
-     allow_origins=[
-         "https://pharmacy-pro-01-frontend.onrender.com",
-         "http://localhost:3000",
-         "http://127.0.0.1:3000",
-         "http://localhost:5173",
-         "http://127.0.0.1:5173",
-         "http://localhost:8000",
-         "http://127.0.0.1:8000",
-     ],
+    allow_origins=_allowed_cors_origins(),
+    allow_origin_regex=r"https://.*\.onrender\.com|http://localhost(:\d+)?|http://127\.0\.0\.1(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(LocalImportRequestLoggingMiddleware)
 
 app.include_router(api_router)
