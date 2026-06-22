@@ -7,7 +7,8 @@ set "BASE_DIR=%~dp0"
 if "%BASE_DIR:~-1%"=="\" set "BASE_DIR=%BASE_DIR:~0,-1%"
 cd /d "%BASE_DIR%"
 
-set "APP_DIR=%BASE_DIR%"
+set "BACKEND_DIR=D:\pharmacy-app-v2\backend"
+set "APP_DIR=D:\pharmacy-app-v2"
 set "PHARMACYOS_MODE=LOCAL_MODE"
 set "DATA_DIR=%APP_DIR%\data"
 set "LOCAL_DATA_DIR=%APP_DIR%\local_data"
@@ -36,24 +37,29 @@ echo Mode: LOCAL_MODE
 echo Database: %LOCAL_DB_PATH%
 echo Backups:  %BACKUP_DIR%
 echo Uploads:  %UPLOAD_DIR%
+echo Backend dir: %BACKEND_DIR%
 echo Log file: %LOG_FILE%
-echo Backend output log: %BACKEND_OUTPUT_LOG%
 echo.
 echo [%date% %time%] PharmacyOS launcher starting.>>"%LOG_FILE%"
 echo [%date% %time%] Log file=%LOG_FILE%>>"%LOG_FILE%"
-echo [%date% %time%] Backend output log=%BACKEND_OUTPUT_LOG%>>"%LOG_FILE%"
 echo [%date% %time%] Backend command file=%BACKEND_CMD_FILE%>>"%LOG_FILE%"
+echo [%date% %time%] Backend dir=%BACKEND_DIR%>>"%LOG_FILE%"
 echo [%date% %time%] Database=%LOCAL_DB_PATH% Backups=%BACKUP_DIR% Uploads=%UPLOAD_DIR%>>"%LOG_FILE%"
 echo [%date% %time%] Health URL=%HEALTH_URL%>>"%LOG_FILE%"
 echo [%date% %time%] Launch command: %UVICORN_CMD%>>"%LOG_FILE%"
 
 call :CHECK_HEALTH
+if errorlevel 2 (
+    echo Local backend started but PHARMACYOS_MODE was not applied.
+    echo [%date% %time%] Health check failed because runtime_mode was CLOUD_MODE.>>"%LOG_FILE%"
+    pause
+    exit /b 1
+)
 if errorlevel 1 (
     echo Starting local backend on http://127.0.0.1:8000 ...
     echo Launch command:
     echo %UVICORN_CMD%
     echo [%date% %time%] Starting backend with Windows start command.>>"%LOG_FILE%"
-    echo Backend output log: %BACKEND_OUTPUT_LOG%
     echo Backend command file: %BACKEND_CMD_FILE%
     call :WRITE_BACKEND_CMD
     if errorlevel 1 (
@@ -63,7 +69,7 @@ if errorlevel 1 (
         exit /b 1
     )
     echo Backend command file created: yes
-    start "PharmacyOS Backend" /MIN cmd.exe /c ""%BACKEND_CMD_FILE%""
+    start "PharmacyOS Backend" /MIN cmd.exe /k ""%BACKEND_CMD_FILE%""
     if errorlevel 1 (
         echo ERROR: Windows could not start the backend process.
         echo [%date% %time%] start command failed with errorlevel !errorlevel!.>>"%LOG_FILE%"
@@ -81,6 +87,12 @@ echo Waiting for PharmacyOS health check: %HEALTH_URL%
 set "READY="
 for /L %%I in (1,1,60) do (
     call :CHECK_HEALTH
+    if errorlevel 2 (
+        echo Local backend started but PHARMACYOS_MODE was not applied.
+        echo [%date% %time%] Health check failed because runtime_mode was CLOUD_MODE.>>"%LOG_FILE%"
+        pause
+        exit /b 1
+    )
     if not errorlevel 1 (
         set "READY=1"
         goto :OPEN_APP
@@ -92,14 +104,7 @@ for /L %%I in (1,1,60) do (
 echo.
 echo ERROR: PharmacyOS did not become healthy within 2 minutes.
 echo Check %LOG_FILE% for launcher details. No data was deleted or changed by this launcher.
-echo Backend output log: %BACKEND_OUTPUT_LOG%
-if exist "%BACKEND_OUTPUT_LOG%" (
-    echo.
-    echo Last backend output log lines:
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath '%BACKEND_OUTPUT_LOG%' -Tail 40"
-) else (
-    echo Backend output log was not created.
-)
+echo The backend window was started visible/minimized. Restore it to review backend errors.
 echo [%date% %time%] Health check failure: timeout waiting for %HEALTH_URL%.>>"%LOG_FILE%"
 pause
 exit /b 1
@@ -127,15 +132,16 @@ goto :DONE
 :WRITE_BACKEND_CMD
 (
     echo @echo off
-    echo cd /d "%BASE_DIR%"
+    echo cd /d "%BACKEND_DIR%"
     echo set "PHARMACYOS_MODE=LOCAL_MODE"
     echo set "LOCAL_DB_PATH=%LOCAL_DB_PATH%"
     echo set "BACKUP_DIR=%BACKUP_DIR%"
     echo set "UPLOAD_DIR=%UPLOAD_DIR%"
-    echo echo [%%date%% %%time%%] Backend command starting. ^>^> "%BACKEND_OUTPUT_LOG%"
-    echo echo Command: %UVICORN_CMD% ^>^> "%BACKEND_OUTPUT_LOG%"
-    echo %UVICORN_CMD% ^>^> "%BACKEND_OUTPUT_LOG%" 2^>^&1
-    echo echo [%%date%% %%time%%] Backend command exited with errorlevel %%errorlevel%%. ^>^> "%BACKEND_OUTPUT_LOG%"
+    echo echo [%%date%% %%time%%] Backend command starting in %%CD%%.
+    echo echo Command: %UVICORN_CMD%
+    echo %UVICORN_CMD%
+    echo echo [%%date%% %%time%%] Backend command exited with errorlevel %%errorlevel%%.
+    echo echo Leave this window open to inspect backend errors.
 ) > "%BACKEND_CMD_FILE%"
 set "BACKEND_CMD_CREATED=no"
 set "BACKEND_CMD_SIZE="
@@ -156,9 +162,9 @@ exit /b 1
 :CHECK_HEALTH
 set "HEALTH_STDOUT=%TEMP%\pharmacyos-health-stdout-%RANDOM%.log"
 set "HEALTH_STDERR=%TEMP%\pharmacyos-health-stderr-%RANDOM%.log"
-echo Health-check command: python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); sys.exit(0 if r.getcode() in range(200, 300) and data.get('status') == 'ok' else 1)" "%HEALTH_URL%"
-echo [%date% %time%] Health-check command: python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); sys.exit(0 if r.getcode() in range(200, 300) and data.get('status') == 'ok' else 1)" "%HEALTH_URL%">>"%LOG_FILE%"
-python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); sys.exit(0 if r.getcode() in range(200, 300) and data.get('status') == 'ok' else 1)" "%HEALTH_URL%" > "%HEALTH_STDOUT%" 2> "%HEALTH_STDERR%"
+echo Health-check command: python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); sys.exit(0 if r.getcode() in range(200, 300) and data.get('status') == 'ok' and data.get('runtime_mode') == 'LOCAL_MODE' and data.get('local_mode') is True and data.get('local_database_connected') is True else (2 if data.get('runtime_mode') == 'CLOUD_MODE' else 1))" "%HEALTH_URL%"
+echo [%date% %time%] Health-check command: python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); sys.exit(0 if r.getcode() in range(200, 300) and data.get('status') == 'ok' and data.get('runtime_mode') == 'LOCAL_MODE' and data.get('local_mode') is True and data.get('local_database_connected') is True else (2 if data.get('runtime_mode') == 'CLOUD_MODE' else 1))" "%HEALTH_URL%">>"%LOG_FILE%"
+python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); print('HTTP status: %%s' %% r.getcode()); print('Response body: %%s' %% body); data = json.loads(body); mode = data.get('runtime_mode'); ok = r.getcode() in range(200, 300) and data.get('status') == 'ok' and mode == 'LOCAL_MODE' and data.get('local_mode') is True and data.get('local_database_connected') is True; sys.exit(0 if ok else (2 if mode == 'CLOUD_MODE' else 1))" "%HEALTH_URL%" > "%HEALTH_STDOUT%" 2> "%HEALTH_STDERR%"
 set "HEALTH_EXIT=%errorlevel%"
 echo Health-check exit code: %HEALTH_EXIT%
 echo [%date% %time%] Health-check exit code: %HEALTH_EXIT%>>"%LOG_FILE%"
