@@ -46,6 +46,53 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["full_version"], f"{response['latest_version']}+{response['latest_build']}")
         self.assertEqual(http_response.headers["cache-control"], "no-store, no-cache, must-revalidate, max-age=0")
 
+    def test_frontend_build_dir_env_overrides_take_precedence(self):
+        from pathlib import Path
+        from server import _resolve_frontend_build_dir
+
+        root = Path(self.id()).resolve()
+        self.assertEqual(
+            _resolve_frontend_build_dir({"FRONTEND_BUILD_DIR": "/tmp/custom-build", "FRONTEND_DIST_DIR": "/tmp/custom-dist"}, root),
+            Path("/tmp/custom-build").resolve(),
+        )
+        self.assertEqual(
+            _resolve_frontend_build_dir({"FRONTEND_DIST_DIR": "/tmp/custom-dist"}, root),
+            Path("/tmp/custom-dist").resolve(),
+        )
+
+    def test_frontend_build_dir_prefers_sibling_frontend_before_legacy(self):
+        import tempfile
+        from pathlib import Path
+        from server import _resolve_frontend_build_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "backend"
+            sibling_dist = Path(tmp) / "frontend" / "dist"
+            sibling_build = Path(tmp) / "frontend" / "build"
+            legacy_dist = root / "frontend" / "dist"
+            legacy_build = root / "frontend" / "build"
+            for path in (sibling_build, legacy_dist, legacy_build):
+                path.mkdir(parents=True)
+
+            self.assertEqual(_resolve_frontend_build_dir({}, root), sibling_build.resolve())
+
+            sibling_dist.mkdir(parents=True)
+            self.assertEqual(_resolve_frontend_build_dir({}, root), sibling_dist.resolve())
+
+    def test_frontend_build_dir_uses_legacy_dist_before_legacy_build(self):
+        import tempfile
+        from pathlib import Path
+        from server import _resolve_frontend_build_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "backend"
+            legacy_dist = root / "frontend" / "dist"
+            legacy_build = root / "frontend" / "build"
+            legacy_dist.mkdir(parents=True)
+            legacy_build.mkdir(parents=True)
+
+            self.assertEqual(_resolve_frontend_build_dir({}, root), legacy_dist.resolve())
+
     def test_version_config_supports_expected_update_types_and_returns_a_copy(self):
         from version_config import SUPPORTED_UPDATE_TYPES, VERSION_METADATA, get_version_metadata
 

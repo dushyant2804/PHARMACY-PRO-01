@@ -88,9 +88,33 @@ LOCAL_BUSY_PATH_PREFIXES = (
     "/api/daily-closings",
 )
 LOCAL_BUSY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
-FRONTEND_BUILD_DIR = Path(os.environ.get("FRONTEND_BUILD_DIR", ROOT_DIR / "frontend" / "build")).resolve()
-if not FRONTEND_BUILD_DIR.exists():
-    FRONTEND_BUILD_DIR = Path(os.environ.get("FRONTEND_DIST_DIR", ROOT_DIR / "frontend" / "dist")).resolve()
+def _resolve_frontend_build_dir(env: Optional[Dict[str, str]] = None, root_dir: Path = ROOT_DIR) -> Path:
+    """Resolve the local desktop frontend directory without changing cloud API behavior.
+
+    Explicit environment overrides win first. Otherwise prefer the sibling
+    frontend project used by the desktop launcher before the legacy in-repo
+    backend/frontend locations.
+    """
+    env = env or os.environ
+    if env.get("FRONTEND_BUILD_DIR"):
+        return Path(env["FRONTEND_BUILD_DIR"]).expanduser().resolve()
+    if env.get("FRONTEND_DIST_DIR"):
+        return Path(env["FRONTEND_DIST_DIR"]).expanduser().resolve()
+
+    candidates = [
+        root_dir.parent / "frontend" / "dist",
+        root_dir.parent / "frontend" / "build",
+        root_dir / "frontend" / "dist",
+        root_dir / "frontend" / "build",
+    ]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.exists():
+            return resolved
+    return candidates[-1].resolve()
+
+
+FRONTEND_BUILD_DIR = _resolve_frontend_build_dir()
 
 LOCAL_IMPORT_PATHS = {
     "/api/local/import/dry-run",
