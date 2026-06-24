@@ -228,6 +228,12 @@ def _tenant_filter(query: Optional[dict], tenant_id: str) -> dict:
 def _canonicalize_user_tenant(user: dict) -> dict:
     """Return an auth-safe user whose demo identity can never inherit another shop."""
     result = dict(user)
+    if not result.get("id") and result.get("_id"):
+        result["id"] = str(result["_id"])
+    if not result.get("tenant_id"):
+        result["tenant_id"] = result.get("shop_id") or REAL_TENANT_ID
+    if not result.get("shop_id"):
+        result["shop_id"] = result["tenant_id"]
     if result.get("id") == DEMO_USER_ID or result.get("is_demo") or result.get("tenant_id") == DEMO_TENANT_ID:
         result["id"] = DEMO_USER_ID
         result["tenant_id"] = DEMO_TENANT_ID
@@ -1004,6 +1010,37 @@ def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
+def _auth_identifier_matches(user: dict, identifier: str) -> bool:
+    needle = str(identifier or "").strip().lower()
+    return any(str(user.get(field) or "").strip().lower() == needle for field in ("email", "mobile", "identifier"))
+
+
+async def _find_local_auth_user_by_identifier(identifier: str) -> Optional[dict]:
+    users = await raw_db.users.find({}).to_list(None)
+    for user in users:
+        user = _canonicalize_user_tenant(user)
+        if user.get("id") == DEMO_USER_ID or user.get("tenant_id") == DEMO_TENANT_ID or user.get("is_demo") is True:
+            continue
+        if _auth_identifier_matches(user, identifier):
+            return user
+    return None
+
+
+async def _find_local_auth_user_by_id(user_id: str, token_is_demo: bool = False) -> Optional[dict]:
+    users = await raw_db.users.find({}).to_list(None)
+    for user in users:
+        user = _canonicalize_user_tenant(user)
+        if token_is_demo:
+            if user.get("id") == DEMO_USER_ID and user.get("tenant_id") == DEMO_TENANT_ID and user.get("is_demo") is True:
+                return user
+            continue
+        if user.get("is_demo") is True or user.get("tenant_id") == DEMO_TENANT_ID:
+            continue
+        if str(user.get("id") or "") == str(user_id) or str(user.get("_id") or "") == str(user_id):
+            return user
+    return None
+
+
 def create_access_token(user_id: str, email: str, role: str, tenant_id: Optional[str] = None, is_demo: bool = False) -> str:
     payload = {
         "sub": user_id, "email": email, "role": role, "tenant_id": tenant_id, "is_demo": is_demo,
@@ -1025,9 +1062,15 @@ async def get_current_user(request: Request) -> dict:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user_id = payload["sub"]
         token_is_demo = bool(payload.get("is_demo")) or user_id == DEMO_USER_ID
-        query = ({"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True}
-                 if token_is_demo else {"id": user_id, "tenant_id": {"$ne": DEMO_TENANT_ID}, "is_demo": {"$ne": True}})
-        user = await raw_db.users.find_one(query, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0})
+        if LOCAL_MODE:
+            user = await _find_local_auth_user_by_id(user_id, token_is_demo=token_is_demo)
+            if user:
+                user.pop("password_hash", None)
+                user.pop("reset_otp_hash", None)
+        else:
+            query = ({"id": DEMO_USER_ID, "tenant_id": DEMO_TENANT_ID, "is_demo": True}
+                     if token_is_demo else {"id": user_id, "tenant_id": {"$ne": DEMO_TENANT_ID}, "is_demo": {"$ne": True}})
+            user = await raw_db.users.find_one(query, {"_id": 0, "password_hash": 0, "reset_otp_hash": 0})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         user = _canonicalize_user_tenant(user)
@@ -2258,15 +2301,18 @@ def _login_response(user: dict, response: Response) -> dict:
 @api_router.post("/auth/login")
 async def login(payload: UserLogin, response: Response):
     identifier = str(payload.email or payload.mobile or payload.identifier or "").strip().lower()
-    user = await raw_db.users.find_one({
-        "$and": [
-            {"$or": [{"email": identifier}, {"mobile": identifier}]},
-            {"id": {"$ne": DEMO_USER_ID}},
-            {"tenant_id": {"$ne": DEMO_TENANT_ID}},
-            {"is_demo": {"$ne": True}},
-        ]
-    })
-    if not user or user.get("active", True) is False or not verify_password(payload.password, user["password_hash"]):
+    if LOCAL_MODE:
+        user = await _find_local_auth_user_by_identifier(identifier)
+    else:
+        user = await raw_db.users.find_one({
+            "$and": [
+                {"$or": [{"email": identifier}, {"mobile": identifier}]},
+                {"id": {"$ne": DEMO_USER_ID}},
+                {"tenant_id": {"$ne": DEMO_TENANT_ID}},
+                {"is_demo": {"$ne": True}},
+            ]
+        })
+    if not user or user.get("active", True) is False or not user.get("password_hash") or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     return _login_response(user, response)
 
