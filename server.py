@@ -4016,10 +4016,39 @@ async def _existing_document_max_sequence(prefix: str, today: str) -> int:
 async def _next_document_no(prefix: str) -> str:
     today = datetime.now(timezone.utc).strftime("%y%m%d")
     existing_max = await _existing_document_max_sequence(prefix, today)
+    counter_id = f"{_current_tenant.get() or REAL_TENANT_ID}:{prefix}-{today}"
+
+    if LOCAL_MODE:
+        # Cloud-to-local import intentionally reads MongoDB documents with
+        # ``{"_id": 0}``, so imported counter rows can be present in the
+        # SQLite JSON collection table without their Mongo ``_id``.  Resolve
+        # counters by the canonical id first, then by the JSON fields retained
+        # by import, and safely create the row if neither shape exists.
+        counter = (
+            await db.counters.find_one({"_id": counter_id})
+            or await db.counters.find_one({"id": counter_id})
+            or await db.counters.find_one({"prefix": prefix, "date": today})
+        )
+        next_sequence = max(int((counter or {}).get("seq") or 0), existing_max) + 1
+        update_query = {"_id": counter.get("_id")} if counter and counter.get("_id") else {"_id": counter_id}
+        if counter and not counter.get("_id"):
+            update_query = {"id": counter["id"]} if counter.get("id") else {"prefix": prefix, "date": today}
+        counter_update = {
+            "seq": next_sequence,
+            "prefix": prefix,
+            "date": today,
+        }
+        if not counter:
+            counter_update["_id"] = counter_id
+        await db.counters.update_one(
+            update_query,
+            {"$set": counter_update},
+            upsert=True,
+        )
+        return f"{prefix}-{today}-{next_sequence:04d}"
+
     counter = await db.counters.find_one_and_update(
-        {
-            "_id": f"{_current_tenant.get() or REAL_TENANT_ID}:{prefix}-{today}"
-        },
+        {"_id": counter_id},
         [
             {
                 "$set": {

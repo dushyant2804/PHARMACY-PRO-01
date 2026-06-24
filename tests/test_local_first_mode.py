@@ -407,3 +407,77 @@ asyncio.run(main())
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_local_mode_po_counter_missing_initializes_and_increments(tmp_path, monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv("MONGO_URL", "mongodb://localhost:27017")
+    monkeypatch.setenv("DB_NAME", "local_counter_test")
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    import server
+    from local_database import LocalSQLiteDatabase
+
+    async def exercise():
+        original_db = server.db
+        original_raw_db = server.raw_db
+        original_local_mode = server.LOCAL_MODE
+        local_db = LocalSQLiteDatabase(tmp_path / "missing-counter.sqlite3")
+        try:
+            server.db = local_db
+            server.raw_db = local_db
+            server.LOCAL_MODE = True
+            po = await server.create_po(server.POCreate(
+                distributor_id="dist-local",
+                distributor_name="Local Distributor",
+                invoice_ref="SUP-LOCAL-001",
+                po_date="2026-06-24",
+                items=[server.POItem(name="LocalMed", batch_no="B1", quantity=1, free_quantity=0, purchase_price=5, mrp=10, gst_rate=12, expiry_date="12/30")],
+            ), {"id": "u1", "name": "Local Admin", "email": "admin@example.com", "role": "admin", "tenant_id": server.REAL_TENANT_ID})
+            first = po["po_no"]
+            second = await server._next_po_no()
+            assert first.startswith("PO-")
+            assert second.startswith("PO-")
+            assert int(second.rsplit("-", 1)[-1]) == int(first.rsplit("-", 1)[-1]) + 1
+            counter = await local_db.counters.find_one({"_id": f"{server.REAL_TENANT_ID}:{first.rsplit('-', 1)[0]}"})
+            assert counter is not None
+            assert counter["seq"] == int(second.rsplit("-", 1)[-1])
+        finally:
+            server.db = original_db
+            server.raw_db = original_raw_db
+            server.LOCAL_MODE = original_local_mode
+
+    asyncio.run(exercise())
+
+
+def test_local_mode_po_counter_uses_imported_json_counter(tmp_path, monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv("MONGO_URL", "mongodb://localhost:27017")
+    monkeypatch.setenv("DB_NAME", "local_counter_test")
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    import server
+    from local_database import LocalSQLiteDatabase
+
+    async def exercise():
+        original_db = server.db
+        original_raw_db = server.raw_db
+        original_local_mode = server.LOCAL_MODE
+        local_db = LocalSQLiteDatabase(tmp_path / "imported-counter.sqlite3")
+        today = server.datetime.now(server.timezone.utc).strftime("%y%m%d")
+        try:
+            server.db = local_db
+            server.raw_db = local_db
+            server.LOCAL_MODE = True
+            await local_db.counters.insert_one({"prefix": "PO", "date": today, "seq": 41})
+            po_no = await server._next_po_no()
+            assert po_no == f"PO-{today}-0042"
+            counter = await local_db.counters.find_one({"prefix": "PO", "date": today})
+            assert counter["seq"] == 42
+            assert await local_db.counters.count_documents({"prefix": "PO", "date": today}) == 1
+        finally:
+            server.db = original_db
+            server.raw_db = original_raw_db
+            server.LOCAL_MODE = original_local_mode
+
+    asyncio.run(exercise())
