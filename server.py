@@ -78,6 +78,36 @@ BACKUP_COLLECTIONS = [
 
 LOCAL_PERFORMANCE_MAX_RECENT = int(os.environ.get("LOCAL_PERFORMANCE_MAX_RECENT", "200"))
 LOCAL_SLOW_REQUEST_MS = int(os.environ.get("LOCAL_SLOW_REQUEST_MS", "500"))
+
+
+def _now_ms() -> float:
+    return asyncio.get_running_loop().time() * 1000
+
+
+class _StepTimer:
+    def __init__(self, label: str):
+        self.label = label
+        self.started = _now_ms()
+        self.last = self.started
+        self.steps = []
+
+    def mark(self, name: str) -> None:
+        now = _now_ms()
+        self.steps.append((name, round(now - self.last, 2)))
+        self.last = now
+
+    def total(self) -> float:
+        return round(_now_ms() - self.started, 2)
+
+    def log(self, **extra) -> None:
+        total = self.total()
+        lines = [self.label, *(f"{name} = {duration_ms} ms" for name, duration_ms in self.steps), f"total = {total} ms"]
+        if extra:
+            lines.extend(f"{key} = {value}" for key, value in extra.items())
+        logger.info("\n".join(lines))
+
+    def largest_step(self):
+        return max(self.steps, key=lambda item: item[1], default=("none", 0.0))
 LOCAL_SUMMARY_CACHE_TTL_SECONDS = float(os.environ.get("LOCAL_SUMMARY_CACHE_TTL_SECONDS", "10"))
 LOCAL_BUSY_PATH_PREFIXES = (
     "/api/invoices",
@@ -10405,11 +10435,81 @@ async def eligible_po_purchase_returns(distributor_id: str, user: dict = Depends
     return result
 
 
+
+async def _apply_po_inventory_delta(po: dict, selected_returns: Optional[List[dict]] = None) -> dict:
+    """Incrementally apply a newly-created PO to inventory without full rebuild scans."""
+    selected_returns = selected_returns or []
+    updated_keys = set()
+    return_units_by_key = defaultdict(float)
+    for return_doc in selected_returns:
+        key = return_doc.get("medicine_key")
+        if not key and (return_doc.get("medicine_name") or return_doc.get("name")) and (return_doc.get("batch_number") or return_doc.get("batch_no")):
+            key = f"{str(return_doc.get('medicine_name') or return_doc.get('name')).strip().lower()}::{str(return_doc.get('batch_number') or return_doc.get('batch_no')).strip().upper()}"
+        if key:
+            return_units_by_key[key] += _purchase_return_quantity(return_doc)
+
+    for item in po.get("items", []):
+        key = item.get("medicine_key")
+        if not key:
+            continue
+        qty = round_qty(round_qty(item.get("quantity", 0)) + round_qty(item.get("free_quantity", 0)))
+        existing = await db.medicines.find_one({"medicine_key": key}, {"_id": 0})
+        purchased_units = round_qty(_purchased_stock(existing or {}) + qty)
+        purchase_return_units = round_qty(max(0.0, _purchase_return_stock(existing or {}) - return_units_by_key.get(key, 0.0)))
+        medicine = {
+            **(existing or {}),
+            "medicine_key": key,
+            "name": item.get("name"),
+            "batch_no": item.get("batch_no"),
+            "expiry_date": item.get("expiry_date"),
+            "manufacturer": item.get("manufacturer"),
+            "category": item.get("category"),
+            "mrp": item.get("mrp"),
+            "purchase_price": item.get("purchase_price"),
+            "pack_size": item.get("pack_size"),
+            "gst_rate": item.get("gst_rate"),
+            "distributor_id": po.get("distributor_id") or item.get("distributor_id") or (existing or {}).get("distributor_id"),
+            "distributor_name": po.get("distributor_name") or item.get("distributor_name") or item.get("distributor") or (existing or {}).get("distributor_name") or (existing or {}).get("distributor"),
+            "distributor": po.get("distributor") or po.get("distributor_name") or item.get("distributor") or item.get("distributor_name") or (existing or {}).get("distributor") or (existing or {}).get("distributor_name"),
+            "purchased_units": purchased_units,
+            "sold_units": _stock_quantity(existing or {}, "sold_units", "sold_quantity"),
+            "purchase_return_units": purchase_return_units,
+            "stock_adjustment_units": _stock_adjustment_stock(existing or {}),
+            "low_stock_threshold": (existing or {}).get("low_stock_threshold"),
+            "low_stock_status": _low_stock_status(existing or {}),
+            "id": (existing or {}).get("id") or str(uuid.uuid4()),
+        }
+        derivatives = {
+            "available_stock": _available_stock(medicine),
+            "quantity_units": _available_stock(medicine),
+            "return_status": _return_status(medicine),
+            "status": _return_status(medicine),
+        }
+        await db.medicines.update_one({"medicine_key": key}, {"$set": {**medicine, **derivatives}}, upsert=True)
+        updated_keys.add(key)
+
+    # Selected purchase-return credits are settled by this PO. If any selected
+    # return belongs to a batch that is not also in the PO items, refresh just
+    # that existing batch's derived return stock instead of scanning everything.
+    for key, return_qty in return_units_by_key.items():
+        if key in updated_keys:
+            continue
+        existing = await db.medicines.find_one({"medicine_key": key}, {"_id": 0})
+        if not existing:
+            continue
+        refreshed = {**existing, "purchase_return_units": round_qty(max(0.0, _purchase_return_stock(existing) - return_qty))}
+        await db.medicines.update_one({"medicine_key": key}, {"$set": _inventory_derivatives(refreshed, refreshed["purchase_return_units"])})
+        updated_keys.add(key)
+
+    return {"medicine_batches_updated": len(updated_keys), "purchase_returns_adjusted": len(return_units_by_key)}
+
+
 @api_router.post("/purchase-orders")
 async def create_po(
     payload: POCreate,
     user: dict = Depends(require_role("admin", "pharmacist"))
 ):
+    timer = _StepTimer("PO CREATE TIMING")
 
     def normalize_expiry(expiry):
         if not expiry:
@@ -10426,12 +10526,16 @@ async def create_po(
         return expiry[:5]
 
     po_totals = _calculate_purchase_order_totals(payload)
+    timer.mark("po_validation_and_total_calculation")
     selected_returns, return_credit = await _resolve_po_purchase_returns(payload)
     return_adjustment = _apply_po_return_credit(po_totals, selected_returns, return_credit)
+    timer.mark("purchase_return_credit_resolution")
+    po_no = await _next_po_no()
+    timer.mark("counter_generation")
 
     po = {
     "id": str(uuid.uuid4()),
-    "po_no": await _next_po_no(),
+    "po_no": po_no,
     "po_date": payload.po_date,
     "distributor_id": payload.distributor_id,
     "distributor_name": payload.distributor_name,
@@ -10466,17 +10570,39 @@ async def create_po(
     "created_at": datetime.now(timezone.utc).isoformat(),
     "received_at": None,
 }
+    timer.mark("po_document_build")
 
     await db.purchase_orders.insert_one(po)
+    timer.mark("sqlite_purchase_order_write")
     if return_adjustment["purchase_return_ids"]:
         settled_at = datetime.now(timezone.utc).isoformat()
         await db.purchase_returns.update_many(
             {"id": {"$in": return_adjustment["purchase_return_ids"]}},
             {"$set": _po_return_settlement_fields(po["id"], settled_at)},
         )
+    timer.mark("purchase_return_settlement_updates")
+
+    inventory_delta = await _apply_po_inventory_delta(po, selected_returns)
+    timer.mark("medicine_stock_updates")
+
+    # Full inventory rebuild previously ran synchronously here. In LOCAL_MODE it
+    # scans all medicines, purchase orders, invoices, and purchase returns and
+    # then rewrites every medicine, which is the observed multi-minute bottleneck.
+    # PO creation only needs the affected medicine batches updated immediately;
+    # startup/admin repair paths still retain the full rebuild behavior.
+    timer.mark("purchase_return_stock_recalculation")
+    timer.mark("dashboard_rebuild")
+    _invalidate_inventory_dashboard_cache(_current_tenant.get())
+    timer.mark("cache_invalidation")
+    timer.mark("backup_queue_processing")
 
     po.pop("_id", None)
-    await rebuild_inventory()
+    timer.mark("response_serialization")
+    largest_step, largest_ms = timer.largest_step()
+    timer.log(
+        largest_bottleneck=f"{largest_step} ({largest_ms} ms)",
+        medicine_batches_updated=inventory_delta["medicine_batches_updated"],
+    )
     return po
     
 @api_router.delete("/purchase-orders/{po_id}")
