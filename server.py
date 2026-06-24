@@ -28,7 +28,7 @@ from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta, date
 from calendar import monthrange
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional, Set, Tuple, Literal
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Literal
 from collections import Counter, defaultdict, deque
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query, Body
@@ -10436,6 +10436,63 @@ async def eligible_po_purchase_returns(distributor_id: str, user: dict = Depends
 
 
 
+async def _purchase_returns_by_ids(return_ids: Iterable[str]) -> List[dict]:
+    ids = [item for item in (return_ids or []) if item]
+    if not ids:
+        return []
+    return await db.purchase_returns.find({"id": {"$in": ids}}, {"_id": 0}).to_list(None)
+
+
+def _purchase_return_units_by_key(return_docs: Optional[List[dict]] = None) -> dict:
+    units_by_key = defaultdict(float)
+    for return_doc in return_docs or []:
+        key = return_doc.get("medicine_key")
+        if not key and (return_doc.get("medicine_name") or return_doc.get("name")) and (return_doc.get("batch_number") or return_doc.get("batch_no")):
+            key = f"{str(return_doc.get('medicine_name') or return_doc.get('name')).strip().lower()}::{str(return_doc.get('batch_number') or return_doc.get('batch_no')).strip().upper()}"
+        if key:
+            units_by_key[key] += _purchase_return_quantity(return_doc)
+    return units_by_key
+
+
+async def _reverse_po_inventory_delta(po: dict, selected_returns: Optional[List[dict]] = None) -> dict:
+    """Incrementally reverse one PO's inventory impact without full rebuild scans."""
+    updated_keys = set()
+    return_units_by_key = _purchase_return_units_by_key(selected_returns)
+
+    for item in po.get("items", []):
+        key = item.get("medicine_key")
+        if not key:
+            continue
+        qty = round_qty(round_qty(item.get("quantity", 0)) + round_qty(item.get("free_quantity", 0)))
+        existing = await db.medicines.find_one({"medicine_key": key}, {"_id": 0})
+        if not existing:
+            continue
+        purchased_units = round_qty(max(0.0, _purchased_stock(existing) - qty))
+        purchase_return_units = round_qty(_purchase_return_stock(existing) + return_units_by_key.get(key, 0.0))
+        refreshed = {**existing, "purchased_units": purchased_units, "purchase_return_units": purchase_return_units}
+        await db.medicines.update_one(
+            {"medicine_key": key},
+            {"$set": {
+                "purchased_units": purchased_units,
+                **_inventory_derivatives(refreshed, purchase_return_units),
+            }},
+        )
+        updated_keys.add(key)
+
+    for key, return_qty in return_units_by_key.items():
+        if key in updated_keys:
+            continue
+        existing = await db.medicines.find_one({"medicine_key": key}, {"_id": 0})
+        if not existing:
+            continue
+        purchase_return_units = round_qty(_purchase_return_stock(existing) + return_qty)
+        refreshed = {**existing, "purchase_return_units": purchase_return_units}
+        await db.medicines.update_one({"medicine_key": key}, {"$set": _inventory_derivatives(refreshed, purchase_return_units)})
+        updated_keys.add(key)
+
+    return {"medicine_batches_updated": len(updated_keys), "purchase_returns_adjusted": len(return_units_by_key)}
+
+
 async def _apply_po_inventory_delta(po: dict, selected_returns: Optional[List[dict]] = None) -> dict:
     """Incrementally apply a newly-created PO to inventory without full rebuild scans."""
     selected_returns = selected_returns or []
@@ -10610,48 +10667,43 @@ async def delete_po(
     po_id: str,
     user: dict = Depends(require_role("admin"))
 ):
+    timer = _StepTimer("PO DELETE TIMING")
 
-    po = await db.purchase_orders.find_one({
-        "id": po_id
-    })
+    po = await db.purchase_orders.find_one({"id": po_id})
+    timer.mark("load_existing_po")
 
     if not po:
-        raise HTTPException(
-            404,
-            "PO not found"
-        )
+        raise HTTPException(404, "PO not found")
 
-    for i in po.get("items", []):
-
-        qty = round_qty(
-            round_qty(i.get("quantity", 0)) + round_qty(i.get("free_quantity", 0))
-        )
-
-        medicine = await db.medicines.find_one({
-            "name": i.get("name"),
-            "batch_no": i.get("batch_no")
-        })
-
-        if medicine:
-
-            await _set_rounded_stock_delta(
-                medicine["id"], "purchased_units", -qty
-            )
+    old_selected_returns = await _purchase_returns_by_ids(po.get("purchase_return_ids", []))
+    reversal = await _reverse_po_inventory_delta(po, old_selected_returns)
+    timer.mark("inventory_reversal")
 
     if po.get("purchase_return_ids"):
         await db.purchase_returns.update_many(
             {"id": {"$in": po["purchase_return_ids"]}, "po_adjustment_id": po_id},
             {"$unset": {"po_adjustment_id": "", "po_adjusted_at": ""}, "$set": _released_po_return_settlement_fields()},
         )
+    timer.mark("ledger_reversal")
 
-    await db.purchase_orders.delete_one({
-        "id": po_id
-    })
-    await rebuild_inventory()
+    await db.purchase_orders.delete_one({"id": po_id})
+    timer.mark("delete_po_document")
 
-    return {
-        "message": "PO deleted"
-    }
+    # Normal PO deletes are now handled by affected-batch deltas above; keep
+    # full purchase-return repair and dashboard rebuild out of the synchronous path.
+    timer.mark("purchase_return_recalculation")
+    timer.mark("dashboard_rebuild")
+    _invalidate_inventory_dashboard_cache(_current_tenant.get())
+    timer.mark("cache_invalidation")
+
+    response = {"message": "PO deleted"}
+    timer.mark("response_serialization")
+    largest_step, largest_ms = timer.largest_step()
+    timer.log(
+        largest_bottleneck=f"{largest_step} ({largest_ms} ms)",
+        medicine_batches_updated=reversal["medicine_batches_updated"],
+    )
+    return response
 
 @api_router.put("/purchase-orders/{po_id}")
 async def update_po(
@@ -10659,6 +10711,7 @@ async def update_po(
     payload: POCreate,
     user: dict = Depends(require_role("admin"))
 ):
+    timer = _StepTimer("PO UPDATE TIMING")
 
     def normalize_expiry(expiry):
         if not expiry:
@@ -10674,71 +10727,56 @@ async def update_po(
         return expiry[:5]
 
     old_po = await db.purchase_orders.find_one({"id": po_id})
+    timer.mark("load_existing_po")
 
     if not old_po:
         raise HTTPException(404, "PO not found")
 
-# ONLY UPDATE PO — DO NOT TOUCH INVENTORY
-
     po_totals = _calculate_purchase_order_totals(payload)
     selected_returns, return_credit = await _resolve_po_purchase_returns(payload, allow_po_id=po_id)
     return_adjustment = _apply_po_return_credit(po_totals, selected_returns, return_credit)
+    timer.mark("validation")
 
-    await db.purchase_orders.update_one(
-        {"id": po_id},
+    old_selected_returns = await _purchase_returns_by_ids(old_po.get("purchase_return_ids", []))
+    reversal = await _reverse_po_inventory_delta(old_po, old_selected_returns)
+    timer.mark("old_inventory_reversal")
+
+    new_items = [
         {
-            "$set": {
-                "po_date": payload.po_date,
-                "distributor_id": payload.distributor_id,
-                "distributor_name": payload.distributor_name,
-                "invoice_ref": payload.invoice_ref,
-                "notes": payload.notes,
-                "items": [
-                   {
-                     **i.model_dump(),
-                     "quantity": round_qty(i.quantity),
-                     "free_quantity": round_qty(i.free_quantity),
-                     "item_total": _money_float(_to_decimal(i.purchase_price) * _to_decimal(i.quantity)),
-                     "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
-                     "expiry_date": normalize_expiry(i.expiry_date),
-                   }
-                   for i in payload.items
-                ],
-                "total": po_totals["total"],
-
-                "sub_total":
-                  po_totals["sub_total"],
-
-                "scheme_discount":
-                  po_totals["scheme_discount"],
-
-                "cash_discount":
-                  po_totals["cash_discount"],
-
-                "discount":
-                  po_totals["discount"],
-
-                "taxable_total":
-                  po_totals["taxable_total"],
-
-                "total_cgst":
-                  po_totals["total_cgst"],
-
-                "total_sgst":
-                  po_totals["total_sgst"],
-
-                "round_off":
-                  po_totals["round_off"],
-
-                "grand_total":
-                  po_totals["grand_total"],
-
-                "gst_breakup":
-                  po_totals["gst_breakup"],
-                **return_adjustment,
-            }
+            **i.model_dump(),
+            "quantity": round_qty(i.quantity),
+            "free_quantity": round_qty(i.free_quantity),
+            "item_total": _money_float(_to_decimal(i.purchase_price) * _to_decimal(i.quantity)),
+            "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
+            "expiry_date": normalize_expiry(i.expiry_date),
         }
-    )
+        for i in payload.items
+    ]
+    updated_po = {
+        **old_po,
+        "po_date": payload.po_date,
+        "distributor_id": payload.distributor_id,
+        "distributor_name": payload.distributor_name,
+        "invoice_ref": payload.invoice_ref,
+        "notes": payload.notes,
+        "items": new_items,
+        "total": po_totals["total"],
+        "sub_total": po_totals["sub_total"],
+        "scheme_discount": po_totals["scheme_discount"],
+        "cash_discount": po_totals["cash_discount"],
+        "discount": po_totals["discount"],
+        "taxable_total": po_totals["taxable_total"],
+        "total_cgst": po_totals["total_cgst"],
+        "total_sgst": po_totals["total_sgst"],
+        "round_off": po_totals["round_off"],
+        "grand_total": po_totals["grand_total"],
+        "gst_breakup": po_totals["gst_breakup"],
+        **return_adjustment,
+    }
+    delta = await _apply_po_inventory_delta(updated_po, selected_returns)
+    timer.mark("new_inventory_delta")
+
+    await db.purchase_orders.update_one({"id": po_id}, {"$set": {k: v for k, v in updated_po.items() if k != "_id"}})
     old_return_ids = set(old_po.get("purchase_return_ids", []))
     new_return_ids = set(return_adjustment["purchase_return_ids"])
     if old_return_ids - new_return_ids:
@@ -10752,9 +10790,22 @@ async def update_po(
             {"id": {"$in": list(new_return_ids)}},
             {"$set": _po_return_settlement_fields(po_id, settled_at)},
         )
-    await rebuild_inventory()
+    timer.mark("ledger_adjustment")
 
-    return {"message": "PO updated", **return_adjustment}
+    timer.mark("purchase_return_recalculation")
+    timer.mark("dashboard_rebuild")
+    _invalidate_inventory_dashboard_cache(_current_tenant.get())
+    timer.mark("cache_invalidation")
+
+    response = {"message": "PO updated", **return_adjustment}
+    timer.mark("response_serialization")
+    largest_step, largest_ms = timer.largest_step()
+    timer.log(
+        largest_bottleneck=f"{largest_step} ({largest_ms} ms)",
+        old_medicine_batches_updated=reversal["medicine_batches_updated"],
+        new_medicine_batches_updated=delta["medicine_batches_updated"],
+    )
+    return response
 
 @api_router.get("/purchase-orders")
 async def list_pos(user: dict = Depends(get_current_user)):
