@@ -39,6 +39,10 @@ class Collection:
             rows = [row for row in rows if row.get(key) == expected]
         return Cursor(rows)
 
+    async def find_one(self, query=None, *args, **kwargs):
+        rows = await self.find(query).to_list(1)
+        return rows[0] if rows else None
+
     async def update_one(self, query, update, upsert=False, *args, **kwargs):
         row = next((row for row in self.rows if all(row.get(k) == v for k, v in query.items())), None)
         if row is None:
@@ -119,3 +123,64 @@ class InventoryRebuildSalesSourceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(medicines.rows[0]["sold_units"], 3)
         self.assertEqual(medicines.rows[0]["available_stock"], 0)
+
+class PurchaseOrderCreatePerformanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_create_po_updates_only_affected_inventory_without_full_rebuild(self):
+        from server import POCreate, POItem, create_po
+
+        class PurchaseOrders(Collection):
+            async def insert_one(self, doc, *args, **kwargs):
+                self.rows.append(dict(doc))
+                return SimpleNamespace(inserted_id=doc.get("id"))
+
+        class Counters(Collection):
+            async def find_one(self, query=None, *args, **kwargs):
+                return None
+
+            async def update_one(self, query, update, upsert=False, *args, **kwargs):
+                self.rows.append({**query, **update.get("$set", {})})
+                return SimpleNamespace(modified_count=1)
+
+        class PurchaseReturns(Collection):
+            async def update_many(self, query, update, *args, **kwargs):
+                raise AssertionError("purchase returns should not be updated when none are selected")
+
+        medicines = Collection([{
+            "id": "existing-med",
+            "medicine_key": "fastmed::B1",
+            "name": "FastMed",
+            "batch_no": "B1",
+            "purchased_units": 4,
+            "sold_units": 1,
+            "purchase_return_units": 0,
+        }])
+        fake_db = SimpleNamespace(
+            medicines=medicines,
+            purchase_orders=PurchaseOrders([]),
+            purchase_returns=PurchaseReturns([]),
+            counters=Counters([]),
+            invoices=Collection([]),
+        )
+
+        async def fail_rebuild():
+            raise AssertionError("create_po must not run full inventory rebuild synchronously")
+
+        payload = POCreate(
+            distributor_id="dist-1",
+            distributor_name="Distributor",
+            invoice_ref="SUP-1",
+            po_date="2026-06-24",
+            items=[POItem(name="FastMed", batch_no="B1", quantity=6, free_quantity=2, purchase_price=5, mrp=9, gst_rate=5)],
+        )
+
+        with patch("server.db", fake_db), patch("server.rebuild_inventory", fail_rebuild), patch("server._next_po_no", return_value="PO-260624-0001"):
+            po = await create_po(payload, {"role": "admin"})
+
+        self.assertTrue(po["po_no"].startswith("PO-"))
+        self.assertEqual(len(fake_db.purchase_orders.rows), 1)
+        self.assertEqual(len(medicines.rows), 1)
+        med = medicines.rows[0]
+        self.assertEqual(med["purchased_units"], 12)
+        self.assertEqual(med["sold_units"], 1)
+        self.assertEqual(med["available_stock"], 11)
+        self.assertEqual(med["quantity_units"], 11)
