@@ -18,10 +18,9 @@ set "BACKUP_DIR=%APP_DIR%\backups"
 set "UPLOAD_DIR=%APP_DIR%\uploads"
 set "LOG_DIR=%APP_DIR%\logs"
 set "LOG_FILE=%LOG_DIR%\pharmacyos-local.log"
-set "BACKEND_CMD_FILE=%LOG_DIR%\pharmacyos-backend-hidden.cmd"
-set "BACKEND_VBS_FILE=%LOG_DIR%\pharmacyos-backend-hidden.vbs"
+set "BACKEND_VBS_FILE=%BASE_DIR%\PharmacyOS-Backend-Hidden.vbs"
+set "BACKEND_BAT_FILE=%BASE_DIR%\PharmacyOS-Backend-Hidden.bat"
 set "BACKEND_OUTPUT_LOG=%LOG_DIR%\pharmacyos-backend-output.log"
-set "UVICORN_CMD=python -m uvicorn server:app --host 127.0.0.1 --port 8000"
 set "HEALTH_URL=http://127.0.0.1:8000/api/health"
 set "APP_URL=http://127.0.0.1:8000"
 
@@ -37,8 +36,19 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 >>"%LOG_FILE%" echo [%date% %time%] Mode=LOCAL_MODE
 >>"%LOG_FILE%" echo [%date% %time%] Database=%LOCAL_DB_PATH% Backups=%BACKUP_DIR% Uploads=%UPLOAD_DIR%
 >>"%LOG_FILE%" echo [%date% %time%] Backend dir=%BACKEND_DIR%
+>>"%LOG_FILE%" echo [%date% %time%] Backend VBS=%BACKEND_VBS_FILE%
+>>"%LOG_FILE%" echo [%date% %time%] Backend BAT=%BACKEND_BAT_FILE%
 >>"%LOG_FILE%" echo [%date% %time%] Backend output log=%BACKEND_OUTPUT_LOG%
 >>"%LOG_FILE%" echo [%date% %time%] Health URL=%HEALTH_URL%
+
+if not exist "%BACKEND_VBS_FILE%" (
+    >>"%LOG_FILE%" echo [%date% %time%] ERROR: Missing backend hidden launcher: %BACKEND_VBS_FILE%
+    exit /b 1
+)
+if not exist "%BACKEND_BAT_FILE%" (
+    >>"%LOG_FILE%" echo [%date% %time%] ERROR: Missing backend hidden command: %BACKEND_BAT_FILE%
+    exit /b 1
+)
 
 call :CHECK_HEALTH
 if errorlevel 2 (
@@ -46,15 +56,10 @@ if errorlevel 2 (
     exit /b 2
 )
 if errorlevel 1 (
-    >>"%LOG_FILE%" echo [%date% %time%] Backend not healthy yet. Starting hidden background backend.
-    call :WRITE_BACKEND_CMD
+    >>"%LOG_FILE%" echo [%date% %time%] Backend not healthy yet. Starting permanent hidden backend launcher.
+    wscript.exe "%BACKEND_VBS_FILE%"
     if errorlevel 1 (
-        >>"%LOG_FILE%" echo [%date% %time%] ERROR: Could not create backend command file: %BACKEND_CMD_FILE%
-        exit /b 1
-    )
-    start "" wscript.exe "%BACKEND_VBS_FILE%"
-    if errorlevel 1 (
-        >>"%LOG_FILE%" echo [%date% %time%] ERROR: Windows start command failed with errorlevel !errorlevel!.
+        >>"%LOG_FILE%" echo [%date% %time%] ERROR: Backend hidden launcher failed with errorlevel !errorlevel!.
         exit /b 1
     )
     >>"%LOG_FILE%" echo [%date% %time%] Hidden backend start command issued.
@@ -93,36 +98,6 @@ if defined CHROME_EXE (
 
 >>"%LOG_FILE%" echo [%date% %time%] Quiet launcher finished successfully.
 exit /b 0
-
-:WRITE_BACKEND_CMD
-(
-    echo @echo off
-    echo cd /d "%BACKEND_DIR%"
-    echo set "PHARMACYOS_MODE=LOCAL_MODE"
-    echo set "LOCAL_DB_PATH=%LOCAL_DB_PATH%"
-    echo set "BACKUP_DIR=%BACKUP_DIR%"
-    echo set "UPLOAD_DIR=%UPLOAD_DIR%"
-    echo echo [%%date%% %%time%%] Hidden backend command starting in %%CD%%.
-    echo echo Command: %UVICORN_CMD%
-    echo %UVICORN_CMD%
-    echo echo [%%date%% %%time%%] Hidden backend command exited with errorlevel %%errorlevel%%.
-) > "%BACKEND_CMD_FILE%"
-(
-    echo Option Explicit
-    echo Dim shell
-    echo Set shell = CreateObject("WScript.Shell"^)
-    echo shell.Run "cmd.exe /c """"%BACKEND_CMD_FILE%"""" ^>^> """"%BACKEND_OUTPUT_LOG%"""" 2^>^&1", 0, False
-) > "%BACKEND_VBS_FILE%"
-set "BACKEND_CMD_SIZE="
-if exist "%BACKEND_CMD_FILE%" for %%A in ("%BACKEND_CMD_FILE%") do set "BACKEND_CMD_SIZE=%%~zA"
-set "BACKEND_VBS_SIZE="
-if exist "%BACKEND_VBS_FILE%" for %%A in ("%BACKEND_VBS_FILE%") do set "BACKEND_VBS_SIZE=%%~zA"
->>"%LOG_FILE%" echo [%date% %time%] Backend command file=%BACKEND_CMD_FILE%
->>"%LOG_FILE%" echo [%date% %time%] Backend VBS file=%BACKEND_VBS_FILE%
-if defined BACKEND_CMD_SIZE >>"%LOG_FILE%" echo [%date% %time%] Backend command file size=!BACKEND_CMD_SIZE! bytes
-if defined BACKEND_VBS_SIZE >>"%LOG_FILE%" echo [%date% %time%] Backend VBS file size=!BACKEND_VBS_SIZE! bytes
-if defined BACKEND_CMD_SIZE if defined BACKEND_VBS_SIZE if !BACKEND_CMD_SIZE! GTR 0 if !BACKEND_VBS_SIZE! GTR 0 exit /b 0
-exit /b 1
 
 :CHECK_HEALTH
 set "HEALTH_STDOUT=%TEMP%\pharmacyos-health-stdout-%RANDOM%.log"
