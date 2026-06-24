@@ -41,19 +41,24 @@ Local mode stores JSON documents in SQLite through a Mongo-like adapter so the e
 
 When the local backend is running on the default port, the frontend health check should target `http://localhost:8000/api/health`. The root health alias `GET /health` returns the same local server status for compatibility, and startup logs include `Local PharmacyOS server running at http://localhost:8000`.
 
-### Windows one-click local desktop launcher
+### Windows local desktop launcher
 
-Windows desktop users do not need to type terminal commands to start the local backend:
+Windows desktop users do not need to type terminal commands to start the local backend. Use the quiet desktop launcher for day-to-day use and keep the visible BAT launcher for troubleshooting:
 
-1. Double click `PharmacyOS-Start.bat`.
-2. The launcher sets `PHARMACYOS_MODE=LOCAL_MODE`, starts FastAPI/uvicorn on `http://localhost:8000`, and waits until `http://localhost:8000/api/health` responds.
-3. After the server is healthy, the launcher opens PharmacyOS in a Chrome app window. If Chrome is not installed in a standard Windows location, it falls back to the default browser.
-4. Keep the backend window running while using PharmacyOS.
-5. To stop safely, double click `PharmacyOS-Stop.bat`; it asks the local backend to create an app-exit backup before stopping the backend process.
+1. Double click `PharmacyOS-Launch.vbs` for the desktop-software experience. It runs `PharmacyOS-Desktop-Start.bat` hidden, starts the local backend in the background, waits until `http://127.0.0.1:8000/api/health` reports `LOCAL_MODE`, then opens `http://127.0.0.1:8000` in a Chrome app window. If Chrome is not installed in a standard Windows location, it falls back to the default browser.
+2. If startup fails, `PharmacyOS-Launch.vbs` shows a short troubleshooting message. Review `logs\pharmacyos-local.log` and `logs\pharmacyos-backend-output.log`, or double click `PharmacyOS-Start.bat` to run the original visible launcher and see detailed console output.
+3. To stop safely, double click `PharmacyOS-Stop.bat`; it asks the local backend to create an app-exit backup before stopping the backend process.
 
-Existing shortcuts remain compatible: `start-pharmacyos-local.bat` calls `PharmacyOS-Start.bat`, and `stop-pharmacyos-local.bat` calls `PharmacyOS-Stop.bat`.
+To create a desktop shortcut with an icon:
 
-The launcher uses the existing SQLite local database path `local_data\pharmacyos.sqlite3` so existing local data is untouched. It also keeps the existing backup and upload paths beside the application: `backups\` and `uploads\`. Startup and stop status messages are appended to `logs\pharmacyos-local.log`.
+1. Right click `PharmacyOS-Launch.vbs` and choose **Send to > Desktop (create shortcut)**.
+2. On the desktop, right click the new shortcut, choose **Properties**, and keep **Target** pointed at `PharmacyOS-Launch.vbs`.
+3. Choose **Change Icon...** and select a PharmacyOS `.ico` file if one is included with the desktop package, or select an icon from a Windows file such as `%SystemRoot%\System32\shell32.dll`.
+4. Rename the shortcut to **PharmacyOS**.
+
+Existing shortcuts remain compatible: `start-pharmacyos-local.bat` calls `PharmacyOS-Start.bat`, and `stop-pharmacyos-local.bat` calls `PharmacyOS-Stop.bat`. `PharmacyOS-Start.bat` is intentionally still visible so support staff can inspect startup messages and backend errors.
+
+The launcher uses the existing SQLite local database path `local_data\pharmacyos.sqlite3` so existing local data is untouched. It also keeps the existing backup and upload paths beside the application: `backups\` and `uploads\`. Startup, stop, and quiet-launcher status messages are appended to `logs\pharmacyos-local.log`; backend output from the quiet launcher is appended to `logs\pharmacyos-backend-output.log`.
 
 ### Local desktop folder structure
 
