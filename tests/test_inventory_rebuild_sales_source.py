@@ -184,3 +184,87 @@ class PurchaseOrderCreatePerformanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(med["sold_units"], 1)
         self.assertEqual(med["available_stock"], 11)
         self.assertEqual(med["quantity_units"], 11)
+
+class PurchaseOrderUpdateDeletePerformanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_po_updates_inventory_without_full_rebuild_quickly(self):
+        from server import POCreate, POItem, update_po
+        import time
+
+        class PurchaseOrders(Collection):
+            async def update_one(self, query, update, upsert=False, *args, **kwargs):
+                row = await self.find_one(query)
+                row.update(update.get("$set", {}))
+                return SimpleNamespace(modified_count=1)
+
+        class PurchaseReturns(Collection):
+            async def update_many(self, query, update, *args, **kwargs):
+                return SimpleNamespace(modified_count=0)
+
+        medicines = Collection([{
+            "id": "med-1", "medicine_key": "fastmed::B1", "name": "FastMed", "batch_no": "B1",
+            "purchased_units": 10, "sold_units": 2, "purchase_return_units": 0,
+        }])
+        purchase_orders = PurchaseOrders([{
+            "id": "po-1", "po_no": "PO-1", "distributor_id": "dist-1", "distributor_name": "Distributor",
+            "items": [{"medicine_key": "fastmed::B1", "name": "FastMed", "batch_no": "B1", "quantity": 10, "free_quantity": 0}],
+            "purchase_return_ids": [],
+        }])
+        fake_db = SimpleNamespace(medicines=medicines, purchase_orders=purchase_orders, purchase_returns=PurchaseReturns([]))
+
+        async def fail_rebuild():
+            raise AssertionError("update_po must not run full inventory rebuild synchronously")
+
+        payload = POCreate(
+            distributor_id="dist-1", distributor_name="Distributor", invoice_ref="SUP-2", po_date="2026-06-24",
+            items=[POItem(name="FastMed", batch_no="B1", quantity=14, free_quantity=1, purchase_price=5, mrp=9, gst_rate=5)],
+        )
+        started = time.perf_counter()
+        with patch("server.db", fake_db), patch("server.rebuild_inventory", fail_rebuild):
+            result = await update_po("po-1", payload, {"role": "admin"})
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(result["message"], "PO updated")
+        self.assertLess(elapsed, 2.0)
+        med = medicines.rows[0]
+        self.assertEqual(med["purchased_units"], 15)
+        self.assertEqual(med["available_stock"], 13)
+
+    async def test_delete_po_reverses_inventory_without_full_rebuild_quickly(self):
+        from server import delete_po
+        import time
+
+        class PurchaseOrders(Collection):
+            async def delete_one(self, query, *args, **kwargs):
+                before = len(self.rows)
+                self.rows[:] = [row for row in self.rows if not all(row.get(k) == v for k, v in query.items())]
+                return SimpleNamespace(deleted_count=before - len(self.rows))
+
+        class PurchaseReturns(Collection):
+            async def update_many(self, query, update, *args, **kwargs):
+                return SimpleNamespace(modified_count=0)
+
+        medicines = Collection([{
+            "id": "med-1", "medicine_key": "fastmed::B1", "name": "FastMed", "batch_no": "B1",
+            "purchased_units": 15, "sold_units": 2, "purchase_return_units": 0,
+        }])
+        purchase_orders = PurchaseOrders([{
+            "id": "po-1", "po_no": "PO-1", "distributor_id": "dist-1", "distributor_name": "Distributor",
+            "items": [{"medicine_key": "fastmed::B1", "name": "FastMed", "batch_no": "B1", "quantity": 15, "free_quantity": 0}],
+            "purchase_return_ids": [],
+        }])
+        fake_db = SimpleNamespace(medicines=medicines, purchase_orders=purchase_orders, purchase_returns=PurchaseReturns([]))
+
+        async def fail_rebuild():
+            raise AssertionError("delete_po must not run full inventory rebuild synchronously")
+
+        started = time.perf_counter()
+        with patch("server.db", fake_db), patch("server.rebuild_inventory", fail_rebuild):
+            result = await delete_po("po-1", {"role": "admin"})
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(result["message"], "PO deleted")
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(purchase_orders.rows), 0)
+        med = medicines.rows[0]
+        self.assertEqual(med["purchased_units"], 0)
+        self.assertEqual(med["available_stock"], 0)
