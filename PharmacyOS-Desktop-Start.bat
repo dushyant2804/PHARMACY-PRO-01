@@ -21,8 +21,11 @@ set "LOG_FILE=%LOG_DIR%\pharmacyos-local.log"
 set "BACKEND_VBS_FILE=%BASE_DIR%\PharmacyOS-Backend-Hidden.vbs"
 set "BACKEND_BAT_FILE=%BASE_DIR%\PharmacyOS-Backend-Hidden.bat"
 set "BACKEND_OUTPUT_LOG=%LOG_DIR%\pharmacyos-backend-output.log"
+set "HEALTH_CHECK_PY=%BASE_DIR%\PharmacyOS-Health-Check.py"
 set "HEALTH_URL=http://127.0.0.1:8000/api/health"
+set "DOCS_URL=http://127.0.0.1:8000/docs"
 set "APP_URL=http://127.0.0.1:8000"
+set "FINAL_EXIT_CODE=1"
 
 if not exist "%LOCAL_DATA_DIR%" mkdir "%LOCAL_DATA_DIR%"
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
@@ -39,51 +42,59 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 >>"%LOG_FILE%" echo [%date% %time%] Backend VBS=%BACKEND_VBS_FILE%
 >>"%LOG_FILE%" echo [%date% %time%] Backend BAT=%BACKEND_BAT_FILE%
 >>"%LOG_FILE%" echo [%date% %time%] Backend output log=%BACKEND_OUTPUT_LOG%
+>>"%LOG_FILE%" echo [%date% %time%] Health-check helper=%HEALTH_CHECK_PY%
 >>"%LOG_FILE%" echo [%date% %time%] Health URL=%HEALTH_URL%
 
 if not exist "%BACKEND_VBS_FILE%" (
+    set "FINAL_EXIT_CODE=1"
     >>"%LOG_FILE%" echo [%date% %time%] ERROR: Missing backend hidden launcher: %BACKEND_VBS_FILE%
-    exit /b 1
+    >>"%LOG_FILE%" echo [%date% %time%] Final decision: failure; final exit code !FINAL_EXIT_CODE!.
+    exit /b !FINAL_EXIT_CODE!
 )
 if not exist "%BACKEND_BAT_FILE%" (
+    set "FINAL_EXIT_CODE=1"
     >>"%LOG_FILE%" echo [%date% %time%] ERROR: Missing backend hidden command: %BACKEND_BAT_FILE%
-    exit /b 1
+    >>"%LOG_FILE%" echo [%date% %time%] Final decision: failure; final exit code !FINAL_EXIT_CODE!.
+    exit /b !FINAL_EXIT_CODE!
+)
+if not exist "%HEALTH_CHECK_PY%" (
+    set "FINAL_EXIT_CODE=1"
+    >>"%LOG_FILE%" echo [%date% %time%] ERROR: Missing health-check helper: %HEALTH_CHECK_PY%
+    >>"%LOG_FILE%" echo [%date% %time%] Final decision: failure; final exit code !FINAL_EXIT_CODE!.
+    exit /b !FINAL_EXIT_CODE!
 )
 
-call :CHECK_HEALTH
-if errorlevel 2 (
-    >>"%LOG_FILE%" echo [%date% %time%] Quiet launcher stopped: health endpoint reports CLOUD_MODE.
-    exit /b 2
-)
-if errorlevel 1 (
-    >>"%LOG_FILE%" echo [%date% %time%] Backend not healthy yet. Starting permanent hidden backend launcher.
-    wscript.exe "%BACKEND_VBS_FILE%"
-    if errorlevel 1 (
-        >>"%LOG_FILE%" echo [%date% %time%] ERROR: Backend hidden launcher failed with errorlevel !errorlevel!.
-        exit /b 1
-    )
-    >>"%LOG_FILE%" echo [%date% %time%] Hidden backend start command issued.
-) else (
+call :CHECK_HEALTH 0
+if not errorlevel 1 (
     >>"%LOG_FILE%" echo [%date% %time%] Backend already running; opening app.
     goto :OPEN_APP
 )
 
+>>"%LOG_FILE%" echo [%date% %time%] Backend not healthy yet. Starting permanent hidden backend launcher.
+wscript.exe "%BACKEND_VBS_FILE%"
+if errorlevel 1 (
+    set "FINAL_EXIT_CODE=1"
+    >>"%LOG_FILE%" echo [%date% %time%] ERROR: Backend hidden launcher failed with errorlevel !errorlevel!.
+    >>"%LOG_FILE%" echo [%date% %time%] Final decision: failure; final exit code !FINAL_EXIT_CODE!.
+    exit /b !FINAL_EXIT_CODE!
+)
+>>"%LOG_FILE%" echo [%date% %time%] Hidden backend start command issued.
+
 for /L %%I in (1,1,60) do (
-    call :CHECK_HEALTH
-    if errorlevel 2 (
-        >>"%LOG_FILE%" echo [%date% %time%] Quiet launcher stopped: health endpoint reports CLOUD_MODE after backend start.
-        exit /b 2
-    )
+    call :CHECK_HEALTH %%I
     if not errorlevel 1 goto :OPEN_APP
     >>"%LOG_FILE%" echo [%date% %time%] Waiting for health check %%I/60.
     timeout /t 2 /nobreak >nul
 )
 
->>"%LOG_FILE%" echo [%date% %time%] ERROR: PharmacyOS did not become healthy within 2 minutes.
-exit /b 1
+set "FINAL_EXIT_CODE=1"
+>>"%LOG_FILE%" echo [%date% %time%] ERROR: PharmacyOS did not become reachable at %HEALTH_URL% within 2 minutes.
+>>"%LOG_FILE%" echo [%date% %time%] Final decision: failure; backend never became reachable after full timeout; final exit code %FINAL_EXIT_CODE%.
+exit /b %FINAL_EXIT_CODE%
 
 :OPEN_APP
->>"%LOG_FILE%" echo [%date% %time%] Health check success. Opening PharmacyOS app window.
+set "FINAL_EXIT_CODE=0"
+>>"%LOG_FILE%" echo [%date% %time%] Final decision: success; %HEALTH_URL% returned HTTP 200; opening PharmacyOS app window; final exit code %FINAL_EXIT_CODE%.
 set "CHROME_EXE="
 if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" set "CHROME_EXE=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
 if not defined CHROME_EXE if exist "%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe" set "CHROME_EXE=%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"
@@ -96,17 +107,17 @@ if defined CHROME_EXE (
     start "PharmacyOS" "%APP_URL%"
 )
 
->>"%LOG_FILE%" echo [%date% %time%] Quiet launcher finished successfully.
-exit /b 0
+>>"%LOG_FILE%" echo [%date% %time%] Quiet launcher finished successfully with final exit code %FINAL_EXIT_CODE%.
+exit /b %FINAL_EXIT_CODE%
 
 :CHECK_HEALTH
-set "HEALTH_STDOUT=%TEMP%\pharmacyos-health-stdout-%RANDOM%.log"
-set "HEALTH_STDERR=%TEMP%\pharmacyos-health-stderr-%RANDOM%.log"
-python -c "import json, sys, urllib.request; url = sys.argv[1]; r = urllib.request.urlopen(url, timeout=2); body = r.read().decode('utf-8'); data = json.loads(body); mode = data.get('runtime_mode'); ok = r.getcode() in range(200, 300) and data.get('status') == 'ok' and mode == 'LOCAL_MODE' and data.get('local_mode') is True and data.get('local_database_connected') is True; sys.exit(0 if ok else (2 if mode == 'CLOUD_MODE' else 1))" "%HEALTH_URL%" > "%HEALTH_STDOUT%" 2> "%HEALTH_STDERR%"
+set "HEALTH_ATTEMPT=%~1"
+if "%HEALTH_ATTEMPT%"=="" set "HEALTH_ATTEMPT=0"
+set "HEALTH_RESULT=%TEMP%\pharmacyos-health-result-%RANDOM%.log"
+python "%HEALTH_CHECK_PY%" "%HEALTH_URL%" "%DOCS_URL%" "%HEALTH_RESULT%" >nul 2>&1
 set "HEALTH_EXIT=%errorlevel%"
->>"%LOG_FILE%" echo [%date% %time%] Health-check exit code: %HEALTH_EXIT%
-if exist "%HEALTH_STDOUT%" type "%HEALTH_STDOUT%" >> "%LOG_FILE%"
-if exist "%HEALTH_STDERR%" type "%HEALTH_STDERR%" >> "%LOG_FILE%"
-if exist "%HEALTH_STDOUT%" del "%HEALTH_STDOUT%" >nul 2>nul
-if exist "%HEALTH_STDERR%" del "%HEALTH_STDERR%" >nul 2>nul
+>>"%LOG_FILE%" echo [%date% %time%] Health-check attempt %HEALTH_ATTEMPT%; URL=%HEALTH_URL%
+if exist "%HEALTH_RESULT%" type "%HEALTH_RESULT%" >> "%LOG_FILE%"
+if not exist "%HEALTH_RESULT%" >>"%LOG_FILE%" echo Health-check helper failed before writing result.
+if exist "%HEALTH_RESULT%" del "%HEALTH_RESULT%" >nul 2>nul
 exit /b %HEALTH_EXIT%

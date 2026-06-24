@@ -14,6 +14,10 @@ End If
 
 exitCode = shell.Run("""" & launcher & """", 0, True)
 
+If exitCode = 0 Then
+    WScript.Quit 0
+End If
+
 If exitCode <> 0 Then
     MsgBox "PharmacyOS could not start cleanly." & vbCrLf & vbCrLf & _
            "Troubleshooting options:" & vbCrLf & _
