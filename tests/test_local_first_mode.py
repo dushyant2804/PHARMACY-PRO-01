@@ -331,3 +331,79 @@ asyncio.run(main())
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+def test_local_mode_auth_reads_imported_users_json_table(tmp_path):
+    db_path = tmp_path / "imported.sqlite3"
+    backup_dir = tmp_path / "backups"
+    script = r'''
+import asyncio, json, os, sqlite3
+from types import SimpleNamespace
+from fastapi import HTTPException
+from starlette.responses import Response
+
+import server
+
+PASSWORD = "StrongPass123"
+
+async def main():
+    user = {
+        "_id": "mongo-admin-id", "email": "dushyantbhadu07@gmail.com", "name": "SHREE SHYAM PHARMACY",
+        "role": "admin", "shop_id": "real_shop", "tenant_id": "real_shop", "is_demo": False,
+        "active": True, "password_hash": server.hash_password(PASSWORD),
+    }
+    with sqlite3.connect(os.environ["LOCAL_DB_PATH"]) as conn:
+        conn.execute("DROP TABLE IF EXISTS users")
+        conn.execute("CREATE TABLE users (_doc_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO users(_doc_id, data, updated_at) VALUES (?, ?, ?)", (user["_id"], json.dumps(user), "2026-06-24T00:00:00+00:00"))
+        conn.commit()
+
+    response = Response()
+    login = await server.login(server.UserLogin(email=user["email"], password=PASSWORD), response)
+    assert login["id"] == user["_id"]
+    assert login["email"] == user["email"]
+    assert login["name"] == user["name"]
+    assert login["role"] == "admin"
+    assert login["shop_id"] == "real_shop"
+    assert login["is_demo"] is False
+    assert login["token"]
+
+    try:
+        await server.login(server.UserLogin(email=user["email"], password="WrongPass123"), Response())
+    except HTTPException as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("invalid password should fail")
+
+    request = SimpleNamespace(cookies={}, headers={"Authorization": "Bearer " + login["token"]}, method="GET", url=SimpleNamespace(path="/api/auth/me"))
+    me = await server.get_current_user(request)
+    assert me["id"] == user["_id"]
+    assert me["email"] == user["email"]
+    assert me["name"] == user["name"]
+    assert me["role"] == "admin"
+    assert me["shop_id"] == "real_shop"
+    assert me["is_demo"] is False
+
+    demo = await server.demo_login(Response())
+    assert demo["id"] == server.DEMO_USER_ID
+    assert demo["is_demo"] is True
+    assert demo["shop_id"] == server.DEMO_TENANT_ID
+
+asyncio.run(main())
+'''
+    env = os.environ.copy()
+    env.update({
+        "PHARMACYOS_MODE": "LOCAL_MODE",
+        "DB_NAME": "unused_local_test",
+        "LOCAL_DB_PATH": str(db_path),
+        "BACKUP_DIR": str(backup_dir),
+        "JWT_SECRET": "test-secret",
+    })
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

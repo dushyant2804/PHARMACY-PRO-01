@@ -189,13 +189,22 @@ class LocalSQLiteDatabase:
         self.conn.execute(
             f"CREATE TABLE IF NOT EXISTS {table} (doc_id TEXT NOT NULL PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
         )
+        id_column = self._collection_id_column(table)
         self.conn.execute(
-            f"INSERT OR IGNORE INTO {table}(doc_id, data, updated_at) "
+            f"INSERT OR IGNORE INTO {table}({id_column}, data, updated_at) "
             "SELECT doc_id, data, updated_at FROM documents WHERE collection=?",
             (str(name),),
         )
         self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_updated ON {table}(updated_at)")
         self.conn.commit()
+
+    def _collection_id_column(self, table: str) -> str:
+        columns = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "doc_id" in columns:
+            return "doc_id"
+        if "_doc_id" in columns:
+            return "_doc_id"
+        raise sqlite3.OperationalError(f"Collection table {table} has no doc_id/_doc_id column")
 
     def _collection_table_name(self, name):
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(name)):
@@ -272,7 +281,8 @@ class LocalSQLiteDatabase:
         payload = json.dumps(doc, default=str)
         updated_at = datetime.now(timezone.utc).isoformat()
         self.conn.execute("INSERT OR REPLACE INTO documents(collection, doc_id, data, updated_at) VALUES (?, ?, ?, ?)", (collection, doc_id, payload, updated_at))
-        self.conn.execute(f"INSERT OR REPLACE INTO {table}(doc_id, data, updated_at) VALUES (?, ?, ?)", (doc_id, payload, updated_at))
+        id_column = self._collection_id_column(table)
+        self.conn.execute(f"INSERT OR REPLACE INTO {table}({id_column}, data, updated_at) VALUES (?, ?, ?)", (doc_id, payload, updated_at))
         self.conn.commit()
 
     def _delete(self, collection, query, multi=True):
@@ -282,7 +292,8 @@ class LocalSQLiteDatabase:
                 doc_id = str(doc.get("_id", doc.get("id")))
                 table = self._collection_table_name(collection)
                 self.conn.execute("DELETE FROM documents WHERE collection=? AND doc_id=?", (collection, doc_id))
-                self.conn.execute(f"DELETE FROM {table} WHERE doc_id=?", (doc_id,))
+                id_column = self._collection_id_column(table)
+                self.conn.execute(f"DELETE FROM {table} WHERE {id_column}=?", (doc_id,))
                 deleted += 1
                 if not multi:
                     break
