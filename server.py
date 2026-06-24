@@ -9588,7 +9588,25 @@ def _json_safe_mongo_document(document: dict) -> dict:
 
 async def _local_collection_counts(collections: Optional[List[str]] = None) -> dict:
     names = collections or LOCAL_FIRST_IMPORT_COLLECTIONS
-    return {name: await raw_db[name].count_documents({}) for name in names}
+    counts = {}
+    for name in names:
+        if LOCAL_MODE and hasattr(raw_db, "collection_table_count"):
+            counts[name] = raw_db.collection_table_count(name)
+        else:
+            counts[name] = await raw_db[name].count_documents({})
+    return counts
+
+
+def _local_import_sqlite_path() -> Path:
+    if not LOCAL_MODE or not isinstance(raw_db, LocalSQLiteDatabase):
+        raise HTTPException(status_code=400, detail="Cloud-to-local import requires the LOCAL_MODE SQLite backend")
+    configured = Path(LOCAL_DB_PATH).expanduser().resolve()
+    if raw_db.path != configured:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Local import SQLite path mismatch: health path {configured} but active database is {raw_db.path}",
+        )
+    return raw_db.path
 
 
 async def _cloud_to_local_source_counts(cloud_database, collections: Optional[List[str]] = None) -> dict:
@@ -9609,6 +9627,7 @@ def _require_local_cloud_import_config() -> Tuple[str, str]:
 
 async def _cloud_to_local_import(dry_run: bool, confirm: bool, overwrite_local: bool) -> dict:
     source_url, source_db_name = _require_local_cloud_import_config()
+    sqlite_path = _local_import_sqlite_path()
     started_at = datetime.now(timezone.utc).isoformat()
     source_client = AsyncIOMotorClient(source_url, serverSelectionTimeoutMS=8000)
     try:
@@ -9626,6 +9645,7 @@ async def _cloud_to_local_import(dry_run: bool, confirm: bool, overwrite_local: 
             "overwrite_local": overwrite_local,
             "started_at": started_at,
             "source_database": source_db_name,
+            "local_database_path": str(sqlite_path),
             "collections": LOCAL_FIRST_IMPORT_COLLECTIONS,
             "cloud_records_found": cloud_counts,
             "local_records_before_import": local_before,
@@ -9649,6 +9669,14 @@ async def _cloud_to_local_import(dry_run: bool, confirm: bool, overwrite_local: 
                 await raw_db[collection_name].insert_many(safe_docs)
             imported[collection_name] = len(safe_docs)
         local_after = await _local_collection_counts()
+        mismatches = {
+            name: {"imported": imported.get(name, 0), "sqlite_count": local_after.get(name, 0)}
+            for name in LOCAL_FIRST_IMPORT_COLLECTIONS
+            if local_after.get(name, 0) != imported.get(name, 0)
+        }
+        if mismatches:
+            logger.error("Local first cloud import verification failed: %s", mismatches)
+            raise HTTPException(status_code=500, detail={"message": "Local import verification failed after SQLite commit", "mismatches": mismatches})
         logger.info("Local first cloud import complete: cloud records found=%s", cloud_counts)
         logger.info("Local first cloud import complete: local records before import=%s", local_before)
         logger.info("Local first cloud import complete: local records after import=%s", local_after)

@@ -11,6 +11,7 @@ import json
 import logging
 import sqlite3
 import uuid
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -184,7 +185,27 @@ class LocalSQLiteDatabase:
         self.conn.commit()
 
     def _ensure_collection(self, name):
-        return None
+        table = self._collection_table_name(name)
+        self.conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {table} (doc_id TEXT NOT NULL PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        self.conn.execute(
+            f"INSERT OR IGNORE INTO {table}(doc_id, data, updated_at) "
+            "SELECT doc_id, data, updated_at FROM documents WHERE collection=?",
+            (str(name),),
+        )
+        self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_updated ON {table}(updated_at)")
+        self.conn.commit()
+
+    def _collection_table_name(self, name):
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(name)):
+            raise ValueError(f"Unsafe SQLite collection/table name: {name}")
+        return str(name)
+
+    def collection_table_count(self, name):
+        table = self._collection_table_name(name)
+        self._ensure_collection(name)
+        return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
     def _sqlite_json1_available(self) -> bool:
         try:
@@ -238,18 +259,30 @@ class LocalSQLiteDatabase:
         return LocalCollection(self, name)
 
     def _read_all(self, collection):
-        rows = self.conn.execute("SELECT data FROM documents WHERE collection=?", (collection,)).fetchall()
+        self._ensure_collection(collection)
+        table = self._collection_table_name(collection)
+        rows = self.conn.execute(f"SELECT data FROM {table}").fetchall()
+        if not rows:
+            rows = self.conn.execute("SELECT data FROM documents WHERE collection=?", (collection,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def _upsert(self, collection, doc_id, doc):
-        self.conn.execute("INSERT OR REPLACE INTO documents(collection, doc_id, data, updated_at) VALUES (?, ?, ?, ?)", (collection, doc_id, json.dumps(doc, default=str), datetime.now(timezone.utc).isoformat()))
+        self._ensure_collection(collection)
+        table = self._collection_table_name(collection)
+        payload = json.dumps(doc, default=str)
+        updated_at = datetime.now(timezone.utc).isoformat()
+        self.conn.execute("INSERT OR REPLACE INTO documents(collection, doc_id, data, updated_at) VALUES (?, ?, ?, ?)", (collection, doc_id, payload, updated_at))
+        self.conn.execute(f"INSERT OR REPLACE INTO {table}(doc_id, data, updated_at) VALUES (?, ?, ?)", (doc_id, payload, updated_at))
         self.conn.commit()
 
     def _delete(self, collection, query, multi=True):
         deleted = 0
         for doc in self._read_all(collection):
             if _matches(doc, query):
-                self.conn.execute("DELETE FROM documents WHERE collection=? AND doc_id=?", (collection, str(doc.get("_id", doc.get("id")))))
+                doc_id = str(doc.get("_id", doc.get("id")))
+                table = self._collection_table_name(collection)
+                self.conn.execute("DELETE FROM documents WHERE collection=? AND doc_id=?", (collection, doc_id))
+                self.conn.execute(f"DELETE FROM {table} WHERE doc_id=?", (doc_id,))
                 deleted += 1
                 if not multi:
                     break

@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -119,6 +120,10 @@ asyncio.run(main())
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    with sqlite3.connect(db_path) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "users" in tables
+        assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
 
 
 def test_local_mode_database_open_failure_is_explicit(tmp_path):
@@ -186,9 +191,11 @@ def test_sqlite_adapter_creates_json_indexes_when_json1_available(tmp_path):
     from local_database import LocalSQLiteDatabase
 
     db = LocalSQLiteDatabase(tmp_path / "json1.sqlite3")
+    _ = db.users
     indexes = db.conn.execute("SELECT name, sql FROM sqlite_master WHERE type='index'").fetchall()
 
     assert any(name == "idx_documents_collection_updated" for name, _ in indexes)
+    assert any(name == "users" for name, _ in db.conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'").fetchall())
     assert any("json_extract" in (sql or "") for _, sql in indexes)
 
 
@@ -275,14 +282,17 @@ async def main():
     server.AsyncIOMotorClient = lambda *args, **kwargs: fake_client
     dry = await server.local_mode_import_dry_run()
     assert dry["dry_run"] is True
+    assert dry["local_database_path"] == str(server.LOCAL_DB_PATH.resolve())
     assert dry["cloud_records_found"]["users"] == 1
     assert dry["local_records_before_import"]["users"] == 0
     assert dry["local_records_after_import"] is None
+    assert server.raw_db.collection_table_count("users") == 0
 
     imported = await server.local_mode_import_confirm(overwrite_local=False)
     assert imported["dry_run"] is False
     assert imported["imported"]["users"] == 1
     assert imported["local_records_after_import"]["users"] == 1
+    assert server.raw_db.collection_table_count("users") == imported["imported"]["users"]
 
     stored = await server.raw_db.users.find_one({"email": "owner@example.com"})
     assert stored["password_hash"] == password_hash
