@@ -85,9 +85,8 @@ Local mode writes timestamped JSON backups locally first, then attempts non-dest
 - `GET /api/backup/health` reports local, Atlas, and Google Drive status, last successful timestamps, and pending queue counts.
 - `GET /api/backup/status` is a compatibility alias for `GET /api/backup/health`.
 - `POST /api/backup/sync/retry` retries pending Atlas and Google Drive queue entries.
-- `POST /api/backup/google-drive/device-login` starts Google OAuth device-code login for a local Windows desktop, and `POST /api/backup/google-drive/device-token` stores the resulting token locally.
 
-Atlas backup uses `ATLAS_BACKUP_MONGO_URL` and stores timestamped records in `local_backup_snapshots` without replacing existing snapshots. Google Drive backup uses `GOOGLE_DRIVE_CLIENT_ID`, optional `GOOGLE_DRIVE_CLIENT_SECRET`, and `GOOGLE_DRIVE_TOKEN_PATH`; uploaded backup packages go into a `PharmacyOS` Drive folder. Set `BACKUP_ENCRYPTION_KEY` to encrypt the packaged JSON backup before Drive upload. Failed Atlas or Google Drive uploads remain queued locally and are retried by scheduled/manual/exit backup flows or `/api/backup/sync/retry`.
+Atlas backup uses `ATLAS_BACKUP_MONGO_URL` and stores timestamped records in `local_backup_snapshots` without replacing existing snapshots. Google Drive backup uses a Google Service Account JSON key from `GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH` (or legacy alias `GOOGLE_SERVICE_ACCOUNT_JSON`) and uploads backup ZIP packages directly into the fixed Drive folder ID configured with `GOOGLE_DRIVE_FOLDER_ID`; share that Drive folder with the service account email. OAuth login, refresh tokens, and Connect Google Drive are not used. Set `BACKUP_ENCRYPTION_KEY` to encrypt the packaged JSON backup before Drive upload. Failed Atlas or Google Drive uploads remain queued locally and are retried by scheduled/manual/exit backup flows or `/api/backup/sync/retry`.
 
 ### Migration/export flow
 

@@ -207,6 +207,8 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/api/health", route_paths)
             self.assertIn("/api/backup/health", route_paths)
             self.assertIn("/api/backup/status", route_paths)
+            self.assertNotIn("/api/backup/google-drive/device-login", route_paths)
+            self.assertNotIn("/api/backup/google-drive/device-token", route_paths)
         finally:
             server._database_connected = original_database_connected
 
