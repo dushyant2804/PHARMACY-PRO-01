@@ -199,6 +199,7 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
             server._database_connected = healthy_database
             payload = asyncio.run(server.api_health())
             self.assertEqual(payload["status"], "ok")
+            self.assertTrue(payload["system_stable"])
             self.assertTrue(payload["local_backend_running"])
 
             route_paths = {route.path for route in server.app.routes}
@@ -208,6 +209,33 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/api/backup/status", route_paths)
         finally:
             server._database_connected = original_database_connected
+
+    def test_health_system_stable_reflects_startup_maintenance_state(self):
+        import server
+
+        original_state = dict(server._STARTUP_STABILITY)
+        try:
+            server._STARTUP_STABILITY.update({
+                "maintenance_running": True,
+                "tenant_initialization_complete": True,
+                "purchase_return_recalculation_complete": True,
+                "indexing_complete": True,
+            })
+            self.assertFalse(server._system_stable())
+
+            server._STARTUP_STABILITY.update({
+                "maintenance_running": False,
+                "tenant_initialization_complete": True,
+                "purchase_return_recalculation_complete": True,
+                "indexing_complete": True,
+            })
+            self.assertTrue(server._system_stable())
+
+            server._STARTUP_STABILITY["purchase_return_recalculation_complete"] = False
+            self.assertFalse(server._system_stable())
+        finally:
+            server._STARTUP_STABILITY.clear()
+            server._STARTUP_STABILITY.update(original_state)
 
 
     def test_local_import_cors_preflight_allows_deployed_frontend_and_localhost_origins(self):
