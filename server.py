@@ -12,6 +12,7 @@ import re
 import bcrypt
 import jwt
 import asyncio
+import threading
 import hashlib
 import hmac
 import secrets
@@ -2053,34 +2054,59 @@ async def _seed_demo_data(now_iso: str) -> None:
             await collection.replace_one({"id": document["id"], "tenant_id": DEMO_TENANT_ID}, owned, upsert=True)
 
 
+async def _run_deferred_startup_maintenance(now_iso: str) -> None:
+    """Run startup repairs/indexing after the API is already accepting requests."""
+    try:
+        await _backfill_tenant_data(now_iso)
+        await _cleanup_unsafe_real_users()
+        await raw_db.users.create_index("email", unique=True)
+        await raw_db.users.create_index("mobile", unique=True, sparse=True)
+        await raw_db.password_reset_requests.create_index("created_at", expireAfterSeconds=FORGOT_PASSWORD_WINDOW_MINUTES * 60)
+        await raw_db.pending_signups.create_index("expires_at", expireAfterSeconds=0)
+        for collection_name, indexes in {
+            "medicines": ["name", "batch_no", "manufacturer", "barcode"], "invoices": ["created_at"],
+            "purchase_returns": ["return_date", "distributor", "medicine_name", "reason", "ledger_adjusted", "po_adjustment_id"],
+        }.items():
+            for index in indexes:
+                await raw_db[collection_name].create_index(index)
+        for collection_name, date_field in {
+            "invoices": "created_at", "purchase_orders": "created_at",
+            "customer_transactions": "created_at", "purchase_returns": "return_date",
+        }.items():
+            await raw_db[collection_name].create_index([("tenant_id", 1), (date_field, -1)])
+        await raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)])
+        await raw_db.daily_closings.create_index([("tenant_id", 1), ("closing_date", 1)], unique=True)
+        await _seed_admin_if_enabled(now_iso)
+        await _run_startup_purchase_return_stock_recalculation()
+    except Exception:
+        logger.exception("Deferred startup maintenance failed")
+
+
+def _start_deferred_startup_maintenance(now_iso: str) -> None:
+    if LOCAL_MODE:
+        task = asyncio.create_task(_run_deferred_startup_maintenance(now_iso))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        return
+
+    def runner() -> None:
+        asyncio.run(_run_deferred_startup_maintenance(now_iso))
+
+    thread = threading.Thread(
+        target=runner,
+        name="pharmacyos-startup-maintenance",
+        daemon=True,
+    )
+    thread.start()
+
+
 @app.on_event("startup")
 async def startup():
     now_iso = datetime.now(timezone.utc).isoformat()
-    await _backfill_tenant_data(now_iso)
-    await _cleanup_unsafe_real_users()
-    # Repair and safely reseed demo identities before unique email indexes are enforced.
+    # Keep the lightweight demo identity available for local/demo login, but defer
+    # tenant-wide repairs, indexing, and stock recalculation so health is immediate.
     await _seed_demo_data(now_iso)
-    await raw_db.users.create_index("email", unique=True)
-    await raw_db.users.create_index("mobile", unique=True, sparse=True)
-    await raw_db.password_reset_requests.create_index("created_at", expireAfterSeconds=FORGOT_PASSWORD_WINDOW_MINUTES * 60)
-    await raw_db.pending_signups.create_index("expires_at", expireAfterSeconds=0)
-    for collection_name, indexes in {
-        "medicines": ["name", "batch_no", "manufacturer", "barcode"], "invoices": ["created_at"],
-        "purchase_returns": ["return_date", "distributor", "medicine_name", "reason", "ledger_adjusted", "po_adjustment_id"],
-    }.items():
-        for index in indexes:
-            await raw_db[collection_name].create_index(index)
-    for collection_name, date_field in {
-        "invoices": "created_at", "purchase_orders": "created_at",
-        "customer_transactions": "created_at", "purchase_returns": "return_date",
-    }.items():
-        await raw_db[collection_name].create_index([("tenant_id", 1), (date_field, -1)])
-    await raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)])
-    await raw_db.daily_closings.create_index([("tenant_id", 1), ("closing_date", 1)], unique=True)
-    await _seed_admin_if_enabled(now_iso)
-    task = asyncio.create_task(_run_startup_purchase_return_stock_recalculation())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    _start_deferred_startup_maintenance(now_iso)
     if LOCAL_MODE:
         backup_task = asyncio.create_task(_scheduled_local_backup_loop())
         _background_tasks.add(backup_task)
