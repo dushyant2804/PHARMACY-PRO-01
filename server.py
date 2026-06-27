@@ -1,7 +1,40 @@
 from dotenv import load_dotenv
 from pathlib import Path
+import time
 ROOT_DIR = Path(__file__).parent
+_STARTUP_TIMING_ORIGIN = time.perf_counter()
+_STARTUP_TIMING_BUFFER = []
+_STARTUP_TIMING_ACTIVE = True
+
+def _startup_elapsed_seconds() -> float:
+    return time.perf_counter() - _STARTUP_TIMING_ORIGIN
+
+def _format_startup_timing(label, duration=None, **extra):
+    suffix = []
+    if duration is not None:
+        suffix.append(f"duration={duration:.3f}s")
+    suffix.extend(f"{key}={value}" for key, value in extra.items())
+    detail = f" ({', '.join(suffix)})" if suffix else ""
+    return f"[{_startup_elapsed_seconds():.1f}s] {label}{detail}"
+
+def _record_startup_timing(label, duration=None, **extra):
+    message = _format_startup_timing(label, duration, **extra)
+    logger_obj = globals().get("logger")
+    if logger_obj is None:
+        _STARTUP_TIMING_BUFFER.append(message)
+    else:
+        logger_obj.info("STARTUP_TIMING %s", message)
+
+def _flush_startup_timing_buffer():
+    logger_obj = globals().get("logger")
+    if logger_obj is None:
+        return
+    while _STARTUP_TIMING_BUFFER:
+        logger_obj.info("STARTUP_TIMING %s", _STARTUP_TIMING_BUFFER.pop(0))
+
+_load_config_started = time.perf_counter()
 load_dotenv(ROOT_DIR / '.env')
+_record_startup_timing("Load configuration", time.perf_counter() - _load_config_started, root=ROOT_DIR)
 
 import os
 import copy
@@ -215,14 +248,19 @@ LOCAL_FIRST_IMPORT_COLLECTIONS = [
 if LOCAL_MODE:
     mongo_url = os.environ.get("MONGO_URL", "")
     client = None
+    _db_init_started = time.perf_counter()
     try:
         raw_db = LocalSQLiteDatabase(LOCAL_DB_PATH)
     except Exception as exc:
+        _record_startup_timing("Connect SQLite failed", time.perf_counter() - _db_init_started, path=LOCAL_DB_PATH)
         raise RuntimeError(f"LOCAL_MODE database could not be opened at {LOCAL_DB_PATH}: {exc}") from exc
+    _record_startup_timing("Connect SQLite", time.perf_counter() - _db_init_started, path=LOCAL_DB_PATH)
 else:
     mongo_url = os.environ['MONGO_URL']
+    _db_init_started = time.perf_counter()
     client = AsyncIOMotorClient(mongo_url)
     raw_db = client[os.environ['DB_NAME']]
+    _record_startup_timing("Create Mongo client", time.perf_counter() - _db_init_started, database=os.environ['DB_NAME'])
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", ROOT_DIR / "uploads")).resolve()
 BRANDING_UPLOAD_DIR = UPLOAD_DIR / "branding"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -382,8 +420,11 @@ class TenantAwareDatabase:
 
 db = TenantAwareDatabase(raw_db)
 
+_routes_started = time.perf_counter()
 app = FastAPI(title="Pharmacy Management API")
+_record_startup_timing("Create FastAPI app", time.perf_counter() - _routes_started)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+_record_startup_timing("Mount uploads route")
 
 @app.get("/")
 def home():
@@ -482,6 +523,8 @@ if not JWT_SECRET:
 
 logger = logging.getLogger("pharmacy")
 logging.basicConfig(level=logging.INFO)
+_flush_startup_timing_buffer()
+_record_startup_timing("Logger initialized")
 _background_tasks = set()
 _local_recent_requests = deque(maxlen=LOCAL_PERFORMANCE_MAX_RECENT)
 _local_summary_cache: Dict[str, Tuple[float, Any]] = {}
@@ -495,6 +538,24 @@ def _is_local_busy_path(method: str, path: str) -> bool:
 
 def _local_request_busy() -> bool:
     return LOCAL_MODE and _local_busy_request_count > 0
+
+
+async def _time_startup_awaitable(label: str, awaitable, **extra):
+    started = time.perf_counter()
+    try:
+        return await awaitable
+    finally:
+        if _STARTUP_TIMING_ACTIVE:
+            _record_startup_timing(label, time.perf_counter() - started, **extra)
+
+
+def _time_startup_sync(label: str, func, *args, **kwargs):
+    started = time.perf_counter()
+    try:
+        return func(*args, **kwargs)
+    finally:
+        if _STARTUP_TIMING_ACTIVE:
+            _record_startup_timing(label, time.perf_counter() - started)
 
 
 def _local_summary_cache_key(name: str, *args, **kwargs) -> str:
@@ -2056,37 +2117,57 @@ async def _seed_demo_data(now_iso: str) -> None:
 
 async def _run_deferred_startup_maintenance(now_iso: str) -> None:
     """Run startup repairs/indexing after the API is already accepting requests."""
+    global _STARTUP_TIMING_ACTIVE
+    maintenance_started = time.perf_counter()
+    _record_startup_timing("Background startup maintenance started")
     try:
-        await _backfill_tenant_data(now_iso)
-        await _cleanup_unsafe_real_users()
-        await raw_db.users.create_index("email", unique=True)
-        await raw_db.users.create_index("mobile", unique=True, sparse=True)
-        await raw_db.password_reset_requests.create_index("created_at", expireAfterSeconds=FORGOT_PASSWORD_WINDOW_MINUTES * 60)
-        await raw_db.pending_signups.create_index("expires_at", expireAfterSeconds=0)
+        await _time_startup_awaitable("Tenant initialization/backfill", _backfill_tenant_data(now_iso))
+        await _time_startup_awaitable("Tenant/user repair cleanup", _cleanup_unsafe_real_users())
+        await _time_startup_awaitable("Index creation users.email", raw_db.users.create_index("email", unique=True))
+        await _time_startup_awaitable("Index creation users.mobile", raw_db.users.create_index("mobile", unique=True, sparse=True))
+        await _time_startup_awaitable("Index creation password_reset_requests.created_at", raw_db.password_reset_requests.create_index("created_at", expireAfterSeconds=FORGOT_PASSWORD_WINDOW_MINUTES * 60))
+        await _time_startup_awaitable("Index creation pending_signups.expires_at", raw_db.pending_signups.create_index("expires_at", expireAfterSeconds=0))
         for collection_name, indexes in {
             "medicines": ["name", "batch_no", "manufacturer", "barcode"], "invoices": ["created_at"],
             "purchase_returns": ["return_date", "distributor", "medicine_name", "reason", "ledger_adjusted", "po_adjustment_id"],
         }.items():
             for index in indexes:
-                await raw_db[collection_name].create_index(index)
+                await _time_startup_awaitable(f"Index creation {collection_name}.{index}", raw_db[collection_name].create_index(index))
         for collection_name, date_field in {
             "invoices": "created_at", "purchase_orders": "created_at",
             "customer_transactions": "created_at", "purchase_returns": "return_date",
         }.items():
-            await raw_db[collection_name].create_index([("tenant_id", 1), (date_field, -1)])
-        await raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)])
-        await raw_db.daily_closings.create_index([("tenant_id", 1), ("closing_date", 1)], unique=True)
-        await _seed_admin_if_enabled(now_iso)
-        await _run_startup_purchase_return_stock_recalculation()
+            await _time_startup_awaitable(f"Index creation {collection_name}.tenant_id_{date_field}", raw_db[collection_name].create_index([("tenant_id", 1), (date_field, -1)]))
+        await _time_startup_awaitable("Index creation purchase_returns.tenant_distributor_po", raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)]))
+        await _time_startup_awaitable("Index creation daily_closings.tenant_closing_date", raw_db.daily_closings.create_index([("tenant_id", 1), ("closing_date", 1)], unique=True))
+        await _time_startup_awaitable("Seed admin", _seed_admin_if_enabled(now_iso))
+        if LOCAL_MODE:
+            logger.info(
+                "Skipping heavy LOCAL_MODE startup maintenance: purchase-return stock recalculation, "
+                "inventory rebuild, and dashboard/cache rebuild are manual admin maintenance actions."
+            )
+            _record_startup_timing("Purchase return recalculation all tenants", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
+            _record_startup_timing("Inventory rebuild", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
+            _record_startup_timing("Dashboard rebuild", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
+            _record_startup_timing("Cache warm-up", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
+        else:
+            await _time_startup_awaitable("Purchase return recalculation all tenants", _run_startup_purchase_return_stock_recalculation())
+            _record_startup_timing("Inventory rebuild", status="not scheduled during startup")
+            _record_startup_timing("Cache warm-up", status="not scheduled during startup")
     except Exception:
         logger.exception("Deferred startup maintenance failed")
+    finally:
+        _record_startup_timing("Background startup maintenance complete", time.perf_counter() - maintenance_started)
+        _STARTUP_TIMING_ACTIVE = False
 
 
 def _start_deferred_startup_maintenance(now_iso: str) -> None:
+    started = time.perf_counter()
     if LOCAL_MODE:
         task = asyncio.create_task(_run_deferred_startup_maintenance(now_iso))
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
+        _record_startup_timing("Background startup maintenance task scheduled", time.perf_counter() - started, mode="asyncio")
         return
 
     def runner() -> None:
@@ -2098,23 +2179,31 @@ def _start_deferred_startup_maintenance(now_iso: str) -> None:
         daemon=True,
     )
     thread.start()
+    _record_startup_timing("Background startup maintenance task scheduled", time.perf_counter() - started, mode="thread")
 
 
 @app.on_event("startup")
 async def startup():
+    startup_started = time.perf_counter()
+    _record_startup_timing("FastAPI startup event started")
     now_iso = datetime.now(timezone.utc).isoformat()
     # Keep the lightweight demo identity available for local/demo login, but defer
     # tenant-wide repairs, indexing, and stock recalculation so health is immediate.
-    await _seed_demo_data(now_iso)
-    _start_deferred_startup_maintenance(now_iso)
+    await _time_startup_awaitable("Seed demo data", _seed_demo_data(now_iso))
+    _time_startup_sync("Schedule deferred startup maintenance", _start_deferred_startup_maintenance, now_iso)
     if LOCAL_MODE:
+        backup_started = time.perf_counter()
         backup_task = asyncio.create_task(_scheduled_local_backup_loop())
         _background_tasks.add(backup_task)
         backup_task.add_done_callback(_background_tasks.discard)
+        _record_startup_timing("Backup scheduler task scheduled", time.perf_counter() - backup_started)
+        idle_sync_started = time.perf_counter()
         idle_sync_task = asyncio.create_task(_local_idle_backup_sync_loop())
         _background_tasks.add(idle_sync_task)
         idle_sync_task.add_done_callback(_background_tasks.discard)
+        _record_startup_timing("Idle backup sync task scheduled", time.perf_counter() - idle_sync_started)
         logger.info("Local PharmacyOS server running at http://localhost:8000")
+    _record_startup_timing("FastAPI startup event complete", time.perf_counter() - startup_started)
 
 
 @app.on_event("shutdown")
@@ -7320,23 +7409,41 @@ def _inventory_derivatives(medicine: dict, purchase_return_units: float) -> dict
 
 
 def _rebuild_dashboard_summaries(tenant_id: Optional[str]) -> None:
-    # Dashboard summaries are calculated live from medicines and transactions.
-    # Refreshing medicine derivatives rebuilds the inventory portion immediately.
-    logger.info("Dashboard inventory summaries rebuilt tenant/shop=%s", tenant_id)
+    started = time.perf_counter()
+    try:
+        # Dashboard summaries are calculated live from medicines and transactions.
+        # Refreshing medicine derivatives rebuilds the inventory portion immediately.
+        logger.info("Dashboard inventory summaries rebuilt tenant/shop=%s", tenant_id)
+    finally:
+        if _STARTUP_TIMING_ACTIVE:
+            _record_startup_timing("Dashboard rebuild", time.perf_counter() - started, tenant_id=tenant_id)
 
 
 def _invalidate_inventory_dashboard_cache(tenant_id: Optional[str]) -> None:
-    # There is currently no application cache to clear. Keep this hook for
-    # future inventory/dashboard cache providers.
-    logger.info("Inventory/dashboard cache invalidated tenant/shop=%s (no cache configured)", tenant_id)
+    started = time.perf_counter()
+    try:
+        # There is currently no application cache to clear. Keep this hook for
+        # future inventory/dashboard cache providers.
+        logger.info("Inventory/dashboard cache invalidated tenant/shop=%s (no cache configured)", tenant_id)
+    finally:
+        if _STARTUP_TIMING_ACTIVE:
+            _record_startup_timing("Cache invalidation/warm-up", time.perf_counter() - started, tenant_id=tenant_id)
 
 
 async def recalculate_purchase_return_stock(tenant_id: Optional[str] = None) -> dict:
     """Backfill return quantities and refresh inventory/dashboard-derived fields."""
     tenant_id = tenant_id or _current_tenant.get()
     logger.info("Purchase return stock recalculation started tenant/shop=%s", tenant_id)
-    medicines = await db.medicines.find({}, {"_id": 0}).to_list(None)
-    purchase_returns = await db.purchase_returns.find({}, {"_id": 0}).to_list(None)
+    medicines = await _time_startup_awaitable(
+        f"Purchase return load medicines tenant={tenant_id}",
+        db.medicines.find({}, {"_id": 0}).to_list(None),
+        tenant_id=tenant_id,
+    )
+    purchase_returns = await _time_startup_awaitable(
+        f"Purchase return load returns tenant={tenant_id}",
+        db.purchase_returns.find({}, {"_id": 0}).to_list(None),
+        tenant_id=tenant_id,
+    )
     totals = defaultdict(float)
     unmatched_return_ids = []
     matched_returns = 0
@@ -7370,6 +7477,7 @@ async def recalculate_purchase_return_stock(tenant_id: Optional[str] = None) -> 
 
     # Refresh only derived inventory fields. Purchase/sale quantities, FIFO,
     # billing, return documents, and ledger records remain untouched.
+    update_started = time.perf_counter()
     for medicine in medicines:
         identity = (
             "id" if medicine.get("id") else "medicine_key",
@@ -7382,6 +7490,8 @@ async def recalculate_purchase_return_stock(tenant_id: Optional[str] = None) -> 
             {identity[0]: identity[1]},
             {"$set": _inventory_derivatives(medicine, totals.get(identity, 0.0))},
         )
+    if _STARTUP_TIMING_ACTIVE:
+        _record_startup_timing("Purchase return medicine updates", time.perf_counter() - update_started, tenant_id=tenant_id, medicines=len(medicines))
 
     # Dashboard stock summaries read medicines live, so refreshing every
     # medicine above rebuilds their source data. No persisted stock summary or
@@ -7401,15 +7511,16 @@ async def recalculate_purchase_return_stock(tenant_id: Optional[str] = None) -> 
 
 async def _run_startup_purchase_return_stock_recalculation() -> None:
     """Run one isolated stock repair per tenant after startup without failing startup."""
+    recalculation_started = time.perf_counter()
     try:
-        tenant_ids = set(await raw_db.medicines.distinct("tenant_id"))
-        tenant_ids.update(await raw_db.purchase_returns.distinct("tenant_id"))
+        tenant_ids = set(await _time_startup_awaitable("Purchase return tenants scan medicines", raw_db.medicines.distinct("tenant_id")))
+        tenant_ids.update(await _time_startup_awaitable("Purchase return tenants scan returns", raw_db.purchase_returns.distinct("tenant_id")))
         for tenant_id in sorted(item for item in tenant_ids if item):
             active_token = _request_active.set(True)
             tenant_token = _current_tenant.set(tenant_id)
             demo_token = _current_demo.set(False)
             try:
-                await recalculate_purchase_return_stock(tenant_id)
+                await _time_startup_awaitable(f"Purchase return recalculation tenant={tenant_id}", recalculate_purchase_return_stock(tenant_id), tenant_id=tenant_id)
             except Exception:
                 logger.exception(
                     "Purchase return stock recalculation failed tenant/shop=%s",
@@ -7422,6 +7533,8 @@ async def _run_startup_purchase_return_stock_recalculation() -> None:
         logger.info("Purchase return stock recalculation completed")
     except Exception:
         logger.exception("Purchase return stock recalculation failed during startup")
+    finally:
+        _record_startup_timing("Purchase return recalculation complete", time.perf_counter() - recalculation_started)
 
 
 def _invoice_item_quantity(row: dict) -> float:
@@ -11797,9 +11910,11 @@ app.add_middleware(
 app.add_middleware(LocalImportRequestLoggingMiddleware)
 
 app.include_router(api_router)
+_record_startup_timing("Register routes", time.perf_counter() - _routes_started)
 
 
 if LOCAL_MODE and FRONTEND_BUILD_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_BUILD_DIR / "assets")), name="frontend-assets") if (FRONTEND_BUILD_DIR / "assets").exists() else None
     app.mount("/static", StaticFiles(directory=str(FRONTEND_BUILD_DIR / "static")), name="frontend-static") if (FRONTEND_BUILD_DIR / "static").exists() else None
     app.mount("/", StaticFiles(directory=str(FRONTEND_BUILD_DIR), html=True), name="frontend")
+    _record_startup_timing("Mount frontend static routes")
