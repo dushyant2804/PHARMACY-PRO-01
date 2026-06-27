@@ -98,9 +98,9 @@ BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 SYNC_QUEUE_COLLECTION = "sync_queue"
 ATLAS_BACKUP_MONGO_URL = os.environ.get("ATLAS_BACKUP_MONGO_URL", "")
 ATLAS_BACKUP_DB_NAME = os.environ.get("ATLAS_BACKUP_DB_NAME", os.environ.get("DB_NAME", "pharmacyos_local_backups"))
-GOOGLE_DRIVE_CLIENT_ID = os.environ.get("GOOGLE_DRIVE_CLIENT_ID", "")
-GOOGLE_DRIVE_CLIENT_SECRET = os.environ.get("GOOGLE_DRIVE_CLIENT_SECRET", "")
-GOOGLE_DRIVE_TOKEN_PATH = Path(os.environ.get("GOOGLE_DRIVE_TOKEN_PATH", ROOT_DIR / "local_data" / "google_drive_token.json"))
+GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH = Path(os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH", os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", ROOT_DIR / "local_data" / "google_drive_service_account.json"))).expanduser()
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
+GOOGLE_DRIVE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 BACKUP_ENCRYPTION_KEY = os.environ.get("BACKUP_ENCRYPTION_KEY", os.environ.get("JWT_SECRET", ""))
 BACKUP_COLLECTIONS = [
     "medicines", "invoices", "purchase_orders", "distributors", "customers",
@@ -9702,24 +9702,6 @@ async def _upload_backup_to_atlas(backup_file: str, reason: str = "manual", queu
         atlas_client.close()
 
 
-def _load_google_token() -> Optional[dict]:
-    if GOOGLE_DRIVE_TOKEN_PATH.exists():
-        try:
-            return json.loads(GOOGLE_DRIVE_TOKEN_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-    return None
-
-
-def _save_google_token(token: dict) -> None:
-    GOOGLE_DRIVE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    GOOGLE_DRIVE_TOKEN_PATH.write_text(json.dumps(token, indent=2), encoding="utf-8")
-    try:
-        GOOGLE_DRIVE_TOKEN_PATH.chmod(0o600)
-    except Exception:
-        pass
-
-
 def _google_api_request(url: str, token: Optional[str] = None, data: Optional[bytes] = None, headers: Optional[dict] = None, method: Optional[str] = None) -> dict:
     req_headers = dict(headers or {})
     if token:
@@ -9730,44 +9712,73 @@ def _google_api_request(url: str, token: Optional[str] = None, data: Optional[by
         return json.loads(body) if body else {}
 
 
-async def _google_access_token() -> str:
-    token = _load_google_token()
-    if not token:
-        raise RuntimeError("Google Drive is not authenticated. Configure GOOGLE_DRIVE_TOKEN_PATH with OAuth device-code token.")
-    expires_at = float(token.get("expires_at", 0))
-    if token.get("access_token") and expires_at > datetime.now(timezone.utc).timestamp() + 60:
-        return token["access_token"]
-    if not token.get("refresh_token") or not GOOGLE_DRIVE_CLIENT_ID:
-        raise RuntimeError("Google Drive token is expired and cannot be refreshed")
-    form = urllib.parse.urlencode({"client_id": GOOGLE_DRIVE_CLIENT_ID, "client_secret": GOOGLE_DRIVE_CLIENT_SECRET, "refresh_token": token["refresh_token"], "grant_type": "refresh_token"}).encode()
-    refreshed = await asyncio.to_thread(_google_api_request, "https://oauth2.googleapis.com/token", None, form, {"Content-Type": "application/x-www-form-urlencoded"}, "POST")
-    token.update(refreshed)
-    token["expires_at"] = datetime.now(timezone.utc).timestamp() + int(refreshed.get("expires_in", 3600))
-    _save_google_token(token)
+def _load_google_service_account() -> dict:
+    if not GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.exists():
+        raise RuntimeError("Google Drive service account key is not configured or file does not exist")
+    try:
+        data = json.loads(GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Google Drive service account key could not be read: {exc}")
+    required = {"client_email", "private_key"}
+    missing = sorted(field for field in required if not data.get(field))
+    if missing:
+        raise RuntimeError(f"Google Drive service account key is missing: {', '.join(missing)}")
+    return data
+
+
+async def _google_service_account_access_token() -> str:
+    service_account = _load_google_service_account()
+    now = int(datetime.now(timezone.utc).timestamp())
+    claims = {
+        "iss": service_account["client_email"],
+        "scope": "https://www.googleapis.com/auth/drive",
+        "aud": service_account.get("token_uri") or GOOGLE_DRIVE_TOKEN_URI,
+        "iat": now,
+        "exp": now + 3600,
+    }
+    assertion = jwt.encode(claims, service_account["private_key"], algorithm="RS256")
+    if isinstance(assertion, bytes):
+        assertion = assertion.decode("utf-8")
+    form = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": assertion,
+    }).encode()
+    token = await asyncio.to_thread(
+        _google_api_request,
+        service_account.get("token_uri") or GOOGLE_DRIVE_TOKEN_URI,
+        None,
+        form,
+        {"Content-Type": "application/x-www-form-urlencoded"},
+        "POST",
+    )
+    if not token.get("access_token"):
+        raise RuntimeError("Google Drive service account token request did not return an access token")
     return token["access_token"]
 
+
+async def _backup_package_for_file(path: Path, reason: str) -> Path:
+    metadata = await raw_db.backup_metadata.find_one({"file": str(path)}, {"_id": 0})
+    package = Path((metadata or {}).get("package_file") or path.with_suffix(".zip"))
+    if not package.exists():
+        package = _write_encrypted_backup_package(path, _file_sha256(path), reason, datetime.now(timezone.utc).isoformat())
+    return package
 
 async def _upload_backup_to_google_drive(backup_file: str, reason: str = "manual", queue_id: Optional[str] = None) -> dict:
     path = Path(backup_file).expanduser().resolve()
     if not path.exists():
         raise RuntimeError("Backup file not found for Google Drive upload")
-    metadata = await _last_backup_metadata() or {}
-    package = Path(metadata.get("package_file") or _write_encrypted_backup_package(path, _file_sha256(path), reason, datetime.now(timezone.utc).isoformat()))
-    access_token = await _google_access_token()
-    folder_query = urllib.parse.quote("name='PharmacyOS' and mimeType='application/vnd.google-apps.folder' and trashed=false")
-    found = await asyncio.to_thread(_google_api_request, f"https://www.googleapis.com/drive/v3/files?q={folder_query}&fields=files(id,name)", access_token)
-    files = found.get("files", [])
-    if files:
-        folder_id = files[0]["id"]
-    else:
-        folder = await asyncio.to_thread(_google_api_request, "https://www.googleapis.com/drive/v3/files", access_token, json.dumps({"name": "PharmacyOS", "mimeType": "application/vnd.google-apps.folder"}).encode(), {"Content-Type": "application/json"}, "POST")
-        folder_id = folder["id"]
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is not configured")
+    package = await _backup_package_for_file(path, reason)
+    access_token = await _google_service_account_access_token()
+    folder_id = GOOGLE_DRIVE_FOLDER_ID
     boundary = "pharmacyosbackup"
     meta = {"name": package.name, "parents": [folder_id], "description": f"PharmacyOS {reason} backup sha256={_file_sha256(package)}"}
     body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(meta)}\r\n--{boundary}\r\nContent-Type: application/zip\r\n\r\n").encode() + package.read_bytes() + f"\r\n--{boundary}--".encode()
     uploaded = await asyncio.to_thread(_google_api_request, "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink", access_token, body, {"Content-Type": f"multipart/related; boundary={boundary}"}, "POST")
-    await raw_db.backup_status.update_one({"id": "google_drive"}, {"$set": {"id": "google_drive", "status": "uploaded", "last_successful_google_drive_backup": datetime.now(timezone.utc).isoformat(), "last_backup_file": str(path), "last_drive_file_id": uploaded.get("id")}}, upsert=True)
-    return {"ok": True, "status": "uploaded", "drive_file_id": uploaded.get("id"), "drive_file_name": uploaded.get("name")}
+    uploaded_at = datetime.now(timezone.utc).isoformat()
+    await raw_db.backup_status.update_one({"id": "google_drive"}, {"$set": {"id": "google_drive", "status": "Google Drive backup successful", "connection_status": "connected", "last_successful_google_drive_backup": uploaded_at, "last_upload_time": uploaded_at, "last_backup_file": str(path), "last_drive_folder_id": folder_id, "last_drive_file_id": uploaded.get("id")}}, upsert=True)
+    return {"ok": True, "status": "Google Drive backup successful", "message": "Google Drive backup successful", "drive_file_id": uploaded.get("id"), "drive_file_name": uploaded.get("name")}
 
 
 async def _process_pending_backup_queue(destination: Optional[str] = None) -> dict:
@@ -9790,6 +9801,8 @@ async def _process_pending_backup_queue(destination: Optional[str] = None) -> di
             result["succeeded"] += 1
         except Exception as exc:
             await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row["id"]}, {"$set": _mark_queue_failed_fields(exc), "$inc": {"attempts": 1}})
+            if dest == "google_drive":
+                await raw_db.backup_status.update_one({"id": "google_drive"}, {"$set": {"id": "google_drive", "status": "upload_failed_queued", "connection_status": "error", "last_error": str(exc), "last_failed_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
             result["failed"] += 1
             result["errors"].append({"id": row.get("id"), "destination": dest, "error": str(exc)})
     return result
@@ -10052,9 +10065,13 @@ async def backup_health(user: dict = Depends(get_current_user)):
         "local_backup_status": "ok" if last_local else "never_run",
         "atlas_backup_status": atlas_status.get("status", "pending"),
         "google_drive_backup_status": google_status.get("status", "pending"),
+        "google_drive_connection_status": google_status.get("connection_status", "configured" if GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.exists() and GOOGLE_DRIVE_FOLDER_ID else "not_configured"),
+        "google_drive_service_account_key_path": str(GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH),
+        "google_drive_folder_id_configured": bool(GOOGLE_DRIVE_FOLDER_ID),
         "last_local_backup_at": (last_local or {}).get("created_at"),
         "last_atlas_backup_at": atlas_status.get("last_successful_atlas_backup"),
         "last_google_drive_backup_at": google_status.get("last_successful_google_drive_backup"),
+        "last_google_drive_upload_time": google_status.get("last_upload_time") or google_status.get("last_successful_google_drive_backup"),
         "pending_atlas_sync_count": await _pending_backup_count("atlas"),
         "pending_google_drive_upload_count": await _pending_backup_count("google_drive"),
         "last_backup": last_local,
@@ -10076,39 +10093,6 @@ async def local_app_exit_backup(request: Request):
     if client_host not in {"127.0.0.1", "::1", "localhost"}:
         raise HTTPException(status_code=403, detail="Local app-exit backup is restricted to this computer")
     return await _create_and_sync_backup("app_exit")
-
-
-@api_router.post("/backup/google-drive/device-login")
-async def google_drive_device_login(user: dict = Depends(require_role("admin"))):
-    if not GOOGLE_DRIVE_CLIENT_ID:
-        raise HTTPException(status_code=400, detail="GOOGLE_DRIVE_CLIENT_ID is not configured")
-    form = urllib.parse.urlencode({
-        "client_id": GOOGLE_DRIVE_CLIENT_ID,
-        "scope": "https://www.googleapis.com/auth/drive.file",
-    }).encode()
-    data = await asyncio.to_thread(_google_api_request, "https://oauth2.googleapis.com/device/code", None, form, {"Content-Type": "application/x-www-form-urlencoded"}, "POST")
-    _save_google_token({"device_code": data.get("device_code"), "created_at": datetime.now(timezone.utc).isoformat()})
-    return {"verification_url": data.get("verification_url") or data.get("verification_uri"), "user_code": data.get("user_code"), "expires_in": data.get("expires_in"), "interval": data.get("interval", 5)}
-
-
-@api_router.post("/backup/google-drive/device-token")
-async def google_drive_device_token(user: dict = Depends(require_role("admin"))):
-    token = _load_google_token() or {}
-    if not token.get("device_code"):
-        raise HTTPException(status_code=400, detail="Start device login first")
-    form = urllib.parse.urlencode({
-        "client_id": GOOGLE_DRIVE_CLIENT_ID,
-        "client_secret": GOOGLE_DRIVE_CLIENT_SECRET,
-        "device_code": token["device_code"],
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-    }).encode()
-    try:
-        data = await asyncio.to_thread(_google_api_request, "https://oauth2.googleapis.com/token", None, form, {"Content-Type": "application/x-www-form-urlencoded"}, "POST")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Google device authorization is not complete: {exc}")
-    data["expires_at"] = datetime.now(timezone.utc).timestamp() + int(data.get("expires_in", 3600))
-    _save_google_token(data)
-    return {"ok": True, "token_path": str(GOOGLE_DRIVE_TOKEN_PATH)}
 
 @api_router.options("/local-mode/import/dry-run")
 @api_router.options("/local/import/dry-run")
