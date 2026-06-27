@@ -2141,9 +2141,19 @@ async def _run_deferred_startup_maintenance(now_iso: str) -> None:
         await _time_startup_awaitable("Index creation purchase_returns.tenant_distributor_po", raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)]))
         await _time_startup_awaitable("Index creation daily_closings.tenant_closing_date", raw_db.daily_closings.create_index([("tenant_id", 1), ("closing_date", 1)], unique=True))
         await _time_startup_awaitable("Seed admin", _seed_admin_if_enabled(now_iso))
-        await _time_startup_awaitable("Purchase return recalculation all tenants", _run_startup_purchase_return_stock_recalculation())
-        _record_startup_timing("Inventory rebuild", status="not scheduled during startup")
-        _record_startup_timing("Cache warm-up", status="not scheduled during startup")
+        if LOCAL_MODE:
+            logger.info(
+                "Skipping heavy LOCAL_MODE startup maintenance: purchase-return stock recalculation, "
+                "inventory rebuild, and dashboard/cache rebuild are manual admin maintenance actions."
+            )
+            _record_startup_timing("Purchase return recalculation all tenants", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
+            _record_startup_timing("Inventory rebuild", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
+            _record_startup_timing("Dashboard rebuild", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
+            _record_startup_timing("Cache warm-up", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
+        else:
+            await _time_startup_awaitable("Purchase return recalculation all tenants", _run_startup_purchase_return_stock_recalculation())
+            _record_startup_timing("Inventory rebuild", status="not scheduled during startup")
+            _record_startup_timing("Cache warm-up", status="not scheduled during startup")
     except Exception:
         logger.exception("Deferred startup maintenance failed")
     finally:
