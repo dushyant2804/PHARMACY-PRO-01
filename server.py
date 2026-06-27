@@ -1958,6 +1958,40 @@ class PurchaseReturnUpdate(BaseModel):
     def normalize_notes(cls, value):
         return value.strip() if isinstance(value, str) else value
     
+# ---------------- Startup stability tracking ----------------
+# Defaults are stable for direct function/test calls before the FastAPI startup
+# event schedules deferred maintenance. Startup flips these flags while tenant
+# backfills, index creation, and purchase-return repairs are in progress.
+_STARTUP_STABILITY = {
+    "maintenance_running": False,
+    "tenant_initialization_complete": True,
+    "purchase_return_recalculation_complete": True,
+    "indexing_complete": True,
+}
+
+
+def _mark_startup_maintenance_started() -> None:
+    _STARTUP_STABILITY.update({
+        "maintenance_running": True,
+        "tenant_initialization_complete": False,
+        "purchase_return_recalculation_complete": LOCAL_MODE,
+        "indexing_complete": False,
+    })
+
+
+def _mark_startup_maintenance_finished() -> None:
+    _STARTUP_STABILITY["maintenance_running"] = False
+
+
+def _system_stable() -> bool:
+    return (
+        not _STARTUP_STABILITY["maintenance_running"]
+        and _STARTUP_STABILITY["tenant_initialization_complete"]
+        and _STARTUP_STABILITY["purchase_return_recalculation_complete"]
+        and _STARTUP_STABILITY["indexing_complete"]
+    )
+
+
 # ---------------- Startup ----------------
 async def _backfill_tenant_data(now_iso: str) -> None:
     await raw_db.users.update_many(
@@ -2119,9 +2153,11 @@ async def _run_deferred_startup_maintenance(now_iso: str) -> None:
     """Run startup repairs/indexing after the API is already accepting requests."""
     global _STARTUP_TIMING_ACTIVE
     maintenance_started = time.perf_counter()
+    _mark_startup_maintenance_started()
     _record_startup_timing("Background startup maintenance started")
     try:
         await _time_startup_awaitable("Tenant initialization/backfill", _backfill_tenant_data(now_iso))
+        _STARTUP_STABILITY["tenant_initialization_complete"] = True
         await _time_startup_awaitable("Tenant/user repair cleanup", _cleanup_unsafe_real_users())
         await _time_startup_awaitable("Index creation users.email", raw_db.users.create_index("email", unique=True))
         await _time_startup_awaitable("Index creation users.mobile", raw_db.users.create_index("mobile", unique=True, sparse=True))
@@ -2140,23 +2176,27 @@ async def _run_deferred_startup_maintenance(now_iso: str) -> None:
             await _time_startup_awaitable(f"Index creation {collection_name}.tenant_id_{date_field}", raw_db[collection_name].create_index([("tenant_id", 1), (date_field, -1)]))
         await _time_startup_awaitable("Index creation purchase_returns.tenant_distributor_po", raw_db.purchase_returns.create_index([("tenant_id", 1), ("distributor_id", 1), ("po_adjustment_id", 1)]))
         await _time_startup_awaitable("Index creation daily_closings.tenant_closing_date", raw_db.daily_closings.create_index([("tenant_id", 1), ("closing_date", 1)], unique=True))
+        _STARTUP_STABILITY["indexing_complete"] = True
         await _time_startup_awaitable("Seed admin", _seed_admin_if_enabled(now_iso))
         if LOCAL_MODE:
             logger.info(
                 "Skipping heavy LOCAL_MODE startup maintenance: purchase-return stock recalculation, "
                 "inventory rebuild, and dashboard/cache rebuild are manual admin maintenance actions."
             )
+            _STARTUP_STABILITY["purchase_return_recalculation_complete"] = True
             _record_startup_timing("Purchase return recalculation all tenants", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
             _record_startup_timing("Inventory rebuild", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
             _record_startup_timing("Dashboard rebuild", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
             _record_startup_timing("Cache warm-up", status="skipped in LOCAL_MODE startup; run manually from admin maintenance")
         else:
             await _time_startup_awaitable("Purchase return recalculation all tenants", _run_startup_purchase_return_stock_recalculation())
+            _STARTUP_STABILITY["purchase_return_recalculation_complete"] = True
             _record_startup_timing("Inventory rebuild", status="not scheduled during startup")
             _record_startup_timing("Cache warm-up", status="not scheduled during startup")
     except Exception:
         logger.exception("Deferred startup maintenance failed")
     finally:
+        _mark_startup_maintenance_finished()
         _record_startup_timing("Background startup maintenance complete", time.perf_counter() - maintenance_started)
         _STARTUP_TIMING_ACTIVE = False
 
@@ -9500,6 +9540,7 @@ async def _server_health_payload() -> dict:
     database_connected = await _database_connected()
     return {
         "status": "ok" if database_connected else "degraded",
+        "system_stable": _system_stable(),
         "runtime_mode": RUNTIME_MODE,
         "local_mode": LOCAL_MODE,
         "local_backend_running": True,
