@@ -148,6 +148,59 @@ def test_local_mode_database_open_failure_is_explicit(tmp_path):
     assert "LOCAL_MODE database could not be opened" in result.stderr
 
 
+def test_local_to_cloud_sync_status_and_missing_uri_are_safe(tmp_path):
+    db_path = tmp_path / "pharmacyos.sqlite3"
+    script = r'''
+import asyncio
+
+import server
+from fastapi import HTTPException
+
+USER = {"id": "u1", "name": "Local Admin", "email": "admin@example.com", "role": "admin", "tenant_id": "real_shop"}
+
+async def main():
+    await server.raw_db.users.insert_one({"id": "u1", "email": "admin@example.com", "role": "admin"})
+    await server.raw_db.medicines.insert_one({"id": "med-1", "name": "Safe Sync Tablet"})
+
+    status = await server.local_sync_status(USER)
+    assert status["last_sync_time"] is None
+    assert status["last_sync_status"] == "never_run"
+    assert status["records_synced"] == 0
+    assert status["failed_tables"] == []
+    assert status["pending_changes"] == 2
+
+    assert not server.raw_db.collection_table_exists("invoice_items")
+
+    try:
+        await server.local_sync_push_to_cloud(USER)
+    except HTTPException as exc:
+        assert exc.status_code == 400
+        assert exc.detail == "Cloud database not configured"
+    else:
+        raise AssertionError("missing cloud URI should fail safely")
+
+asyncio.run(main())
+'''
+    env = os.environ.copy()
+    env.update({
+        "PHARMACYOS_MODE": "LOCAL_MODE",
+        "DB_NAME": "unused_local_test",
+        "LOCAL_DB_PATH": str(db_path),
+        "JWT_SECRET": "test-secret",
+    })
+    env.pop("MONGO_URL", None)
+    env.pop("MONGO_URI", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 
 def test_sqlite_adapter_skips_json_indexes_when_json1_unavailable(tmp_path, monkeypatch, caplog):
     import logging
