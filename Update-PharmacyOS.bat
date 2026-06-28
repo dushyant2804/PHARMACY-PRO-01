@@ -9,7 +9,18 @@ REM - Replaces only the frontend dist folder after backing it up
 REM - Restarts PharmacyOS with the existing launcher
 REM ================================================================
 
-set "APP_ROOT=D:\pharmacy-app-v2"
+set "UPDATER_DIR=%~dp0"
+if "%UPDATER_DIR:~-1%"=="\" set "UPDATER_DIR=%UPDATER_DIR:~0,-1%"
+
+REM Automatically detect the project root from the updater location.
+REM If this file is run from the backend folder, the project root is its parent.
+for %%I in ("%UPDATER_DIR%") do set "UPDATER_FOLDER=%%~nxI"
+if /I "%UPDATER_FOLDER%"=="backend" (
+    for %%I in ("%UPDATER_DIR%\..") do set "APP_ROOT=%%~fI"
+) else (
+    set "APP_ROOT=%UPDATER_DIR%"
+)
+
 set "BACKEND_DIR=%APP_ROOT%\backend"
 set "FRONTEND_DIR=%APP_ROOT%\frontend"
 set "DIST_DIR=%FRONTEND_DIR%\dist"
@@ -39,6 +50,11 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+echo Project root: %APP_ROOT%
+echo Backend path: %BACKEND_DIR%
+echo Frontend path: %FRONTEND_DIR%
+echo.
 
 echo [1/5] Updating backend code...
 if not exist "%BACKEND_DIR%" (
@@ -77,7 +93,7 @@ if "%GITHUB_OWNER%"=="" (
 echo [3/5] Downloading latest UI build...
 call :DownloadAndInstallUi
 if errorlevel 1 (
-    echo Frontend update failed, using existing UI
+    echo Frontend update failed, using existing UI.
 ) else (
     echo UI updated successfully
 )
@@ -118,7 +134,8 @@ exit /b 0
 set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 
 > "%PS_SCRIPT%" echo $ErrorActionPreference = 'Stop'
->> "%PS_SCRIPT%" echo try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+>> "%PS_SCRIPT%" echo [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 3072)
+>> "%PS_SCRIPT%" echo Write-Host ('TLS version being used: ' + [Net.ServicePointManager]::SecurityProtocol)
 >> "%PS_SCRIPT%" echo $owner = $env:GITHUB_OWNER
 >> "%PS_SCRIPT%" echo $repo = $env:GITHUB_REPO
 >> "%PS_SCRIPT%" echo $artifactName = $env:ARTIFACT_NAME
@@ -129,6 +146,7 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 >> "%PS_SCRIPT%" echo $zipPath = Join-Path $env:TEMP 'pharmacyos-frontend-dist.zip'
 >> "%PS_SCRIPT%" echo function New-Client { $wc = New-Object Net.WebClient; $wc.Headers.Add('User-Agent','PharmacyOS-Updater'); $wc.Headers.Add('Accept','application/vnd.github+json'); if ($env:GITHUB_TOKEN) { $wc.Headers.Add('Authorization','Bearer ' + $env:GITHUB_TOKEN) }; return $wc }
 >> "%PS_SCRIPT%" echo $api = 'https://api.github.com/repos/' + $owner + '/' + $repo + '/actions/artifacts?per_page=100'
+>> "%PS_SCRIPT%" echo Write-Host ('GitHub API URL: ' + $api)
 >> "%PS_SCRIPT%" echo $json = (New-Client).DownloadString($api)
 >> "%PS_SCRIPT%" echo Add-Type -AssemblyName System.Web.Extensions
 >> "%PS_SCRIPT%" echo $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
@@ -136,8 +154,13 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 >> "%PS_SCRIPT%" echo $artifact = $null
 >> "%PS_SCRIPT%" echo foreach ($a in $data['artifacts']) { if ($a['name'] -eq $artifactName -and -not $a['expired']) { $ok = $true; if ($a.ContainsKey('workflow_run') -and $a['workflow_run'] -and $a['workflow_run'].ContainsKey('conclusion') -and $a['workflow_run']['conclusion']) { $ok = ($a['workflow_run']['conclusion'] -eq 'success') }; if ($ok) { $artifact = $a; break } } }
 >> "%PS_SCRIPT%" echo if (-not $artifact) { throw 'No non-expired successful artifact named ' + $artifactName + ' was found.' }
+>> "%PS_SCRIPT%" echo $artifactUrl = $artifact['archive_download_url']
+>> "%PS_SCRIPT%" echo Write-Host ('Artifact URL: ' + $artifactUrl)
 >> "%PS_SCRIPT%" echo if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
->> "%PS_SCRIPT%" echo (New-Client).DownloadFile($artifact['archive_download_url'], $zipPath)
+>> "%PS_SCRIPT%" echo (New-Client).DownloadFile($artifactUrl, $zipPath)
+>> "%PS_SCRIPT%" echo if (-not (Test-Path $zipPath)) { throw 'Artifact download did not create a zip file.' }
+>> "%PS_SCRIPT%" echo $zipInfo = Get-Item $zipPath
+>> "%PS_SCRIPT%" echo if ($zipInfo.Length -le 0) { throw 'Artifact download created an empty zip file.' }
 >> "%PS_SCRIPT%" echo if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 >> "%PS_SCRIPT%" echo New-Item -ItemType Directory -Path $tempDir ^| Out-Null
 >> "%PS_SCRIPT%" echo $shell = New-Object -ComObject Shell.Application
@@ -150,6 +173,8 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 >> "%PS_SCRIPT%" echo if (Test-Path $backupDir) { Remove-Item $backupDir -Recurse -Force }
 >> "%PS_SCRIPT%" echo if (Test-Path $distDir) { Move-Item $distDir $backupDir }
 >> "%PS_SCRIPT%" echo Move-Item $tempDir $distDir
+>> "%PS_SCRIPT%" echo if (-not (Test-Path $distDir)) { throw 'Dist replacement failed.' }
+>> "%PS_SCRIPT%" echo if ((Get-ChildItem -Path $distDir -Force ^| Measure-Object).Count -eq 0) { throw 'Dist replacement produced an empty folder.' }
 >> "%PS_SCRIPT%" echo if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%"
@@ -158,13 +183,18 @@ if exist "%PS_SCRIPT%" del "%PS_SCRIPT%" >nul 2>nul
 exit /b %PS_EXIT%
 
 :RestartPharmacyOS
+set "LAUNCHER_PATH="
 cd /d "%APP_ROOT%" >nul 2>nul
-if exist "%APP_ROOT%\PharmacyOS-Launch.vbs" (
-    start "" wscript.exe "%APP_ROOT%\PharmacyOS-Launch.vbs"
-    exit /b 0
+if exist "%APP_ROOT%\PharmacyOS-Launch.vbs" set "LAUNCHER_PATH=%APP_ROOT%\PharmacyOS-Launch.vbs"
+if "%LAUNCHER_PATH%"=="" if exist "%APP_ROOT%\PharmacyOS-Launcher.bat" set "LAUNCHER_PATH=%APP_ROOT%\PharmacyOS-Launcher.bat"
+if "%LAUNCHER_PATH%"=="" if exist "%BACKEND_DIR%\PharmacyOS-Launch.vbs" set "LAUNCHER_PATH=%BACKEND_DIR%\PharmacyOS-Launch.vbs"
+if "%LAUNCHER_PATH%"=="" if exist "%BACKEND_DIR%\PharmacyOS-Launcher.bat" set "LAUNCHER_PATH=%BACKEND_DIR%\PharmacyOS-Launcher.bat"
+echo Launcher path: %LAUNCHER_PATH%
+if "%LAUNCHER_PATH%"=="" exit /b 1
+for %%I in ("%LAUNCHER_PATH%") do set "LAUNCHER_EXT=%%~xI"
+if /I "%LAUNCHER_EXT%"==".vbs" (
+    start "" wscript.exe "%LAUNCHER_PATH%"
+) else (
+    start "" "%LAUNCHER_PATH%"
 )
-if exist "%APP_ROOT%\PharmacyOS-Launcher.bat" (
-    start "" "%APP_ROOT%\PharmacyOS-Launcher.bat"
-    exit /b 0
-)
-exit /b 1
+exit /b 0
