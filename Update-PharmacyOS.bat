@@ -91,11 +91,15 @@ if "%GITHUB_OWNER%"=="" (
 )
 
 echo [3/5] Downloading latest UI build...
-call :DownloadAndInstallUi
-if errorlevel 1 (
-    echo Frontend update failed, using existing UI.
+if "%GITHUB_TOKEN%"=="" (
+    echo Frontend artifact download requires GITHUB_TOKEN. Using existing UI.
 ) else (
-    echo UI updated successfully
+    call :DownloadAndInstallUi
+    if errorlevel 1 (
+        echo Frontend update failed, using existing UI.
+    ) else (
+        echo UI updated successfully
+    )
 )
 echo.
 
@@ -144,7 +148,7 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 >> "%PS_SCRIPT%" echo $backupDir = $env:DIST_BACKUP
 >> "%PS_SCRIPT%" echo $tempDir = $env:DIST_TEMP
 >> "%PS_SCRIPT%" echo $zipPath = Join-Path $env:TEMP 'pharmacyos-frontend-dist.zip'
->> "%PS_SCRIPT%" echo function New-Client { $wc = New-Object Net.WebClient; $wc.Headers.Add('User-Agent','PharmacyOS-Updater'); $wc.Headers.Add('Accept','application/vnd.github+json'); if ($env:GITHUB_TOKEN) { $wc.Headers.Add('Authorization','Bearer ' + $env:GITHUB_TOKEN) }; return $wc }
+>> "%PS_SCRIPT%" echo function New-Client { $wc = New-Object Net.WebClient; $wc.Headers.Add('User-Agent','PharmacyOS-Updater'); $wc.Headers.Add('Accept','application/vnd.github+json'); $wc.Headers.Add('Authorization','Bearer ' + $env:GITHUB_TOKEN); return $wc }
 >> "%PS_SCRIPT%" echo $api = 'https://api.github.com/repos/' + $owner + '/' + $repo + '/actions/artifacts?per_page=100'
 >> "%PS_SCRIPT%" echo Write-Host ('GitHub API URL: ' + $api)
 >> "%PS_SCRIPT%" echo $json = (New-Client).DownloadString($api)
@@ -170,11 +174,13 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 >> "%PS_SCRIPT%" echo $dest.CopyHere($zip.Items(), 16)
 >> "%PS_SCRIPT%" echo Start-Sleep -Seconds 3
 >> "%PS_SCRIPT%" echo if ((Get-ChildItem -Path $tempDir -Force ^| Measure-Object).Count -eq 0) { throw 'Extracted artifact is empty.' }
+>> "%PS_SCRIPT%" echo Write-Host 'Artifact extraction completed.'
 >> "%PS_SCRIPT%" echo if (Test-Path $backupDir) { Remove-Item $backupDir -Recurse -Force }
 >> "%PS_SCRIPT%" echo if (Test-Path $distDir) { Move-Item $distDir $backupDir }
 >> "%PS_SCRIPT%" echo Move-Item $tempDir $distDir
 >> "%PS_SCRIPT%" echo if (-not (Test-Path $distDir)) { throw 'Dist replacement failed.' }
 >> "%PS_SCRIPT%" echo if ((Get-ChildItem -Path $distDir -Force ^| Measure-Object).Count -eq 0) { throw 'Dist replacement produced an empty folder.' }
+>> "%PS_SCRIPT%" echo Write-Host 'Dist replacement completed.'
 >> "%PS_SCRIPT%" echo if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%"
