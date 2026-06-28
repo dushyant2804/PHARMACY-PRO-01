@@ -109,6 +109,22 @@ BACKUP_COLLECTIONS = [
     "regular_patients", "settings",
 ]
 
+LOCAL_TO_CLOUD_SYNC_TABLES = [
+    "users",
+    "medicines",
+    "invoices",
+    "invoice_items",
+    "purchase_orders",
+    "purchase_returns",
+    "customers",
+    "distributors",
+    "customer_transactions",
+    "distributor_transactions",
+    "stock_adjustments",
+    "settings",
+]
+LOCAL_TO_CLOUD_SYNC_STATUS_ID = "local_to_cloud"
+
 
 LOCAL_PERFORMANCE_MAX_RECENT = int(os.environ.get("LOCAL_PERFORMANCE_MAX_RECENT", "200"))
 LOCAL_SLOW_REQUEST_MS = int(os.environ.get("LOCAL_SLOW_REQUEST_MS", "500"))
@@ -10006,6 +10022,125 @@ def _load_backup_file_for_restore(backup_file: str, expected_sha256: Optional[st
     return path, payload, checksum, path.stat().st_size
 
 
+def _local_to_cloud_mongo_config() -> Tuple[str, str]:
+    if not LOCAL_MODE or not isinstance(raw_db, LocalSQLiteDatabase):
+        raise HTTPException(status_code=400, detail="Local-to-cloud sync is only available in LOCAL_MODE")
+    cloud_url = os.environ.get("MONGO_URL") or os.environ.get("MONGO_URI") or ""
+    if not cloud_url:
+        raise HTTPException(status_code=400, detail="Cloud database not configured")
+    cloud_db_name = os.environ.get("DB_NAME") or ATLAS_BACKUP_DB_NAME
+    return cloud_url, cloud_db_name
+
+
+def _local_sync_table_exists(table_name: str) -> bool:
+    return bool(
+        LOCAL_MODE
+        and isinstance(raw_db, LocalSQLiteDatabase)
+        and raw_db.collection_table_exists(table_name)
+    )
+
+
+def _local_sync_read_table(table_name: str) -> List[dict]:
+    if not LOCAL_MODE or not isinstance(raw_db, LocalSQLiteDatabase):
+        return []
+    return raw_db.read_existing_collection(table_name)
+
+
+def _local_sync_document_key(document: dict) -> Tuple[dict, dict]:
+    safe_doc = _json_safe_mongo_document(document)
+    if safe_doc.get("_id") is not None:
+        return {"_id": safe_doc["_id"]}, safe_doc
+    if safe_doc.get("id") is not None:
+        safe_doc.setdefault("_id", str(safe_doc["id"]))
+        return {"_id": safe_doc["_id"]}, safe_doc
+    generated_id = hashlib.sha256(json.dumps(safe_doc, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    safe_doc["_id"] = generated_id
+    safe_doc.setdefault("id", generated_id)
+    return {"_id": generated_id}, safe_doc
+
+
+async def _local_sync_pending_changes(last_sync_time: Optional[str]) -> int:
+    if not LOCAL_MODE or not isinstance(raw_db, LocalSQLiteDatabase):
+        return 0
+    total = 0
+    for table_name in LOCAL_TO_CLOUD_SYNC_TABLES:
+        if not raw_db.collection_table_exists(table_name):
+            continue
+        if last_sync_time:
+            total += raw_db.collection_table_count_updated_after(table_name, last_sync_time)
+        else:
+            total += raw_db.collection_table_count_existing(table_name)
+    return total
+
+
+async def _local_sync_status_payload() -> dict:
+    status = await raw_db.local_sync_status.find_one({"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID}, {"_id": 0}) if LOCAL_MODE else None
+    last_sync_time = (status or {}).get("last_sync_time")
+    return {
+        "last_sync_time": last_sync_time,
+        "last_sync_status": (status or {}).get("last_sync_status", "never_run"),
+        "records_synced": (status or {}).get("records_synced", 0),
+        "failed_tables": (status or {}).get("failed_tables", []),
+        "pending_changes": await _local_sync_pending_changes(last_sync_time),
+    }
+
+
+async def _push_local_sqlite_to_cloud() -> dict:
+    cloud_url, cloud_db_name = _local_to_cloud_mongo_config()
+    started_at = datetime.now(timezone.utc).isoformat()
+    cloud_client = AsyncIOMotorClient(cloud_url, serverSelectionTimeoutMS=8000)
+    table_results: Dict[str, Any] = {}
+    failed_tables: List[str] = []
+    total_uploaded = 0
+    try:
+        await cloud_client.admin.command("ping")
+        cloud_db = cloud_client[cloud_db_name]
+        for table_name in LOCAL_TO_CLOUD_SYNC_TABLES:
+            if not _local_sync_table_exists(table_name):
+                logger.info("LOCAL_TO_CLOUD_SYNC table=%s skipped reason=local_table_missing", table_name)
+                table_results[table_name] = {"skipped": True, "reason": "local_table_missing", "records_scanned": 0, "records_uploaded": 0, "errors": []}
+                continue
+            docs = _local_sync_read_table(table_name)
+            scanned = len(docs)
+            uploaded = 0
+            errors: List[str] = []
+            logger.info("LOCAL_TO_CLOUD_SYNC table=%s records_scanned=%s", table_name, scanned)
+            for doc in docs:
+                try:
+                    filter_doc, replacement = _local_sync_document_key(doc)
+                    await cloud_db[table_name].replace_one(filter_doc, replacement, upsert=True)
+                    uploaded += 1
+                except Exception as exc:
+                    errors.append(str(exc))
+                    logger.exception("LOCAL_TO_CLOUD_SYNC table=%s record upload failed", table_name)
+            if errors:
+                failed_tables.append(table_name)
+            total_uploaded += uploaded
+            table_results[table_name] = {"skipped": False, "records_scanned": scanned, "records_uploaded": uploaded, "errors": errors}
+            logger.info("LOCAL_TO_CLOUD_SYNC table=%s records_scanned=%s records_uploaded=%s errors=%s", table_name, scanned, uploaded, len(errors))
+        finished_at = datetime.now(timezone.utc).isoformat()
+        status_value = "success" if not failed_tables else "partial_failure"
+        await raw_db.local_sync_status.update_one(
+            {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID},
+            {"$set": {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID, "last_sync_time": finished_at, "last_sync_status": status_value, "records_synced": total_uploaded, "failed_tables": failed_tables, "started_at": started_at, "database": cloud_db_name, "tables": table_results}},
+            upsert=True,
+        )
+        return {**await _local_sync_status_payload(), "ok": not failed_tables, "database": cloud_db_name, "tables": table_results}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        failed_tables = LOCAL_TO_CLOUD_SYNC_TABLES
+        logger.exception("LOCAL_TO_CLOUD_SYNC failed before table sync")
+        await raw_db.local_sync_status.update_one(
+            {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID},
+            {"$set": {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID, "last_sync_time": started_at, "last_sync_status": "failed", "records_synced": 0, "failed_tables": failed_tables, "last_error": str(exc)}},
+            upsert=True,
+        )
+        raise HTTPException(status_code=502, detail=f"Local-to-cloud sync failed: {exc}") from exc
+    finally:
+        cloud_client.close()
+
+
 def _restore_upload_files(payload: dict) -> int:
     restored = 0
     for item in payload.get("uploads", []):
@@ -10083,6 +10218,18 @@ async def backup_health(user: dict = Depends(get_current_user)):
 @api_router.post("/backup/exit")
 async def backup_exit(user: dict = Depends(require_role("admin"))):
     return await _create_and_sync_backup("app_exit")
+
+
+@api_router.get("/local-sync/status")
+async def local_sync_status(user: dict = Depends(require_role("admin"))):
+    if not LOCAL_MODE or not isinstance(raw_db, LocalSQLiteDatabase):
+        raise HTTPException(status_code=400, detail="Local-to-cloud sync is only available in LOCAL_MODE")
+    return await _local_sync_status_payload()
+
+
+@api_router.post("/local-sync/push-to-cloud")
+async def local_sync_push_to_cloud(user: dict = Depends(require_role("admin"))):
+    return await _push_local_sqlite_to_cloud()
 
 
 @api_router.post("/local/app-exit")

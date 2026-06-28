@@ -211,10 +211,37 @@ class LocalSQLiteDatabase:
             raise ValueError(f"Unsafe SQLite collection/table name: {name}")
         return str(name)
 
+    def collection_table_exists(self, name):
+        table = self._collection_table_name(name)
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        return bool(row)
+
     def collection_table_count(self, name):
         table = self._collection_table_name(name)
         self._ensure_collection(name)
         return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    def collection_table_count_existing(self, name):
+        table = self._collection_table_name(name)
+        if not self.collection_table_exists(name):
+            return 0
+        return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    def collection_table_count_updated_after(self, name, updated_after):
+        table = self._collection_table_name(name)
+        if not self.collection_table_exists(name) or not updated_after:
+            return 0
+        return int(self.conn.execute(f"SELECT COUNT(*) FROM {table} WHERE updated_at > ?", (updated_after,)).fetchone()[0])
+
+    def read_existing_collection(self, collection):
+        if not self.collection_table_exists(collection):
+            return []
+        table = self._collection_table_name(collection)
+        rows = self.conn.execute(f"SELECT data FROM {table}").fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def _sqlite_json1_available(self) -> bool:
         try:
