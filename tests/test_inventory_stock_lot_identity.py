@@ -7,7 +7,7 @@ os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "pharmacy_test")
 os.environ.setdefault("JWT_SECRET", "test-secret")
 
-from server import POCreate, PurchaseReturnCreate, _apply_po_inventory_delta, _find_purchase_return_medicine, list_medicines
+from server import POCreate, PurchaseReturnCreate, _apply_po_inventory_delta, _find_purchase_return_medicine, _rebuild_inventory_for_po_medicines, list_medicines
 
 
 class Cursor:
@@ -135,6 +135,42 @@ class InventoryStockLotIdentityTests(unittest.IsolatedAsyncioTestCase):
             await _apply_po_inventory_delta(po_2)
         self.assertEqual(len(fake_db.medicines.rows), 2)
         self.assertEqual({row["distributor_id"] for row in fake_db.medicines.rows}, {"dist-1", "dist-2"})
+
+
+    async def test_deleted_medicine_inventory_rebuilt_from_all_old_pos(self):
+        po_1 = {"id": "po-1", "distributor_id": "dist-1", "distributor_name": "Distributor 1", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 2, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "medicine_key": "medicine a::dist-1::ABC123::-::-::10.0::20.0"}]}
+        po_2 = {"id": "po-2", "distributor_id": "dist-2", "distributor_name": "Distributor 2", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 8, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "medicine_key": "medicine a::dist-2::ABC123::-::-::10.0::20.0"}]}
+        fake_db = SimpleNamespace(medicines=Collection([]), purchase_orders=Collection([po_1, po_2]), distributors=Collection([]))
+        with patch("server.db", fake_db):
+            await _rebuild_inventory_for_po_medicines({"Medicine A"})
+            response = await list_medicines(user={"id": "tester"})
+        self.assertEqual(len(response), 1)
+        self.assertEqual(response[0]["total_stock"], 10)
+        self.assertEqual(len(response[0]["batches"]), 2)
+        lots = {lot["distributor_id"]: lot["available_stock"] for lot in response[0]["batches"]}
+        self.assertEqual(lots, {"dist-1": 2, "dist-2": 8})
+
+    async def test_rebuild_merges_same_distributor_same_batch_lot(self):
+        po_1 = {"id": "po-1", "distributor_id": "dist-1", "distributor_name": "Distributor 1", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 2, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "medicine_key": "medicine a::dist-1::ABC123::-::-::10.0::20.0"}]}
+        po_2 = {"id": "po-2", "distributor_id": "dist-1", "distributor_name": "Distributor 1", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 8, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "medicine_key": "medicine a::dist-1::ABC123::-::-::10.0::20.0"}]}
+        fake_db = SimpleNamespace(medicines=Collection([]), purchase_orders=Collection([po_1, po_2]), distributors=Collection([]))
+        with patch("server.db", fake_db):
+            await _rebuild_inventory_for_po_medicines({"Medicine A"})
+            response = await list_medicines(user={"id": "tester"})
+        self.assertEqual(response[0]["total_stock"], 10)
+        self.assertEqual(len(response[0]["batches"]), 1)
+        self.assertEqual(response[0]["batches"][0]["available_stock"], 10)
+
+    async def test_rebuild_does_not_keep_only_highest_quantity_lot(self):
+        po_1 = {"id": "po-1", "distributor_id": "dist-1", "distributor_name": "Distributor 1", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 20, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "medicine_key": "medicine a::dist-1::ABC123::-::-::10.0::20.0"}]}
+        po_2 = {"id": "po-2", "distributor_id": "dist-2", "distributor_name": "Distributor 2", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 5, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "medicine_key": "medicine a::dist-2::ABC123::-::-::10.0::20.0"}]}
+        fake_db = SimpleNamespace(medicines=Collection([]), purchase_orders=Collection([po_1, po_2]), distributors=Collection([]))
+        with patch("server.db", fake_db):
+            await _rebuild_inventory_for_po_medicines({"Medicine A"})
+            response = await list_medicines(user={"id": "tester"})
+        self.assertEqual(response[0]["total_stock"], 25)
+        self.assertEqual(len(response[0]["batches"]), 2)
+        self.assertNotEqual(response[0]["total_stock"], 20)
 
     async def test_purchase_return_finds_matching_distributor_lot_only(self):
         rows = [
