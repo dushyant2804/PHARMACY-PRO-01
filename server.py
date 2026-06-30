@@ -11128,6 +11128,96 @@ async def _apply_po_inventory_delta(po: dict, selected_returns: Optional[List[di
     return {"medicine_batches_updated": len(updated_keys), "purchase_returns_adjusted": len(return_units_by_key)}
 
 
+async def _collection_rows(cursor, length=None) -> List[dict]:
+    """Return rows from Motor-style or test cursors without assuming async iteration."""
+    if hasattr(cursor, "to_list"):
+        return await cursor.to_list(length)
+    rows = []
+    async for row in cursor:
+        rows.append(row)
+    return rows
+
+
+def _po_item_medicine_names(po: dict) -> set:
+    return {str(item.get("name") or "").strip().casefold() for item in po.get("items", []) if str(item.get("name") or "").strip()}
+
+
+async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str]) -> dict:
+    """Rebuild all PO-backed stock lots for medicine names from purchase orders.
+
+    This is intentionally medicine-scoped (not edited-PO scoped): if a user
+    deleted an inventory document and then saves an old PO, all active POs for
+    that medicine must be replayed so distributor-specific lots are restored.
+    """
+    target_names = {str(name or "").strip().casefold() for name in medicine_names if str(name or "").strip()}
+    if not target_names:
+        return {"medicine_batches_updated": 0, "medicine_names_rebuilt": 0}
+
+    existing_rows = await _collection_rows(db.medicines.find({}, {"_id": 0}), None)
+    existing_by_key = {row.get("medicine_key"): row for row in existing_rows if row.get("medicine_key")}
+    rebuilt = {}
+
+    purchase_orders = await _collection_rows(db.purchase_orders.find({}, {"_id": 0}), None)
+    for po in purchase_orders:
+        if po.get("deleted_at") or po.get("voided_at") or po.get("status") == "deleted":
+            continue
+        po_distributor_id = po.get("distributor_id")
+        po_distributor_name = po.get("distributor_name") or po.get("distributor")
+        po_distributor = po.get("distributor") or po.get("distributor_name")
+        for item in po.get("items", []):
+            item_name = str(item.get("name") or "").strip()
+            if item_name.casefold() not in target_names:
+                continue
+            key = item.get("medicine_key") or _stock_lot_key(
+                item_name,
+                item.get("batch_no"),
+                po_distributor_id or item.get("distributor_id"),
+                po_distributor_name or item.get("distributor_name") or item.get("distributor"),
+                item.get("expiry_date"),
+                item.get("pack_size"),
+                item.get("purchase_price"),
+                item.get("mrp"),
+            )
+            qty = round_qty(round_qty(item.get("quantity", 0)) + round_qty(item.get("free_quantity", 0)))
+            existing = existing_by_key.get(key) or {}
+            if key not in rebuilt:
+                rebuilt[key] = {
+                    **existing,
+                    "medicine_key": key,
+                    "name": item_name,
+                    "batch_no": item.get("batch_no"),
+                    "expiry_date": item.get("expiry_date"),
+                    "manufacturer": item.get("manufacturer"),
+                    "category": item.get("category"),
+                    "mrp": item.get("mrp"),
+                    "purchase_price": item.get("purchase_price"),
+                    "pack_size": item.get("pack_size"),
+                    "gst_rate": item.get("gst_rate"),
+                    "distributor_id": po_distributor_id or item.get("distributor_id") or existing.get("distributor_id"),
+                    "distributor_name": po_distributor_name or item.get("distributor_name") or item.get("distributor") or existing.get("distributor_name") or existing.get("distributor"),
+                    "distributor": po_distributor or item.get("distributor") or item.get("distributor_name") or existing.get("distributor") or existing.get("distributor_name"),
+                    "purchased_units": 0,
+                    "sold_units": _stock_quantity(existing, "sold_units", "sold_quantity"),
+                    "purchase_return_units": _purchase_return_stock(existing),
+                    "stock_adjustment_units": _stock_adjustment_stock(existing),
+                    "low_stock_threshold": existing.get("low_stock_threshold"),
+                    "low_stock_status": _low_stock_status(existing),
+                    "id": existing.get("id") or str(uuid.uuid4()),
+                }
+            rebuilt[key]["purchased_units"] = round_qty(rebuilt[key]["purchased_units"] + qty)
+
+    for medicine in rebuilt.values():
+        derivatives = {
+            "available_stock": _available_stock(medicine),
+            "quantity_units": _available_stock(medicine),
+            "return_status": _return_status(medicine),
+            "status": _return_status(medicine),
+        }
+        await db.medicines.update_one({"medicine_key": medicine["medicine_key"]}, {"$set": {**medicine, **derivatives}}, upsert=True)
+
+    return {"medicine_batches_updated": len(rebuilt), "medicine_names_rebuilt": len(target_names)}
+
+
 @api_router.post("/purchase-orders")
 async def create_po(
     payload: POCreate,
@@ -11350,6 +11440,8 @@ async def update_po(
     timer.mark("new_inventory_delta")
 
     await db.purchase_orders.update_one({"id": po_id}, {"$set": {k: v for k, v in updated_po.items() if k != "_id"}})
+    rebuilt_inventory = await _rebuild_inventory_for_po_medicines(_po_item_medicine_names(old_po) | _po_item_medicine_names(updated_po))
+    timer.mark("medicine_scoped_inventory_rebuild")
     old_return_ids = set(old_po.get("purchase_return_ids", []))
     new_return_ids = set(return_adjustment["purchase_return_ids"])
     if old_return_ids - new_return_ids:
@@ -11370,13 +11462,14 @@ async def update_po(
     _invalidate_inventory_dashboard_cache(_current_tenant.get())
     timer.mark("cache_invalidation")
 
-    response = {"message": "PO updated", **return_adjustment}
+    response = {"message": "PO updated", **return_adjustment, "rebuilt_medicine_batches_updated": rebuilt_inventory["medicine_batches_updated"]}
     timer.mark("response_serialization")
     largest_step, largest_ms = timer.largest_step()
     timer.log(
         largest_bottleneck=f"{largest_step} ({largest_ms} ms)",
         old_medicine_batches_updated=reversal["medicine_batches_updated"],
         new_medicine_batches_updated=delta["medicine_batches_updated"],
+        rebuilt_medicine_batches_updated=rebuilt_inventory["medicine_batches_updated"],
     )
     return response
 
