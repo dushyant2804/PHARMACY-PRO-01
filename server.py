@@ -11142,7 +11142,7 @@ def _po_item_medicine_names(po: dict) -> set:
     return {str(item.get("name") or "").strip().casefold() for item in po.get("items", []) if str(item.get("name") or "").strip()}
 
 
-async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str]) -> dict:
+async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], updated_pos: Optional[Iterable[dict]] = None) -> dict:
     """Rebuild all PO-backed stock lots for medicine names from purchase orders.
 
     This is intentionally medicine-scoped (not edited-PO scoped): if a user
@@ -11155,9 +11155,42 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str]) -> 
 
     existing_rows = await _collection_rows(db.medicines.find({}, {"_id": 0}), None)
     existing_by_key = {row.get("medicine_key"): row for row in existing_rows if row.get("medicine_key")}
+    existing_by_lot = {}
+    existing_by_name_batch = {}
+    ambiguous_name_batches = set()
+    for row in existing_rows:
+        name_batch_identity = (
+            str(row.get("name") or "").strip().casefold(),
+            str(row.get("batch_no") or row.get("batch_number") or "").strip().casefold(),
+        )
+        lot_identity = (
+            *name_batch_identity,
+            str(row.get("distributor_id") or "").strip().casefold(),
+            str(row.get("distributor_name") or row.get("distributor") or "").strip().casefold(),
+        )
+        existing_by_lot.setdefault(lot_identity, row)
+        if name_batch_identity in existing_by_name_batch:
+            ambiguous_name_batches.add(name_batch_identity)
+        else:
+            existing_by_name_batch[name_batch_identity] = row
     rebuilt = {}
 
     purchase_orders = await _collection_rows(db.purchase_orders.find({}, {"_id": 0}), None)
+    updated_po_by_id = {po.get("id"): po for po in (updated_pos or []) if po and po.get("id")}
+    if updated_po_by_id:
+        seen_updated_po_ids = set()
+        merged_purchase_orders = []
+        for po in purchase_orders:
+            replacement = updated_po_by_id.get(po.get("id"))
+            if replacement:
+                merged_purchase_orders.append(replacement)
+                seen_updated_po_ids.add(po.get("id"))
+            else:
+                merged_purchase_orders.append(po)
+        merged_purchase_orders.extend(
+            po for po_id, po in updated_po_by_id.items() if po_id not in seen_updated_po_ids
+        )
+        purchase_orders = merged_purchase_orders
     for po in purchase_orders:
         if po.get("deleted_at") or po.get("voided_at") or po.get("status") == "deleted":
             continue
@@ -11179,7 +11212,16 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str]) -> 
                 item.get("mrp"),
             )
             qty = round_qty(round_qty(item.get("quantity", 0)) + round_qty(item.get("free_quantity", 0)))
-            existing = existing_by_key.get(key) or {}
+            lot_identity = (
+                item_name.casefold(),
+                str(item.get("batch_no") or item.get("batch_number") or "").strip().casefold(),
+                str(po_distributor_id or item.get("distributor_id") or "").strip().casefold(),
+                str(po_distributor_name or item.get("distributor_name") or item.get("distributor") or "").strip().casefold(),
+            )
+            name_batch_identity = lot_identity[:2]
+            legacy_name_batch = None if name_batch_identity in ambiguous_name_batches else existing_by_name_batch.get(name_batch_identity)
+            existing = existing_by_key.get(key) or existing_by_lot.get(lot_identity) or legacy_name_batch or {}
+            key = existing.get("medicine_key") or key
             if key not in rebuilt:
                 rebuilt[key] = {
                     **existing,
@@ -11436,11 +11478,14 @@ async def update_po(
         "gst_breakup": po_totals["gst_breakup"],
         **return_adjustment,
     }
-    delta = await _apply_po_inventory_delta(updated_po, selected_returns)
-    timer.mark("new_inventory_delta")
-
     await db.purchase_orders.update_one({"id": po_id}, {"$set": {k: v for k, v in updated_po.items() if k != "_id"}})
-    rebuilt_inventory = await _rebuild_inventory_for_po_medicines(_po_item_medicine_names(old_po) | _po_item_medicine_names(updated_po))
+    timer.mark("purchase_order_update_write")
+
+    # The medicine-scoped rebuild is authoritative for PO updates.  Persist the
+    # edited PO first, then replay every active PO item for each affected
+    # medicine name so restoring a deleted inventory lot is not limited to the
+    # currently edited PO or its distributor-scoped stock key.
+    rebuilt_inventory = await _rebuild_inventory_for_po_medicines(_po_item_medicine_names(old_po) | _po_item_medicine_names(updated_po), updated_pos=[updated_po])
     timer.mark("medicine_scoped_inventory_rebuild")
     old_return_ids = set(old_po.get("purchase_return_ids", []))
     new_return_ids = set(return_adjustment["purchase_return_ids"])
@@ -11468,7 +11513,6 @@ async def update_po(
     timer.log(
         largest_bottleneck=f"{largest_step} ({largest_ms} ms)",
         old_medicine_batches_updated=reversal["medicine_batches_updated"],
-        new_medicine_batches_updated=delta["medicine_batches_updated"],
         rebuilt_medicine_batches_updated=rebuilt_inventory["medicine_batches_updated"],
     )
     return response

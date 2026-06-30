@@ -7,7 +7,7 @@ os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "pharmacy_test")
 os.environ.setdefault("JWT_SECRET", "test-secret")
 
-from server import POCreate, PurchaseReturnCreate, _apply_po_inventory_delta, _find_purchase_return_medicine, _rebuild_inventory_for_po_medicines, list_medicines
+from server import POCreate, PurchaseReturnCreate, _apply_po_inventory_delta, _find_purchase_return_medicine, _rebuild_inventory_for_po_medicines, list_medicines, update_po
 
 
 class Cursor:
@@ -44,6 +44,21 @@ class Collection:
             self.rows.append(row)
         row.update(update.get("$set", {}))
         return SimpleNamespace(modified_count=1, matched_count=1)
+
+    async def update_many(self, query, update, *args, **kwargs):
+        count = 0
+        for row in self.rows:
+            if self._matches(row, query):
+                row.update(update.get("$set", {}))
+                for key in update.get("$unset", {}):
+                    row.pop(key, None)
+                count += 1
+        return SimpleNamespace(modified_count=count, matched_count=count)
+
+    async def delete_one(self, query, *args, **kwargs):
+        before = len(self.rows)
+        self.rows = [row for row in self.rows if not self._matches(row, query)]
+        return SimpleNamespace(deleted_count=before - len(self.rows))
 
     def _matches(self, row, query):
         for key, expected in (query or {}).items():
@@ -160,6 +175,23 @@ class InventoryStockLotIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response[0]["total_stock"], 10)
         self.assertEqual(len(response[0]["batches"]), 1)
         self.assertEqual(response[0]["batches"][0]["available_stock"], 10)
+
+    async def test_update_po_rebuilds_deleted_inventory_from_all_active_pos_for_medicine(self):
+        po_1 = {"id": "po-a", "po_no": "PO-A", "distributor_id": "dist-a", "distributor_name": "Distributor A", "invoice_ref": "A", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 5, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "gst_rate": 0, "medicine_key": "medicine a::dist-a::ABC123::-::-::10.0::20.0"}], "purchase_return_ids": []}
+        po_2 = {"id": "po-b", "po_no": "PO-B", "distributor_id": "dist-b", "distributor_name": "Distributor B", "invoice_ref": "B", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 20, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "gst_rate": 0, "medicine_key": "medicine a::dist-b::ABC123::-::-::10.0::20.0"}], "purchase_return_ids": []}
+        fake_db = SimpleNamespace(medicines=Collection([]), purchase_orders=Collection([po_1, po_2]), purchase_returns=Collection([]), distributors=Collection([]))
+        payload_a = POCreate(distributor_id="dist-a", distributor_name="Distributor A", invoice_ref="A", items=[{"name": "Medicine A", "batch_no": "ABC123", "quantity": 5, "purchase_price": 10, "mrp": 20, "gst_rate": 0}])
+        payload_b = POCreate(distributor_id="dist-b", distributor_name="Distributor B", invoice_ref="B", items=[{"name": "Medicine A", "batch_no": "ABC123", "quantity": 20, "purchase_price": 10, "mrp": 20, "gst_rate": 0}])
+
+        with patch("server.db", fake_db):
+            await update_po("po-a", payload_a, {"role": "admin"})
+            await update_po("po-b", payload_b, {"role": "admin"})
+            response = await list_medicines(user={"id": "tester"})
+
+        self.assertEqual(len(response), 1)
+        self.assertEqual(response[0]["total_stock"], 25)
+        lots = {lot["distributor_id"]: lot["available_stock"] for lot in response[0]["batches"]}
+        self.assertEqual(lots, {"dist-a": 5, "dist-b": 20})
 
     async def test_rebuild_does_not_keep_only_highest_quantity_lot(self):
         po_1 = {"id": "po-1", "distributor_id": "dist-1", "distributor_name": "Distributor 1", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 20, "free_quantity": 0, "purchase_price": 10, "mrp": 20, "medicine_key": "medicine a::dist-1::ABC123::-::-::10.0::20.0"}]}
