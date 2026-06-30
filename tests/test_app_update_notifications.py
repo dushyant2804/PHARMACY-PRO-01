@@ -103,3 +103,128 @@ class AppUpdateNotificationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(format_size_label(1024), "1 KB")
         self.assertEqual(format_size_label(50331648), "48 MB")
         self.assertEqual(format_size_label(1073741824), "1 GB")
+
+
+class AppUpdateStartTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import server
+
+        self.original_local_mode = server.LOCAL_MODE
+        self.original_updater_script = os.environ.get("PHARMACYOS_UPDATER_SCRIPT")
+        self.original_github_token = os.environ.get("GITHUB_TOKEN")
+        server._update_last_started_at = None
+        server._update_last_started_monotonic = None
+
+    def tearDown(self):
+        import server
+
+        server.LOCAL_MODE = self.original_local_mode
+        server._update_last_started_at = None
+        server._update_last_started_monotonic = None
+        if self.original_updater_script is None:
+            os.environ.pop("PHARMACYOS_UPDATER_SCRIPT", None)
+        else:
+            os.environ["PHARMACYOS_UPDATER_SCRIPT"] = self.original_updater_script
+        if self.original_github_token is None:
+            os.environ.pop("GITHUB_TOKEN", None)
+        else:
+            os.environ["GITHUB_TOKEN"] = self.original_github_token
+
+    async def test_local_mode_start_update_returns_started_true_when_script_exists(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        import server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "Update-PharmacyOS.bat"
+            script.write_text("@echo off\n", encoding="utf-8")
+            os.environ["PHARMACYOS_UPDATER_SCRIPT"] = str(script)
+            server.LOCAL_MODE = True
+
+            with patch.object(server.subprocess, "Popen") as popen:
+                payload = await server.app_start_update()
+
+        self.assertEqual(payload, {"started": True, "message": "Update started. PharmacyOS will restart after update."})
+        popen.assert_called_once()
+
+    async def test_cloud_mode_start_update_is_rejected(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from fastapi import HTTPException
+        import server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "Update-PharmacyOS.bat"
+            script.write_text("@echo off\n", encoding="utf-8")
+            os.environ["PHARMACYOS_UPDATER_SCRIPT"] = str(script)
+            server.LOCAL_MODE = False
+
+            with patch.object(server.subprocess, "Popen") as popen:
+                with self.assertRaises(HTTPException) as ctx:
+                    await server.app_start_update()
+
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(ctx.exception.detail, "Self-update is only available in local desktop mode.")
+        popen.assert_not_called()
+
+    async def test_missing_updater_script_returns_safe_error(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from fastapi import HTTPException
+        import server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["PHARMACYOS_UPDATER_SCRIPT"] = str(Path(tmpdir) / "missing.bat")
+            server.LOCAL_MODE = True
+
+            with patch.object(server.subprocess, "Popen") as popen:
+                with self.assertRaises(HTTPException) as ctx:
+                    await server.app_start_update()
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.detail, "Updater script was not found.")
+        popen.assert_not_called()
+
+    async def test_duplicate_start_within_guard_window_does_not_launch_again(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        import server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "Update-PharmacyOS.bat"
+            script.write_text("@echo off\n", encoding="utf-8")
+            os.environ["PHARMACYOS_UPDATER_SCRIPT"] = str(script)
+            server.LOCAL_MODE = True
+
+            with patch.object(server.subprocess, "Popen") as popen:
+                first = await server.app_start_update()
+                second = await server.app_start_update()
+
+        self.assertTrue(first["started"])
+        self.assertEqual(second, {"started": False, "message": "Update already in progress."})
+        popen.assert_called_once()
+
+    async def test_github_token_is_not_returned_or_logged(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        import server
+
+        secret = "ghp_secret_token_for_update_test"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "Update-PharmacyOS.bat"
+            script.write_text("@echo off\n", encoding="utf-8")
+            os.environ["PHARMACYOS_UPDATER_SCRIPT"] = str(script)
+            os.environ["GITHUB_TOKEN"] = secret
+            server.LOCAL_MODE = True
+
+            with patch.object(server.subprocess, "Popen"), self.assertLogs(server.logger.name, level="INFO") as logs:
+                server.logger.info("Starting test log capture")
+                payload = await server.app_start_update()
+
+        self.assertNotIn(secret, str(payload))
+        self.assertNotIn(secret, "\n".join(logs.output))
