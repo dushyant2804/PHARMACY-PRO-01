@@ -37,6 +37,7 @@ load_dotenv(ROOT_DIR / '.env')
 _record_startup_timing("Load configuration", time.perf_counter() - _load_config_started, root=ROOT_DIR)
 
 import os
+import subprocess
 import copy
 import uuid
 import logging
@@ -130,6 +131,12 @@ LOCAL_TO_CLOUD_SYNC_STATUS_ID = "local_to_cloud"
 
 LOCAL_PERFORMANCE_MAX_RECENT = int(os.environ.get("LOCAL_PERFORMANCE_MAX_RECENT", "200"))
 LOCAL_SLOW_REQUEST_MS = int(os.environ.get("LOCAL_SLOW_REQUEST_MS", "500"))
+
+DEFAULT_UPDATER_SCRIPT = r"D:\pharmacy-app-v2\Update-PharmacyOS.bat"
+UPDATE_START_GUARD_SECONDS = 120
+_update_start_lock = threading.Lock()
+_update_last_started_at = None
+_update_last_started_monotonic = None
 
 
 def _now_ms() -> float:
@@ -2437,6 +2444,86 @@ async def app_update_check():
     except ManifestUnavailable as exc:
         logger.warning("Update check unavailable: %s", exc)
         return {"update_available": False, "message": "Update check unavailable"}
+
+
+def _updater_script_path() -> Path:
+    configured_path = os.environ.get("PHARMACYOS_UPDATER_SCRIPT") or DEFAULT_UPDATER_SCRIPT
+    return Path(configured_path).expanduser()
+
+
+def _launch_updater_script(script_path: Path) -> None:
+    script = str(script_path)
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", "", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+        return
+
+    subprocess.Popen(
+        [script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+
+
+def _update_status_payload() -> Dict[str, Any]:
+    now = time.monotonic()
+    with _update_start_lock:
+        in_progress = (
+            _update_last_started_monotonic is not None
+            and now - _update_last_started_monotonic < UPDATE_START_GUARD_SECONDS
+        )
+        last_started_at = _update_last_started_at.isoformat() if _update_last_started_at else None
+    return {
+        "update_in_progress": in_progress,
+        "last_started_at": last_started_at,
+        "message": "Update already in progress." if in_progress else "No update in progress.",
+    }
+
+
+@api_router.post("/app/start-update")
+async def app_start_update():
+    global _update_last_started_at, _update_last_started_monotonic
+
+    if not LOCAL_MODE:
+        raise HTTPException(status_code=403, detail="Self-update is only available in local desktop mode.")
+
+    script_path = _updater_script_path()
+    if not script_path.is_file():
+        raise HTTPException(status_code=404, detail="Updater script was not found.")
+
+    now_monotonic = time.monotonic()
+    with _update_start_lock:
+        if (
+            _update_last_started_monotonic is not None
+            and now_monotonic - _update_last_started_monotonic < UPDATE_START_GUARD_SECONDS
+        ):
+            return {"started": False, "message": "Update already in progress."}
+
+        try:
+            _launch_updater_script(script_path)
+        except Exception as exc:
+            logger.exception("Failed to start PharmacyOS updater script")
+            raise HTTPException(status_code=500, detail="Updater script could not be started.") from exc
+
+        _update_last_started_monotonic = now_monotonic
+        _update_last_started_at = datetime.now(timezone.utc)
+
+    return {"started": True, "message": "Update started. PharmacyOS will restart after update."}
+
+
+@api_router.get("/app/update-status")
+async def app_update_status():
+    return _update_status_payload()
 
 
 @api_router.post("/auth/signup/request-otp")
