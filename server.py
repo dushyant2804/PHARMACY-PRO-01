@@ -2707,6 +2707,40 @@ def _medicine_identity_filter(medicine_id: str) -> dict:
     }
 
 
+def _stock_lot_key(
+    medicine_name: str,
+    batch_no: str,
+    distributor_id: Optional[str] = None,
+    distributor_name: Optional[str] = None,
+    expiry_date: Optional[str] = None,
+    pack_size: Optional[str] = None,
+    purchase_rate=None,
+    mrp=None,
+) -> str:
+    """Stable physical lot key: medicine + distributor + batch + known lot fields."""
+
+    def normalize(value, *, upper: bool = False) -> str:
+        normalized = str(value or "").strip()
+        normalized = normalized.upper() if upper else normalized.casefold()
+        return normalized or "-"
+
+    def normalize_money(value) -> str:
+        if value in (None, ""):
+            return "-"
+        return str(_money_float(_to_decimal(value)))
+
+    distributor_identity = distributor_id or distributor_name
+    return "::".join([
+        normalize(medicine_name),
+        normalize(distributor_identity),
+        normalize(batch_no, upper=True),
+        normalize(expiry_date),
+        normalize(pack_size),
+        normalize_money(purchase_rate),
+        normalize_money(mrp),
+    ])
+
+
 def _threshold_response(medicine: dict) -> dict:
     return {
         "medicine_id": medicine.get("id") or medicine.get("medicine_key"),
@@ -3281,6 +3315,36 @@ async def list_medicines(
     )
 
     for item in result:
+        merged_batches = {}
+        for batch in item["batches"]:
+            lot_key = _stock_lot_key(
+                batch.get("name") or item.get("name"),
+                batch.get("batch_no"),
+                batch.get("distributor_id"),
+                batch.get("distributor_name") or batch.get("distributor"),
+                batch.get("expiry_date"),
+                batch.get("pack_size"),
+                batch.get("purchase_price"),
+                batch.get("mrp"),
+            )
+            if lot_key not in merged_batches:
+                merged_batches[lot_key] = dict(batch)
+                continue
+            merged = merged_batches[lot_key]
+            for field in (
+                "quantity_units",
+                "available_stock",
+                "purchased_units",
+                "sold_units",
+                "purchase_return_units",
+                "stock_adjustment_units",
+            ):
+                merged[field] = round_qty(
+                    _safe_float(merged.get(field)) + _safe_float(batch.get(field))
+                )
+            merged["return_status"] = _return_status(merged)
+            merged["status"] = merged["return_status"]
+        item["batches"] = list(merged_batches.values())
         aggregate_stock = {
             **item,
             "purchased_units": item.get("total_stock"),
@@ -7346,15 +7410,54 @@ async def _find_purchase_return_medicine(payload: PurchaseReturnCreate, session=
     if payload.medicine_id:
         lookup_filters.append({"id": payload.medicine_id})
 
-    medicine = await db.medicines.find_one(
+    candidates = await db.medicines.find(
         {"$or": lookup_filters},
+        {"_id": 0},
         session=session,
-    )
+    ).to_list(10000)
+
+    distributor_id = _normalized_stock_match_value(payload.distributor_id or payload.distributor)
+    distributor_name = _normalized_stock_match_value(payload.distributor)
+    if distributor_id or distributor_name:
+        distributor_matches = [
+            medicine for medicine in candidates
+            if (
+                distributor_id
+                and _normalized_stock_match_value(medicine.get("distributor_id")) == distributor_id
+            )
+            or (
+                distributor_name
+                and _normalized_stock_match_value(
+                    medicine.get("distributor_name") or medicine.get("distributor")
+                ) == distributor_name
+            )
+        ]
+        if distributor_matches:
+            candidates = distributor_matches
+
+    if payload.expiry_date:
+        expiry = _normalized_stock_expiry(payload.expiry_date)
+        expiry_matches = [
+            medicine for medicine in candidates
+            if _normalized_stock_expiry(medicine.get("expiry_date")) == expiry
+        ]
+        if expiry_matches:
+            candidates = expiry_matches
+
+    if payload.purchase_rate not in (None, ""):
+        rate_matches = [
+            medicine for medicine in candidates
+            if _round_money(_to_decimal(medicine.get("purchase_price"))) == _round_money(_to_decimal(payload.purchase_rate))
+        ]
+        if rate_matches:
+            candidates = rate_matches
+
+    medicine = candidates[0] if len(candidates) == 1 else None
 
     if not medicine:
         raise HTTPException(
             status_code=400,
-            detail="Medicine batch not found",
+            detail="Medicine stock lot not found or ambiguous",
         )
 
     return medicine
@@ -10846,6 +10949,48 @@ async def _apply_po_inventory_delta(po: dict, selected_returns: Optional[List[di
             continue
         qty = round_qty(round_qty(item.get("quantity", 0)) + round_qty(item.get("free_quantity", 0)))
         existing = await db.medicines.find_one({"medicine_key": key}, {"_id": 0})
+        if not existing:
+            distributor_id = po.get("distributor_id") or item.get("distributor_id")
+            distributor_name = (
+                po.get("distributor_name")
+                or po.get("distributor")
+                or item.get("distributor_name")
+                or item.get("distributor")
+            )
+            legacy_filters = [
+                {"name": item.get("name"), "batch_no": item.get("batch_no"), "distributor_id": distributor_id},
+            ]
+            if distributor_name:
+                legacy_filters.extend([
+                    {"name": item.get("name"), "batch_no": item.get("batch_no"), "distributor_name": distributor_name},
+                    {"name": item.get("name"), "batch_no": item.get("batch_no"), "distributor": distributor_name},
+                ])
+            legacy_candidates = []
+            for legacy_filter in legacy_filters:
+                legacy_match = await db.medicines.find_one(legacy_filter, {"_id": 0})
+                if legacy_match and not any(
+                    (candidate.get("id"), candidate.get("medicine_key"))
+                    == (legacy_match.get("id"), legacy_match.get("medicine_key"))
+                    for candidate in legacy_candidates
+                ):
+                    legacy_candidates.append(legacy_match)
+                if len(legacy_candidates) > 1:
+                    break
+            if not legacy_candidates:
+                unscoped_legacy = await db.medicines.find_one(
+                    {"name": item.get("name"), "batch_no": item.get("batch_no")},
+                    {"_id": 0},
+                )
+                if (
+                    unscoped_legacy
+                    and not unscoped_legacy.get("distributor_id")
+                    and not unscoped_legacy.get("distributor_name")
+                    and not unscoped_legacy.get("distributor")
+                ):
+                    legacy_candidates.append(unscoped_legacy)
+            if len(legacy_candidates) == 1:
+                existing = legacy_candidates[0]
+                key = existing.get("medicine_key") or key
         purchased_units = round_qty(_purchased_stock(existing or {}) + qty)
         purchase_return_units = round_qty(max(0.0, _purchase_return_stock(existing or {}) - return_units_by_key.get(key, 0.0)))
         medicine = {
@@ -10939,7 +11084,10 @@ async def create_po(
             "quantity": round_qty(i.quantity),
             "free_quantity": round_qty(i.free_quantity),
             "item_total": _money_float(_to_decimal(i.purchase_price) * _to_decimal(i.quantity)),
-            "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
+            "medicine_key": _stock_lot_key(
+                i.name, i.batch_no, payload.distributor_id, payload.distributor_name,
+                normalize_expiry(i.expiry_date), i.pack_size, i.purchase_price, i.mrp,
+            ),
             "expiry_date": normalize_expiry(i.expiry_date),
         }
         for i in payload.items
@@ -11082,7 +11230,10 @@ async def update_po(
             "quantity": round_qty(i.quantity),
             "free_quantity": round_qty(i.free_quantity),
             "item_total": _money_float(_to_decimal(i.purchase_price) * _to_decimal(i.quantity)),
-            "medicine_key": f"{str(i.name).strip().lower()}::{str(i.batch_no).strip().upper()}",
+            "medicine_key": _stock_lot_key(
+                i.name, i.batch_no, payload.distributor_id, payload.distributor_name,
+                normalize_expiry(i.expiry_date), i.pack_size, i.purchase_price, i.mrp,
+            ),
             "expiry_date": normalize_expiry(i.expiry_date),
         }
         for i in payload.items
