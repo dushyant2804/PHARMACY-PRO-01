@@ -82,6 +82,8 @@ from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator, mo
 from starlette.datastructures import UploadFile
 
 from version_config import VERSION_METADATA, get_version_metadata
+from app_version import APP_BUILD as BACKEND_APP_BUILD, APP_CHANNEL, APP_VERSION as BACKEND_APP_VERSION
+from app_update_service import ManifestUnavailable, build_update_check_response, fetch_update_manifest
 
 
 # Runtime database mode
@@ -2413,6 +2415,28 @@ async def check_updates(
             }
         )
         return fallback
+
+
+@api_router.get("/app/version")
+async def app_version_endpoint():
+    return {
+        "version": BACKEND_APP_VERSION,
+        "build": BACKEND_APP_BUILD,
+        "channel": APP_CHANNEL,
+        "runtime_mode": RUNTIME_MODE,
+        "local_mode": LOCAL_MODE,
+    }
+
+
+@api_router.get("/app/update-check")
+async def app_update_check():
+    manifest_url = os.environ.get("PHARMACYOS_UPDATE_MANIFEST_URL", "")
+    try:
+        manifest = await asyncio.to_thread(fetch_update_manifest, manifest_url)
+        return build_update_check_response(manifest)
+    except ManifestUnavailable as exc:
+        logger.warning("Update check unavailable: %s", exc)
+        return {"update_available": False, "message": "Update check unavailable"}
 
 
 @api_router.post("/auth/signup/request-otp")
