@@ -456,6 +456,17 @@ def home():
     if LOCAL_MODE and (FRONTEND_BUILD_DIR / "index.html").exists():
         return FileResponse(str(FRONTEND_BUILD_DIR / "index.html"))
     return {"message": "Pharmacy backend is running"}
+
+
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "system_stable": True,
+        "mode": "LOCAL_MODE" if LOCAL_MODE else "CLOUD_MODE",
+    }
+
+
 api_router = APIRouter(prefix="/api")
 
 
