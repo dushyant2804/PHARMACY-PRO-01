@@ -458,13 +458,18 @@ def home():
     return {"message": "Pharmacy backend is running"}
 
 
-@app.get("/api/health")
-async def health():
+def _backend_readiness_payload() -> dict:
     return {
         "status": "ok",
         "system_stable": True,
         "mode": "LOCAL_MODE" if LOCAL_MODE else "CLOUD_MODE",
+        "ready": True,
     }
+
+
+@app.get("/api/health")
+async def health():
+    return _backend_readiness_payload()
 
 
 api_router = APIRouter(prefix="/api")
@@ -9778,16 +9783,7 @@ async def _database_connected() -> bool:
 
 
 async def _server_health_payload() -> dict:
-    database_connected = await _database_connected()
-    return {
-        "status": "ok" if database_connected else "degraded",
-        "system_stable": _system_stable(),
-        "runtime_mode": RUNTIME_MODE,
-        "local_mode": LOCAL_MODE,
-        "local_backend_running": True,
-        "local_database_connected": database_connected,
-        "local_database_path": str(LOCAL_DB_PATH) if LOCAL_MODE else None,
-    }
+    return _backend_readiness_payload()
 
 
 @app.get("/health")

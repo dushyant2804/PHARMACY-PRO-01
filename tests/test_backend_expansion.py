@@ -192,15 +192,16 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
 
         original_database_connected = server._database_connected
 
-        async def healthy_database():
-            return True
+        async def failing_database():
+            raise AssertionError("readiness health must not touch the database")
 
         try:
-            server._database_connected = healthy_database
+            server._database_connected = failing_database
             payload = asyncio.run(server.api_health())
             self.assertEqual(payload["status"], "ok")
             self.assertTrue(payload["system_stable"])
-            self.assertTrue(payload["local_backend_running"])
+            self.assertTrue(payload["ready"])
+            self.assertEqual(payload["mode"], "LOCAL_MODE" if server.LOCAL_MODE else "CLOUD_MODE")
 
             route_paths = {route.path for route in server.app.routes}
             self.assertIn("/health", route_paths)
