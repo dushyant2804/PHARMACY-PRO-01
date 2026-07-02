@@ -11149,37 +11149,72 @@ def _po_item_medicine_names(po: dict) -> set:
     return {str(item.get("name") or "").strip().casefold() for item in po.get("items", []) if str(item.get("name") or "").strip()}
 
 
-async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], updated_pos: Optional[Iterable[dict]] = None) -> dict:
-    """Rebuild all PO-backed stock lots for medicine names from purchase orders.
+async def _delete_inventory_rows_for_medicine_names(medicine_names: Iterable[str]) -> int:
+    """Delete every inventory row for the affected PO medicine names."""
+    target_names = {str(name or "").strip().casefold() for name in medicine_names if str(name or "").strip()}
+    if not target_names:
+        return 0
 
-    This is intentionally medicine-scoped (not edited-PO scoped): if a user
-    deleted an inventory document and then saves an old PO, all active POs for
-    that medicine must be replayed so distributor-specific lots are restored.
+    existing_rows = await _collection_rows(db.medicines.find({}, {"_id": 0}), None)
+    rows_to_delete = [
+        row for row in existing_rows
+        if str(row.get("name") or "").strip().casefold() in target_names
+    ]
+    if not rows_to_delete:
+        return 0
+
+    delete_filter = {"$or": []}
+    for row in rows_to_delete:
+        if row.get("id"):
+            delete_filter["$or"].append({"id": row.get("id")})
+        if row.get("medicine_key"):
+            delete_filter["$or"].append({"medicine_key": row.get("medicine_key")})
+
+    if delete_filter["$or"] and hasattr(db.medicines, "delete_many"):
+        result = await db.medicines.delete_many(delete_filter)
+        return getattr(result, "deleted_count", len(rows_to_delete))
+
+    # Unit-test collections in this repository are intentionally tiny and some
+    # do not implement delete_many. Mutate them directly only in that in-memory
+    # test shape; production Mongo/Motor collections use the branch above.
+    if hasattr(db.medicines, "rows"):
+        before = len(db.medicines.rows)
+        db.medicines.rows[:] = [
+            row for row in db.medicines.rows
+            if str(row.get("name") or "").strip().casefold() not in target_names
+        ]
+        return before - len(db.medicines.rows)
+
+    deleted = 0
+    if hasattr(db.medicines, "delete_one"):
+        for row in rows_to_delete:
+            identity = row.get("id") or row.get("medicine_key")
+            if not identity:
+                continue
+            result = await db.medicines.delete_one(_medicine_identity_filter(identity))
+            deleted += getattr(result, "deleted_count", 0)
+    return deleted
+
+
+def _po_item_group_identity(po: dict, item: dict) -> tuple:
+    medicine_identity = str(item.get("medicine_id") or item.get("name") or "").strip().casefold()
+    distributor_identity = str(po.get("distributor_id") or item.get("distributor_id") or po.get("distributor_name") or po.get("distributor") or item.get("distributor_name") or item.get("distributor") or "").strip().casefold()
+    return medicine_identity, distributor_identity
+
+
+async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], updated_pos: Optional[Iterable[dict]] = None) -> dict:
+    """Deterministically rebuild PO-backed inventory for affected medicines.
+
+    Purchase orders are the source of truth. For every affected medicine, all
+    existing inventory rows are deleted first; fresh rows are then aggregated
+    from active purchase orders only, grouped by medicine identity and
+    distributor identity. No previous inventory quantity is reused.
     """
     target_names = {str(name or "").strip().casefold() for name in medicine_names if str(name or "").strip()}
     if not target_names:
-        return {"medicine_batches_updated": 0, "medicine_names_rebuilt": 0}
+        return {"medicine_batches_updated": 0, "medicine_names_rebuilt": 0, "inventory_rows_deleted": 0}
 
-    existing_rows = await _collection_rows(db.medicines.find({}, {"_id": 0}), None)
-    existing_by_key = {row.get("medicine_key"): row for row in existing_rows if row.get("medicine_key")}
-    existing_by_lot = {}
-    existing_by_name_batch = {}
-    ambiguous_name_batches = set()
-    for row in existing_rows:
-        name_batch_identity = (
-            str(row.get("name") or "").strip().casefold(),
-            str(row.get("batch_no") or row.get("batch_number") or "").strip().casefold(),
-        )
-        lot_identity = (
-            *name_batch_identity,
-            str(row.get("distributor_id") or "").strip().casefold(),
-            str(row.get("distributor_name") or row.get("distributor") or "").strip().casefold(),
-        )
-        existing_by_lot.setdefault(lot_identity, row)
-        if name_batch_identity in existing_by_name_batch:
-            ambiguous_name_batches.add(name_batch_identity)
-        else:
-            existing_by_name_batch[name_batch_identity] = row
+    deleted_count = await _delete_inventory_rows_for_medicine_names(target_names)
     rebuilt = {}
 
     purchase_orders = await _collection_rows(db.purchase_orders.find({}, {"_id": 0}), None)
@@ -11194,10 +11229,9 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
                 seen_updated_po_ids.add(po.get("id"))
             else:
                 merged_purchase_orders.append(po)
-        merged_purchase_orders.extend(
-            po for po_id, po in updated_po_by_id.items() if po_id not in seen_updated_po_ids
-        )
+        merged_purchase_orders.extend(po for po_id, po in updated_po_by_id.items() if po_id not in seen_updated_po_ids)
         purchase_orders = merged_purchase_orders
+
     for po in purchase_orders:
         if po.get("deleted_at") or po.get("voided_at") or po.get("status") == "deleted":
             continue
@@ -11208,31 +11242,17 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
             item_name = str(item.get("name") or "").strip()
             if item_name.casefold() not in target_names:
                 continue
-            key = item.get("medicine_key") or _stock_lot_key(
-                item_name,
-                item.get("batch_no"),
-                po_distributor_id or item.get("distributor_id"),
-                po_distributor_name or item.get("distributor_name") or item.get("distributor"),
-                item.get("expiry_date"),
-                item.get("pack_size"),
-                item.get("purchase_price"),
-                item.get("mrp"),
-            )
+            group_key = _po_item_group_identity(po, item)
             qty = round_qty(round_qty(item.get("quantity", 0)) + round_qty(item.get("free_quantity", 0)))
-            lot_identity = (
-                item_name.casefold(),
-                str(item.get("batch_no") or item.get("batch_number") or "").strip().casefold(),
-                str(po_distributor_id or item.get("distributor_id") or "").strip().casefold(),
-                str(po_distributor_name or item.get("distributor_name") or item.get("distributor") or "").strip().casefold(),
-            )
-            name_batch_identity = lot_identity[:2]
-            legacy_name_batch = None if name_batch_identity in ambiguous_name_batches else existing_by_name_batch.get(name_batch_identity)
-            existing = existing_by_key.get(key) or existing_by_lot.get(lot_identity) or legacy_name_batch or {}
-            key = existing.get("medicine_key") or key
-            if key not in rebuilt:
-                rebuilt[key] = {
-                    **existing,
-                    "medicine_key": key,
+            if group_key not in rebuilt:
+                distributor_id = po_distributor_id or item.get("distributor_id")
+                distributor_name = po_distributor_name or item.get("distributor_name") or item.get("distributor")
+                medicine_key = _stock_lot_key(item_name, "", distributor_id, distributor_name)
+                legacy_batch_identity = f"{item_name.strip().casefold()}::{str(item.get('batch_no') or item.get('batch_number') or '').strip().upper()}"
+                rebuilt[group_key] = {
+                    "id": item.get("medicine_id") or legacy_batch_identity or medicine_key,
+                    "medicine_key": medicine_key,
+                    "medicine_id": item.get("medicine_id") or legacy_batch_identity or medicine_key,
                     "name": item_name,
                     "batch_no": item.get("batch_no"),
                     "expiry_date": item.get("expiry_date"),
@@ -11242,18 +11262,15 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
                     "purchase_price": item.get("purchase_price"),
                     "pack_size": item.get("pack_size"),
                     "gst_rate": item.get("gst_rate"),
-                    "distributor_id": po_distributor_id or item.get("distributor_id") or existing.get("distributor_id"),
-                    "distributor_name": po_distributor_name or item.get("distributor_name") or item.get("distributor") or existing.get("distributor_name") or existing.get("distributor"),
-                    "distributor": po_distributor or item.get("distributor") or item.get("distributor_name") or existing.get("distributor") or existing.get("distributor_name"),
+                    "distributor_id": distributor_id,
+                    "distributor_name": distributor_name,
+                    "distributor": po_distributor or item.get("distributor") or item.get("distributor_name") or distributor_name,
                     "purchased_units": 0,
-                    "sold_units": _stock_quantity(existing, "sold_units", "sold_quantity"),
-                    "purchase_return_units": _purchase_return_stock(existing),
-                    "stock_adjustment_units": _stock_adjustment_stock(existing),
-                    "low_stock_threshold": existing.get("low_stock_threshold"),
-                    "low_stock_status": _low_stock_status(existing),
-                    "id": existing.get("id") or str(uuid.uuid4()),
+                    "sold_units": 0,
+                    "purchase_return_units": 0,
+                    "stock_adjustment_units": 0,
                 }
-            rebuilt[key]["purchased_units"] = round_qty(rebuilt[key]["purchased_units"] + qty)
+            rebuilt[group_key]["purchased_units"] = round_qty(rebuilt[group_key]["purchased_units"] + qty)
 
     for medicine in rebuilt.values():
         derivatives = {
@@ -11264,7 +11281,7 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
         }
         await db.medicines.update_one({"medicine_key": medicine["medicine_key"]}, {"$set": {**medicine, **derivatives}}, upsert=True)
 
-    return {"medicine_batches_updated": len(rebuilt), "medicine_names_rebuilt": len(target_names)}
+    return {"medicine_batches_updated": len(rebuilt), "medicine_names_rebuilt": len(target_names), "inventory_rows_deleted": deleted_count}
 
 
 @api_router.post("/purchase-orders")
@@ -11348,14 +11365,9 @@ async def create_po(
         )
     timer.mark("purchase_return_settlement_updates")
 
-    inventory_delta = await _apply_po_inventory_delta(po, selected_returns)
-    timer.mark("medicine_stock_updates")
+    rebuilt_inventory = await _rebuild_inventory_for_po_medicines(_po_item_medicine_names(po), updated_pos=[po])
+    timer.mark("medicine_scoped_inventory_rebuild")
 
-    # Full inventory rebuild previously ran synchronously here. In LOCAL_MODE it
-    # scans all medicines, purchase orders, invoices, and purchase returns and
-    # then rewrites every medicine, which is the observed multi-minute bottleneck.
-    # PO creation only needs the affected medicine batches updated immediately;
-    # startup/admin repair paths still retain the full rebuild behavior.
     timer.mark("purchase_return_stock_recalculation")
     timer.mark("dashboard_rebuild")
     _invalidate_inventory_dashboard_cache(_current_tenant.get())
@@ -11367,7 +11379,7 @@ async def create_po(
     largest_step, largest_ms = timer.largest_step()
     timer.log(
         largest_bottleneck=f"{largest_step} ({largest_ms} ms)",
-        medicine_batches_updated=inventory_delta["medicine_batches_updated"],
+        medicine_batches_updated=rebuilt_inventory["medicine_batches_updated"],
     )
     return po
     
@@ -11384,9 +11396,7 @@ async def delete_po(
     if not po:
         raise HTTPException(404, "PO not found")
 
-    old_selected_returns = await _purchase_returns_by_ids(po.get("purchase_return_ids", []))
-    reversal = await _reverse_po_inventory_delta(po, old_selected_returns)
-    timer.mark("inventory_reversal")
+    affected_medicine_names = _po_item_medicine_names(po)
 
     if po.get("purchase_return_ids"):
         await db.purchase_returns.update_many(
@@ -11398,8 +11408,9 @@ async def delete_po(
     await db.purchase_orders.delete_one({"id": po_id})
     timer.mark("delete_po_document")
 
-    # Normal PO deletes are now handled by affected-batch deltas above; keep
-    # full purchase-return repair and dashboard rebuild out of the synchronous path.
+    rebuilt_inventory = await _rebuild_inventory_for_po_medicines(affected_medicine_names)
+    timer.mark("medicine_scoped_inventory_rebuild")
+
     timer.mark("purchase_return_recalculation")
     timer.mark("dashboard_rebuild")
     _invalidate_inventory_dashboard_cache(_current_tenant.get())
@@ -11410,7 +11421,7 @@ async def delete_po(
     largest_step, largest_ms = timer.largest_step()
     timer.log(
         largest_bottleneck=f"{largest_step} ({largest_ms} ms)",
-        medicine_batches_updated=reversal["medicine_batches_updated"],
+        medicine_batches_updated=rebuilt_inventory["medicine_batches_updated"],
     )
     return response
 
@@ -11445,10 +11456,6 @@ async def update_po(
     selected_returns, return_credit = await _resolve_po_purchase_returns(payload, allow_po_id=po_id)
     return_adjustment = _apply_po_return_credit(po_totals, selected_returns, return_credit)
     timer.mark("validation")
-
-    old_selected_returns = await _purchase_returns_by_ids(old_po.get("purchase_return_ids", []))
-    reversal = await _reverse_po_inventory_delta(old_po, old_selected_returns)
-    timer.mark("old_inventory_reversal")
 
     new_items = [
         {
@@ -11488,10 +11495,9 @@ async def update_po(
     await db.purchase_orders.update_one({"id": po_id}, {"$set": {k: v for k, v in updated_po.items() if k != "_id"}})
     timer.mark("purchase_order_update_write")
 
-    # The medicine-scoped rebuild is authoritative for PO updates.  Persist the
-    # edited PO first, then replay every active PO item for each affected
-    # medicine name so restoring a deleted inventory lot is not limited to the
-    # currently edited PO or its distributor-scoped stock key.
+    # The medicine-scoped rebuild is authoritative for PO updates. Persist the
+    # edited PO first, delete all inventory rows for affected medicines, then
+    # replay active PO items from purchase_orders only.
     rebuilt_inventory = await _rebuild_inventory_for_po_medicines(_po_item_medicine_names(old_po) | _po_item_medicine_names(updated_po), updated_pos=[updated_po])
     timer.mark("medicine_scoped_inventory_rebuild")
     old_return_ids = set(old_po.get("purchase_return_ids", []))
@@ -11519,7 +11525,6 @@ async def update_po(
     largest_step, largest_ms = timer.largest_step()
     timer.log(
         largest_bottleneck=f"{largest_step} ({largest_ms} ms)",
-        old_medicine_batches_updated=reversal["medicine_batches_updated"],
         rebuilt_medicine_batches_updated=rebuilt_inventory["medicine_batches_updated"],
     )
     return response
