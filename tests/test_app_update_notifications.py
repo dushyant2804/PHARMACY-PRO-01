@@ -6,6 +6,16 @@ os.environ.setdefault("DB_NAME", "test_pharmacy")
 
 
 class AppUpdateNotificationTest(unittest.IsolatedAsyncioTestCase):
+    def test_importing_server_does_not_fetch_manifest(self):
+        import importlib
+        from unittest.mock import patch
+        import server
+
+        with patch("app_update_service.urllib.request.urlopen") as urlopen:
+            importlib.reload(server)
+
+        urlopen.assert_not_called()
+
     async def test_app_version_endpoint(self):
         import server
         from app_version import APP_BUILD, APP_CHANNEL, APP_VERSION
@@ -44,12 +54,16 @@ class AppUpdateNotificationTest(unittest.IsolatedAsyncioTestCase):
             else:
                 os.environ["PHARMACYOS_UPDATE_MANIFEST_URL"] = original_url
 
-        self.assertTrue(payload["update_available"])
-        self.assertEqual(payload["current_version"], APP_VERSION)
-        self.assertEqual(payload["current_build"], APP_BUILD)
-        self.assertEqual(payload["latest_version"], "1.1.0")
-        self.assertEqual(payload["latest_build"], APP_BUILD + 1)
-        self.assertEqual(payload["update_size_label"], "48 MB")
+        self.assertEqual(payload, {
+            "status": "ok",
+            "update_available": True,
+            "current_version": APP_VERSION,
+            "latest_version": "1.1.0",
+            "current_build": APP_BUILD,
+            "latest_build": APP_BUILD + 1,
+            "message": "Update available",
+            "release_notes": ["Improved update notifications"],
+        })
 
     async def test_no_update(self):
         import server
@@ -71,9 +85,9 @@ class AppUpdateNotificationTest(unittest.IsolatedAsyncioTestCase):
             server.fetch_update_manifest = original_fetch
 
         self.assertEqual(payload, {
+            "status": "ok",
             "update_available": False,
-            "current_version": APP_VERSION,
-            "current_build": APP_BUILD,
+            "message": "You are up to date",
         })
 
     async def test_offline_manifest_returns_200_payload(self):
@@ -89,13 +103,18 @@ class AppUpdateNotificationTest(unittest.IsolatedAsyncioTestCase):
         finally:
             server.fetch_update_manifest = original_fetch
 
-        self.assertEqual(payload, {"update_available": False, "message": "Update check unavailable"})
+        self.assertEqual(payload, {
+            "status": "unavailable",
+            "update_available": False,
+            "message": "Update check unavailable",
+            "fallback": True,
+        })
 
     def test_malformed_manifest(self):
         from app_update_service import validate_update_manifest
 
         with self.assertRaises(ValueError):
-            validate_update_manifest({"latest_version": "1.1.0", "latest_build": "2"})
+            validate_update_manifest({"latest_version": "1.1.0", "latest_build": {}})
 
     def test_size_conversion(self):
         from app_update_service import format_size_label
@@ -145,7 +164,7 @@ class AppUpdateStartTest(unittest.IsolatedAsyncioTestCase):
             with patch.object(server.subprocess, "Popen") as popen:
                 payload = await server.app_start_update()
 
-        self.assertEqual(payload, {"started": True, "message": "Update started. PharmacyOS will restart after update."})
+        self.assertEqual(payload, {"status": "started"})
         popen.assert_called_once()
 
     async def test_cloud_mode_start_update_is_rejected(self):
@@ -204,8 +223,8 @@ class AppUpdateStartTest(unittest.IsolatedAsyncioTestCase):
                 first = await server.app_start_update()
                 second = await server.app_start_update()
 
-        self.assertTrue(first["started"])
-        self.assertEqual(second, {"started": False, "message": "Update already in progress."})
+        self.assertEqual(first, {"status": "started"})
+        self.assertEqual(second, {"status": "already_started", "message": "Update already in progress."})
         popen.assert_called_once()
 
     async def test_github_token_is_not_returned_or_logged(self):

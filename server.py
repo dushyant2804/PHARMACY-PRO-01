@@ -2459,7 +2459,12 @@ async def app_update_check():
         return build_update_check_response(manifest)
     except ManifestUnavailable as exc:
         logger.warning("Update check unavailable: %s", exc)
-        return {"update_available": False, "message": "Update check unavailable"}
+        return {
+            "status": "unavailable",
+            "update_available": False,
+            "message": "Update check unavailable",
+            "fallback": True,
+        }
 
 
 def _updater_script_path() -> Path:
@@ -2523,7 +2528,7 @@ async def app_start_update():
             _update_last_started_monotonic is not None
             and now_monotonic - _update_last_started_monotonic < UPDATE_START_GUARD_SECONDS
         ):
-            return {"started": False, "message": "Update already in progress."}
+            return {"status": "already_started", "message": "Update already in progress."}
 
         try:
             _launch_updater_script(script_path)
@@ -2534,7 +2539,7 @@ async def app_start_update():
         _update_last_started_monotonic = now_monotonic
         _update_last_started_at = datetime.now(timezone.utc)
 
-    return {"started": True, "message": "Update started. PharmacyOS will restart after update."}
+    return {"status": "started"}
 
 
 @api_router.get("/app/update-status")
