@@ -147,7 +147,9 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 >> "%PS_SCRIPT%" echo function Read-JsonFile($path) { Add-JsonType; $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer; return $serializer.DeserializeObject([IO.File]::ReadAllText($path)) }
 >> "%PS_SCRIPT%" echo function Read-JsonUrl($url) { Add-JsonType; $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer; return $serializer.DeserializeObject((New-Client 'application/json').DownloadString($url)) }
 >> "%PS_SCRIPT%" echo function First-Text($map, [string[]] $names) { foreach ($name in $names) { if ($map -and $map.ContainsKey($name) -and $map[$name]) { return [string]$map[$name] } }; return '' }
->> "%PS_SCRIPT%" echo function Copy-DirectoryContents($source, $dest) { if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }; New-Item -ItemType Directory -Path $dest ^| Out-Null; Copy-Item (Join-Path $source '*') $dest -Recurse -Force }
+>> "%PS_SCRIPT%" echo function Test-FrontendDist($path) { return ((Test-Path -LiteralPath (Join-Path $path 'index.html') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $path 'static') -PathType Container) -and (Test-Path -LiteralPath (Join-Path $path 'version.json') -PathType Leaf)) }
+>> "%PS_SCRIPT%" echo function Find-ArtifactRoot($path) { $roots = @(Get-Item -LiteralPath $path) + @(Get-ChildItem -LiteralPath $path -Directory -Recurse); foreach ($root in $roots) { if (Test-FrontendDist $root.FullName) { return $root.FullName } }; return $null }
+>> "%PS_SCRIPT%" echo function Copy-DirectoryContents($source, $dest) { if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }; New-Item -ItemType Directory -Path $dest ^| Out-Null; Get-ChildItem -LiteralPath $source -Force ^| Copy-Item -Destination $dest -Recurse -Force }
 >> "%PS_SCRIPT%" echo $owner = $env:GITHUB_OWNER
 >> "%PS_SCRIPT%" echo $repo = $env:GITHUB_REPO
 >> "%PS_SCRIPT%" echo $artifactName = $env:ARTIFACT_NAME
@@ -177,19 +179,17 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 >> "%PS_SCRIPT%" echo if (-not $zip -or -not $dest) { throw 'Unable to open artifact zip.' }
 >> "%PS_SCRIPT%" echo $dest.CopyHere($zip.Items(), 16)
 >> "%PS_SCRIPT%" echo Start-Sleep -Seconds 3
->> "%PS_SCRIPT%" echo Log 'verifying artifact'
->> "%PS_SCRIPT%" echo $artifactRoot = $null
->> "%PS_SCRIPT%" echo $candidates = @(Get-Item $tempDir) + @(Get-ChildItem -Path $tempDir -Directory -Recurse)
->> "%PS_SCRIPT%" echo foreach ($candidate in $candidates) { if ((Test-Path (Join-Path $candidate.FullName 'index.html')) -and (Test-Path (Join-Path $candidate.FullName 'static')) -and (Test-Path (Join-Path $candidate.FullName 'version.json'))) { $artifactRoot = $candidate.FullName; break } }
->> "%PS_SCRIPT%" echo if (-not $artifactRoot) { throw 'Artifact verification failed. Required files were not found: index.html, static/, version.json.' }
+>> "%PS_SCRIPT%" echo Log 'verifying artifact before touching frontend/dist'
+>> "%PS_SCRIPT%" echo $artifactRoot = Find-ArtifactRoot $tempDir
+>> "%PS_SCRIPT%" echo if (-not $artifactRoot) { throw 'Artifact verification failed. Update stopped before touching frontend/dist because the extracted artifact does not contain a folder with index.html, static/, and version.json.' }
 >> "%PS_SCRIPT%" echo Log ('verified artifact root: ' + $artifactRoot)
 >> "%PS_SCRIPT%" echo Copy-DirectoryContents $artifactRoot $stageDir
->> "%PS_SCRIPT%" echo if (-not ((Test-Path (Join-Path $stageDir 'index.html')) -and (Test-Path (Join-Path $stageDir 'static')) -and (Test-Path (Join-Path $stageDir 'version.json')))) { throw 'Staged artifact verification failed.' }
->> "%PS_SCRIPT%" echo Log ('copying to frontend/dist: ' + $distDir)
->> "%PS_SCRIPT%" echo if (Test-Path $backupDir) { Remove-Item $backupDir -Recurse -Force }
->> "%PS_SCRIPT%" echo if (Test-Path $distDir) { Move-Item $distDir $backupDir }
->> "%PS_SCRIPT%" echo Move-Item $stageDir $distDir
->> "%PS_SCRIPT%" echo if (-not ((Test-Path (Join-Path $distDir 'index.html')) -and (Test-Path (Join-Path $distDir 'static')) -and (Test-Path (Join-Path $distDir 'version.json')))) { if (Test-Path $distDir) { Remove-Item $distDir -Recurse -Force }; if (Test-Path $backupDir) { Move-Item $backupDir $distDir }; throw 'Dist replacement verification failed; restored previous frontend/dist.' }
+>> "%PS_SCRIPT%" echo if (-not (Test-FrontendDist $stageDir)) { if (Test-Path -LiteralPath $stageDir) { Remove-Item -LiteralPath $stageDir -Recurse -Force }; throw 'Staged artifact verification failed. Existing frontend/dist was left untouched.' }
+>> "%PS_SCRIPT%" echo Log ('validated staged artifact; replacing frontend/dist: ' + $distDir)
+>> "%PS_SCRIPT%" echo if (Test-Path -LiteralPath $backupDir) { Remove-Item -LiteralPath $backupDir -Recurse -Force }
+>> "%PS_SCRIPT%" echo if (Test-Path -LiteralPath $distDir) { Move-Item -LiteralPath $distDir -Destination $backupDir }
+>> "%PS_SCRIPT%" echo Move-Item -LiteralPath $stageDir -Destination $distDir
+>> "%PS_SCRIPT%" echo if (-not (Test-FrontendDist $distDir)) { if (Test-Path -LiteralPath $distDir) { Remove-Item -LiteralPath $distDir -Recurse -Force }; if (Test-Path -LiteralPath $backupDir) { Move-Item -LiteralPath $backupDir -Destination $distDir }; throw 'Dist replacement verification failed; restored previous frontend/dist.' }
 >> "%PS_SCRIPT%" echo Log 'update complete'
 >> "%PS_SCRIPT%" echo if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 >> "%PS_SCRIPT%" echo if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
