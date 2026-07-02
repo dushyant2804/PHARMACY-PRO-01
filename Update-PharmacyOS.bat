@@ -4,7 +4,8 @@ setlocal EnableExtensions EnableDelayedExpansion
 REM ================================================================
 REM PharmacyOS Windows auto-updater
 REM - Pulls backend and frontend source from GitHub
-REM - Downloads the latest frontend dist artifact through GitHub REST API
+REM - Downloads the GitHub Actions-built frontend dist artifact
+REM - Verifies index.html, static\, and version.json before replacement
 REM - Replaces only the frontend dist folder after backing it up
 REM - Restarts PharmacyOS with the existing launcher
 REM ================================================================
@@ -26,6 +27,7 @@ set "FRONTEND_DIR=%APP_ROOT%\frontend"
 set "DIST_DIR=%FRONTEND_DIR%\dist"
 set "DIST_BACKUP=%FRONTEND_DIR%\dist_backup"
 set "DIST_TEMP=%FRONTEND_DIR%\dist_temp"
+set "DIST_STAGE=%FRONTEND_DIR%\dist_stage"
 
 REM Optional override for the GitHub owner or organization that stores the UI build artifact.
 REM If this is blank, the updater automatically detects the owner from the frontend
@@ -37,6 +39,8 @@ set "ARTIFACT_NAME=pharmacyos-frontend-dist"
 
 REM Optional for private repositories or higher API limits:
 REM set "GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx"
+REM Optional manifest URL. If set, its artifact URL is preferred over latest artifact lookup.
+REM set "PHARMACYOS_UPDATE_MANIFEST_URL=https://example.com/manifest.json"
 
 echo.
 echo ================================================================
@@ -47,6 +51,13 @@ echo.
 where git >nul 2>nul
 if errorlevel 1 (
     echo ERROR: git was not found in PATH. Update stopped safely.
+    pause
+    exit /b 1
+)
+
+where powershell >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: PowerShell was not found in PATH. Update stopped safely.
     pause
     exit /b 1
 )
@@ -79,27 +90,18 @@ if not exist "%FRONTEND_DIR%" (
 cd /d "%FRONTEND_DIR%" || goto :GitFail
 git pull origin main
 if errorlevel 1 goto :GitFail
-echo Frontend updated successfully
+echo Frontend source updated successfully
+echo No local npm build will run on this machine. The updater uses the GitHub-built frontend artifact.
 echo.
 
 if "%GITHUB_OWNER%"=="" call :DetectGitHubOwner
-if "%GITHUB_OWNER%"=="" (
-    echo ERROR: GitHub owner could not be detected for the UI artifact repository.
-    echo Edit Update-PharmacyOS.bat and set GITHUB_OWNER to the owner of %GITHUB_REPO%.
+
+echo [3/5] Downloading, extracting, and verifying frontend artifact...
+call :DownloadAndInstallUi
+if errorlevel 1 (
+    echo ERROR: Frontend artifact update failed. Existing frontend/dist was not overwritten.
     pause
     exit /b 1
-)
-
-echo [3/5] Downloading latest UI build...
-if "%GITHUB_TOKEN%"=="" (
-    echo Frontend artifact download requires GITHUB_TOKEN. Using existing UI.
-) else (
-    call :DownloadAndInstallUi
-    if errorlevel 1 (
-        echo Frontend update failed, using existing UI.
-    ) else (
-        echo UI updated successfully
-    )
 )
 echo.
 
@@ -139,33 +141,35 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 
 > "%PS_SCRIPT%" echo $ErrorActionPreference = 'Stop'
 >> "%PS_SCRIPT%" echo [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 3072)
->> "%PS_SCRIPT%" echo Write-Host ('TLS version being used: ' + [Net.ServicePointManager]::SecurityProtocol)
+>> "%PS_SCRIPT%" echo function Log($message) { Write-Host ('[frontend artifact] ' + $message) }
+>> "%PS_SCRIPT%" echo function New-Client($accept) { $wc = New-Object Net.WebClient; $wc.Headers.Add('User-Agent','PharmacyOS-Updater'); if ($accept) { $wc.Headers.Add('Accept',$accept) }; if ($env:GITHUB_TOKEN) { $wc.Headers.Add('Authorization','Bearer ' + $env:GITHUB_TOKEN) }; return $wc }
+>> "%PS_SCRIPT%" echo function Add-JsonType { Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue }
+>> "%PS_SCRIPT%" echo function Read-JsonFile($path) { Add-JsonType; $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer; return $serializer.DeserializeObject([IO.File]::ReadAllText($path)) }
+>> "%PS_SCRIPT%" echo function Read-JsonUrl($url) { Add-JsonType; $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer; return $serializer.DeserializeObject((New-Client 'application/json').DownloadString($url)) }
+>> "%PS_SCRIPT%" echo function First-Text($map, [string[]] $names) { foreach ($name in $names) { if ($map -and $map.ContainsKey($name) -and $map[$name]) { return [string]$map[$name] } }; return '' }
+>> "%PS_SCRIPT%" echo function Copy-DirectoryContents($source, $dest) { if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }; New-Item -ItemType Directory -Path $dest ^| Out-Null; Copy-Item (Join-Path $source '*') $dest -Recurse -Force }
 >> "%PS_SCRIPT%" echo $owner = $env:GITHUB_OWNER
 >> "%PS_SCRIPT%" echo $repo = $env:GITHUB_REPO
 >> "%PS_SCRIPT%" echo $artifactName = $env:ARTIFACT_NAME
+>> "%PS_SCRIPT%" echo $appRoot = $env:APP_ROOT
 >> "%PS_SCRIPT%" echo $frontendDir = $env:FRONTEND_DIR
 >> "%PS_SCRIPT%" echo $distDir = $env:DIST_DIR
 >> "%PS_SCRIPT%" echo $backupDir = $env:DIST_BACKUP
 >> "%PS_SCRIPT%" echo $tempDir = $env:DIST_TEMP
+>> "%PS_SCRIPT%" echo $stageDir = $env:DIST_STAGE
 >> "%PS_SCRIPT%" echo $zipPath = Join-Path $env:TEMP 'pharmacyos-frontend-dist.zip'
->> "%PS_SCRIPT%" echo function New-Client { $wc = New-Object Net.WebClient; $wc.Headers.Add('User-Agent','PharmacyOS-Updater'); $wc.Headers.Add('Accept','application/vnd.github+json'); $wc.Headers.Add('Authorization','Bearer ' + $env:GITHUB_TOKEN); return $wc }
->> "%PS_SCRIPT%" echo $api = 'https://api.github.com/repos/' + $owner + '/' + $repo + '/actions/artifacts?per_page=100'
->> "%PS_SCRIPT%" echo Write-Host ('GitHub API URL: ' + $api)
->> "%PS_SCRIPT%" echo $json = (New-Client).DownloadString($api)
->> "%PS_SCRIPT%" echo Add-Type -AssemblyName System.Web.Extensions
->> "%PS_SCRIPT%" echo $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
->> "%PS_SCRIPT%" echo $data = $serializer.DeserializeObject($json)
->> "%PS_SCRIPT%" echo $artifact = $null
->> "%PS_SCRIPT%" echo foreach ($a in $data['artifacts']) { if ($a['name'] -eq $artifactName -and -not $a['expired']) { $ok = $true; if ($a.ContainsKey('workflow_run') -and $a['workflow_run'] -and $a['workflow_run'].ContainsKey('conclusion') -and $a['workflow_run']['conclusion']) { $ok = ($a['workflow_run']['conclusion'] -eq 'success') }; if ($ok) { $artifact = $a; break } } }
->> "%PS_SCRIPT%" echo if (-not $artifact) { throw 'No non-expired successful artifact named ' + $artifactName + ' was found.' }
->> "%PS_SCRIPT%" echo $artifactUrl = $artifact['archive_download_url']
->> "%PS_SCRIPT%" echo Write-Host ('Artifact URL: ' + $artifactUrl)
->> "%PS_SCRIPT%" echo if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
->> "%PS_SCRIPT%" echo (New-Client).DownloadFile($artifactUrl, $zipPath)
+>> "%PS_SCRIPT%" echo $manifest = $null
+>> "%PS_SCRIPT%" echo $manifestUrl = $env:PHARMACYOS_UPDATE_MANIFEST_URL
+>> "%PS_SCRIPT%" echo if ($manifestUrl) { Log ('reading manifest.json from ' + $manifestUrl); $manifest = Read-JsonUrl $manifestUrl }
+>> "%PS_SCRIPT%" echo if (-not $manifest) { foreach ($p in @((Join-Path $appRoot 'manifest.json'), (Join-Path $frontendDir 'manifest.json'), (Join-Path $appRoot 'update-manifest.json'))) { if (Test-Path $p) { Log ('reading manifest.json from ' + $p); $manifest = Read-JsonFile $p; break } } }
+>> "%PS_SCRIPT%" echo $artifactUrl = First-Text $manifest @('frontend_artifact_url','artifact_url','artifactUrl','download_url')
+>> "%PS_SCRIPT%" echo if ($artifactUrl) { Log ('downloading artifact from manifest URL'); if (Test-Path $zipPath) { Remove-Item $zipPath -Force }; (New-Client 'application/zip').DownloadFile($artifactUrl, $zipPath) } else { if (-not $owner) { throw 'GitHub owner is not set and no artifact URL was found in manifest.json.' }; $api = 'https://api.github.com/repos/' + $owner + '/' + $repo + '/actions/artifacts?per_page=100'; Log ('downloading latest artifact metadata from ' + $api); $data = Read-JsonUrl $api; $artifact = $null; foreach ($a in $data['artifacts']) { if ($a['name'] -eq $artifactName -and -not $a['expired']) { $artifact = $a; break } }; if (-not $artifact) { throw 'No non-expired artifact named ' + $artifactName + ' was found.' }; $artifactUrl = $artifact['archive_download_url']; Log ('downloading artifact ' + $artifactUrl); if (Test-Path $zipPath) { Remove-Item $zipPath -Force }; (New-Client 'application/vnd.github+json').DownloadFile($artifactUrl, $zipPath) }
 >> "%PS_SCRIPT%" echo if (-not (Test-Path $zipPath)) { throw 'Artifact download did not create a zip file.' }
 >> "%PS_SCRIPT%" echo $zipInfo = Get-Item $zipPath
 >> "%PS_SCRIPT%" echo if ($zipInfo.Length -le 0) { throw 'Artifact download created an empty zip file.' }
+>> "%PS_SCRIPT%" echo Log ('extracting artifact to ' + $tempDir)
 >> "%PS_SCRIPT%" echo if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
+>> "%PS_SCRIPT%" echo if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
 >> "%PS_SCRIPT%" echo New-Item -ItemType Directory -Path $tempDir ^| Out-Null
 >> "%PS_SCRIPT%" echo $shell = New-Object -ComObject Shell.Application
 >> "%PS_SCRIPT%" echo $zip = $shell.NameSpace($zipPath)
@@ -173,14 +177,21 @@ set "PS_SCRIPT=%TEMP%\pharmacyos_update_ui_%RANDOM%%RANDOM%.ps1"
 >> "%PS_SCRIPT%" echo if (-not $zip -or -not $dest) { throw 'Unable to open artifact zip.' }
 >> "%PS_SCRIPT%" echo $dest.CopyHere($zip.Items(), 16)
 >> "%PS_SCRIPT%" echo Start-Sleep -Seconds 3
->> "%PS_SCRIPT%" echo if ((Get-ChildItem -Path $tempDir -Force ^| Measure-Object).Count -eq 0) { throw 'Extracted artifact is empty.' }
->> "%PS_SCRIPT%" echo Write-Host 'Artifact extraction completed.'
+>> "%PS_SCRIPT%" echo Log 'verifying artifact'
+>> "%PS_SCRIPT%" echo $artifactRoot = $null
+>> "%PS_SCRIPT%" echo $candidates = @(Get-Item $tempDir) + @(Get-ChildItem -Path $tempDir -Directory -Recurse)
+>> "%PS_SCRIPT%" echo foreach ($candidate in $candidates) { if ((Test-Path (Join-Path $candidate.FullName 'index.html')) -and (Test-Path (Join-Path $candidate.FullName 'static')) -and (Test-Path (Join-Path $candidate.FullName 'version.json'))) { $artifactRoot = $candidate.FullName; break } }
+>> "%PS_SCRIPT%" echo if (-not $artifactRoot) { throw 'Artifact verification failed. Required files were not found: index.html, static/, version.json.' }
+>> "%PS_SCRIPT%" echo Log ('verified artifact root: ' + $artifactRoot)
+>> "%PS_SCRIPT%" echo Copy-DirectoryContents $artifactRoot $stageDir
+>> "%PS_SCRIPT%" echo if (-not ((Test-Path (Join-Path $stageDir 'index.html')) -and (Test-Path (Join-Path $stageDir 'static')) -and (Test-Path (Join-Path $stageDir 'version.json')))) { throw 'Staged artifact verification failed.' }
+>> "%PS_SCRIPT%" echo Log ('copying to frontend/dist: ' + $distDir)
 >> "%PS_SCRIPT%" echo if (Test-Path $backupDir) { Remove-Item $backupDir -Recurse -Force }
 >> "%PS_SCRIPT%" echo if (Test-Path $distDir) { Move-Item $distDir $backupDir }
->> "%PS_SCRIPT%" echo Move-Item $tempDir $distDir
->> "%PS_SCRIPT%" echo if (-not (Test-Path $distDir)) { throw 'Dist replacement failed.' }
->> "%PS_SCRIPT%" echo if ((Get-ChildItem -Path $distDir -Force ^| Measure-Object).Count -eq 0) { throw 'Dist replacement produced an empty folder.' }
->> "%PS_SCRIPT%" echo Write-Host 'Dist replacement completed.'
+>> "%PS_SCRIPT%" echo Move-Item $stageDir $distDir
+>> "%PS_SCRIPT%" echo if (-not ((Test-Path (Join-Path $distDir 'index.html')) -and (Test-Path (Join-Path $distDir 'static')) -and (Test-Path (Join-Path $distDir 'version.json')))) { if (Test-Path $distDir) { Remove-Item $distDir -Recurse -Force }; if (Test-Path $backupDir) { Move-Item $backupDir $distDir }; throw 'Dist replacement verification failed; restored previous frontend/dist.' }
+>> "%PS_SCRIPT%" echo Log 'update complete'
+>> "%PS_SCRIPT%" echo if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 >> "%PS_SCRIPT%" echo if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%"
