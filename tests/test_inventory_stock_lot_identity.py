@@ -204,6 +204,27 @@ class InventoryStockLotIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response[0]["batches"]), 2)
         self.assertNotEqual(response[0]["total_stock"], 20)
 
+
+    async def test_rebuild_deletes_stale_rows_and_recomputes_distributor_totals(self):
+        stale_rows = [
+            medicine("stale-dist-a", distributor_id="dist-a", distributor="Distributor A", qty=25, available_stock=25),
+            medicine("stale-dist-b", distributor_id="dist-b", distributor="Distributor B", qty=25, available_stock=25),
+        ]
+        po_1 = {"id": "po-a", "distributor_id": "dist-a", "distributor_name": "Distributor A", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 5, "free_quantity": 0, "purchase_price": 10, "mrp": 20}]}
+        po_2 = {"id": "po-b", "distributor_id": "dist-b", "distributor_name": "Distributor B", "items": [{"name": "Medicine A", "batch_no": "ABC123", "quantity": 20, "free_quantity": 0, "purchase_price": 10, "mrp": 20}]}
+        fake_db = SimpleNamespace(medicines=Collection(stale_rows), purchase_orders=Collection([po_1, po_2]), distributors=Collection([]))
+
+        with patch("server.db", fake_db):
+            await _rebuild_inventory_for_po_medicines({"Medicine A"})
+            first_response = await list_medicines(user={"id": "tester"})
+            await _rebuild_inventory_for_po_medicines({"Medicine A"})
+            second_response = await list_medicines(user={"id": "tester"})
+
+        self.assertEqual(first_response, second_response)
+        self.assertEqual(first_response[0]["total_stock"], 25)
+        lots = {lot["distributor_id"]: lot["available_stock"] for lot in first_response[0]["batches"]}
+        self.assertEqual(lots, {"dist-a": 5, "dist-b": 20})
+
     async def test_purchase_return_finds_matching_distributor_lot_only(self):
         rows = [
             medicine("lot-1", distributor_id="dist-1", distributor="Distributor 1", qty=2),

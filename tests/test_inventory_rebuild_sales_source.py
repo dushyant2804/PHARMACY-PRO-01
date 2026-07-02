@@ -125,7 +125,7 @@ class InventoryRebuildSalesSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(medicines.rows[0]["available_stock"], 0)
 
 class PurchaseOrderCreatePerformanceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_create_po_updates_only_affected_inventory_without_full_rebuild(self):
+    async def test_create_po_rebuilds_inventory_from_purchase_orders_only(self):
         from server import POCreate, POItem, create_po
 
         class PurchaseOrders(Collection):
@@ -180,13 +180,13 @@ class PurchaseOrderCreatePerformanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_db.purchase_orders.rows), 1)
         self.assertEqual(len(medicines.rows), 1)
         med = medicines.rows[0]
-        self.assertEqual(med["purchased_units"], 12)
-        self.assertEqual(med["sold_units"], 1)
-        self.assertEqual(med["available_stock"], 11)
-        self.assertEqual(med["quantity_units"], 11)
+        self.assertEqual(med["purchased_units"], 8)
+        self.assertEqual(med["sold_units"], 0)
+        self.assertEqual(med["available_stock"], 8)
+        self.assertEqual(med["quantity_units"], 8)
 
 class PurchaseOrderUpdateDeletePerformanceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_update_po_updates_inventory_without_full_rebuild_quickly(self):
+    async def test_update_po_rebuilds_inventory_from_purchase_orders_only(self):
         from server import POCreate, POItem, update_po
         import time
 
@@ -227,9 +227,9 @@ class PurchaseOrderUpdateDeletePerformanceTests(unittest.IsolatedAsyncioTestCase
         self.assertLess(elapsed, 2.0)
         med = medicines.rows[0]
         self.assertEqual(med["purchased_units"], 15)
-        self.assertEqual(med["available_stock"], 13)
+        self.assertEqual(med["available_stock"], 15)
 
-    async def test_delete_po_reverses_inventory_without_full_rebuild_quickly(self):
+    async def test_delete_po_removes_inventory_when_no_purchase_orders_remain(self):
         from server import delete_po
         import time
 
@@ -265,6 +265,4 @@ class PurchaseOrderUpdateDeletePerformanceTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(result["message"], "PO deleted")
         self.assertLess(elapsed, 2.0)
         self.assertEqual(len(purchase_orders.rows), 0)
-        med = medicines.rows[0]
-        self.assertEqual(med["purchased_units"], 0)
-        self.assertEqual(med["available_stock"], 0)
+        self.assertEqual(medicines.rows, [])
