@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Mapping
 from app_version import APP_BUILD, APP_VERSION
 
 MANIFEST_TIMEOUT_SECONDS = 5
+MAX_MANIFEST_BYTES = 1024 * 1024
 
 
 class ManifestUnavailable(Exception):
@@ -36,60 +37,88 @@ def _require_string(manifest: Mapping[str, Any], field: str) -> str:
     value = manifest.get(field)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"Manifest field {field} must be a non-empty string")
-    return value
+    return value.strip()
 
 
-def _require_int(manifest: Mapping[str, Any], field: str, *, minimum: int = 0) -> int:
-    value = manifest.get(field)
-    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-        raise ValueError(f"Manifest field {field} must be an integer >= {minimum}")
-    return value
+def _coerce_build(value: Any, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"Manifest field {field} must be an integer >= 0")
+    if isinstance(value, int):
+        build = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        build = int(value.strip())
+    else:
+        raise ValueError(f"Manifest field {field} must be an integer >= 0")
+    if build < 0:
+        raise ValueError(f"Manifest field {field} must be an integer >= 0")
+    return build
 
 
-def _require_bool(manifest: Mapping[str, Any], field: str) -> bool:
-    value = manifest.get(field)
+def _optional_bool(manifest: Mapping[str, Any], field: str, default: bool = False) -> bool:
+    value = manifest.get(field, default)
     if not isinstance(value, bool):
         raise ValueError(f"Manifest field {field} must be a boolean")
     return value
 
 
-def _require_string_list(manifest: Mapping[str, Any], field: str) -> List[str]:
-    value = manifest.get(field)
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"Manifest field {field} must be a list of strings")
-    return list(value)
+def _optional_int(manifest: Mapping[str, Any], field: str, default: int = 0) -> int:
+    value = manifest.get(field, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"Manifest field {field} must be an integer >= 0")
+    return value
+
+
+def _optional_string(manifest: Mapping[str, Any], field: str, default: str = "") -> str:
+    value = manifest.get(field, default)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"Manifest field {field} must be a string")
+    return value
+
+
+def _optional_string_list(manifest: Mapping[str, Any], *fields: str) -> List[str]:
+    for field in fields:
+        if field in manifest:
+            value = manifest.get(field)
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"Manifest field {field} must be a list of strings")
+            return list(value)
+    return []
 
 
 def validate_update_manifest(manifest: Mapping[str, Any]) -> Dict[str, Any]:
     """Validate and normalize a PharmacyOS update manifest."""
     latest_version = _require_string(manifest, "latest_version")
-    latest_build = _require_int(manifest, "latest_build", minimum=0)
-    mandatory = _require_bool(manifest, "mandatory")
-    update_size_bytes = _require_int(manifest, "update_size_bytes", minimum=0)
-    download_url = _require_string(manifest, "download_url")
-    release_date = _require_string(manifest, "release_date")
-    whats_new = _require_string_list(manifest, "whats_new")
+    latest_build = _coerce_build(manifest.get("latest_build"), "latest_build")
+    release_notes = _optional_string_list(manifest, "release_notes", "whats_new")
     return {
         "latest_version": latest_version,
         "latest_build": latest_build,
-        "mandatory": mandatory,
-        "update_size_bytes": update_size_bytes,
-        "download_url": download_url,
-        "release_date": release_date,
-        "whats_new": whats_new,
+        "mandatory": _optional_bool(manifest, "mandatory", False),
+        "update_size_bytes": _optional_int(manifest, "update_size_bytes", 0),
+        "download_url": _optional_string(manifest, "download_url", ""),
+        "release_date": _optional_string(manifest, "release_date", ""),
+        "release_notes": release_notes,
+        "whats_new": release_notes,
     }
 
 
-def fetch_update_manifest(manifest_url: str) -> Dict[str, Any]:
-    """Fetch and validate the remote update manifest."""
+def fetch_update_manifest(manifest_url: str, timeout: float = MANIFEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    """Fetch and validate the remote update manifest.
+
+    This function is intentionally side-effect free at import time; callers must
+    invoke it from the update-check request path only.
+    """
     if not manifest_url or not manifest_url.strip():
         raise ManifestUnavailable("Update manifest URL is not configured")
     try:
-        request = urllib.request.Request(manifest_url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(request, timeout=MANIFEST_TIMEOUT_SECONDS) as response:
-            if response.status < 200 or response.status >= 300:
-                raise ManifestUnavailable(f"Manifest returned HTTP {response.status}")
-            raw = response.read(1024 * 1024)
+        request = urllib.request.Request(manifest_url.strip(), headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = getattr(response, "status", 200)
+            if status < 200 or status >= 300:
+                raise ManifestUnavailable(f"Manifest returned HTTP {status}")
+            raw = response.read(MAX_MANIFEST_BYTES)
         parsed = json.loads(raw.decode("utf-8"))
         if not isinstance(parsed, dict):
             raise ValueError("Manifest must be a JSON object")
@@ -101,24 +130,22 @@ def fetch_update_manifest(manifest_url: str) -> Dict[str, Any]:
 
 
 def build_update_check_response(manifest: Mapping[str, Any]) -> Dict[str, Any]:
-    """Compare the manifest against the current backend build."""
-    latest_build = manifest["latest_build"]
+    """Compare the manifest against the current backend build and return stable JSON."""
+    normalized = validate_update_manifest(manifest)
+    latest_build = normalized["latest_build"]
     if latest_build <= APP_BUILD:
         return {
+            "status": "ok",
             "update_available": False,
-            "current_version": APP_VERSION,
-            "current_build": APP_BUILD,
+            "message": "You are up to date",
         }
     return {
+        "status": "ok",
         "update_available": True,
         "current_version": APP_VERSION,
+        "latest_version": normalized["latest_version"],
         "current_build": APP_BUILD,
-        "latest_version": manifest["latest_version"],
         "latest_build": latest_build,
-        "mandatory": manifest["mandatory"],
-        "update_size_bytes": manifest["update_size_bytes"],
-        "update_size_label": format_size_label(manifest["update_size_bytes"]),
-        "download_url": manifest["download_url"],
-        "release_date": manifest["release_date"],
-        "whats_new": manifest["whats_new"],
+        "message": "Update available",
+        "release_notes": normalized["release_notes"],
     }
