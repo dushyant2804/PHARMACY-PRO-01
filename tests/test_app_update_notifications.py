@@ -54,16 +54,17 @@ class AppUpdateNotificationTest(unittest.IsolatedAsyncioTestCase):
             else:
                 os.environ["PHARMACYOS_UPDATE_MANIFEST_URL"] = original_url
 
-        self.assertEqual(payload, {
-            "status": "ok",
-            "update_available": True,
-            "current_version": APP_VERSION,
-            "latest_version": "1.1.0",
-            "current_build": APP_BUILD,
-            "latest_build": APP_BUILD + 1,
-            "message": "Update available",
-            "release_notes": ["Improved update notifications"],
-        })
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["update_available"])
+        self.assertEqual(payload["current_version"], APP_VERSION)
+        self.assertEqual(payload["latest_version"], "1.1.0")
+        self.assertEqual(payload["current_build"], str(APP_BUILD))
+        self.assertEqual(payload["latest_build"], str(APP_BUILD + 1))
+        self.assertEqual(payload["message"], "Update available")
+        self.assertEqual(payload["release_notes"], ["Improved update notifications"])
+        self.assertEqual(payload["whats_new"], ["Improved update notifications"])
+        self.assertEqual(payload["artifact_url"], "https://updates.example.test/pharmacyos.exe")
+        self.assertEqual(payload["frontend_artifact_url"], "https://updates.example.test/pharmacyos.exe")
 
     async def test_no_update(self):
         import server
@@ -84,15 +85,18 @@ class AppUpdateNotificationTest(unittest.IsolatedAsyncioTestCase):
         finally:
             server.fetch_update_manifest = original_fetch
 
-        self.assertEqual(payload, {
-            "status": "ok",
-            "update_available": False,
-            "message": "You are up to date",
-        })
+        self.assertEqual(payload["status"], "ok")
+        self.assertFalse(payload["update_available"])
+        self.assertEqual(payload["current_version"], APP_VERSION)
+        self.assertEqual(payload["latest_version"], APP_VERSION)
+        self.assertEqual(payload["current_build"], str(APP_BUILD))
+        self.assertEqual(payload["latest_build"], str(APP_BUILD))
+        self.assertEqual(payload["message"], "You are up to date")
 
     async def test_offline_manifest_returns_200_payload(self):
         import server
         from app_update_service import ManifestUnavailable
+        from app_version import APP_BUILD, APP_VERSION
 
         original_fetch = server.fetch_update_manifest
         try:
@@ -103,12 +107,14 @@ class AppUpdateNotificationTest(unittest.IsolatedAsyncioTestCase):
         finally:
             server.fetch_update_manifest = original_fetch
 
-        self.assertEqual(payload, {
-            "status": "unavailable",
-            "update_available": False,
-            "message": "Update check unavailable",
-            "fallback": True,
-        })
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertFalse(payload["update_available"])
+        self.assertEqual(payload["current_version"], APP_VERSION)
+        self.assertEqual(payload["latest_version"], APP_VERSION)
+        self.assertEqual(payload["current_build"], str(APP_BUILD))
+        self.assertEqual(payload["latest_build"], str(APP_BUILD))
+        self.assertEqual(payload["message"], "Update check unavailable")
+        self.assertTrue(payload["fallback"])
 
     def test_malformed_manifest(self):
         from app_update_service import validate_update_manifest

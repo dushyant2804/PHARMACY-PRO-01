@@ -84,7 +84,7 @@ from starlette.datastructures import UploadFile
 
 from version_config import VERSION_METADATA, get_version_metadata
 from app_version import APP_BUILD as BACKEND_APP_BUILD, APP_CHANNEL, APP_VERSION as BACKEND_APP_VERSION
-from app_update_service import ManifestUnavailable, build_update_check_response, fetch_update_manifest
+from app_update_service import ManifestUnavailable, build_update_check_fallback, build_update_check_response, fetch_update_manifest
 
 
 # Runtime database mode
@@ -2420,24 +2420,23 @@ async def check_updates(
     current_build: Optional[str] = Query(default=None),
 ):
     _set_update_metadata_no_cache_headers(response)
+    manifest_url = os.environ.get("PHARMACYOS_UPDATE_MANIFEST_URL", "")
     try:
-        metadata = get_version_metadata(current_version=current_version, current_build=current_build)
-        _log_update_metadata_check("Update check", metadata, response)
-        return {**metadata, "status": "ok"}
+        manifest = await asyncio.to_thread(fetch_update_manifest, manifest_url)
+        payload = build_update_check_response(manifest, current_version=current_version, current_build=current_build)
+        logger.info(
+            "Update check: current_version=%s current_build=%s latest_version=%s latest_build=%s update_available=%s",
+            payload.get("current_version"),
+            payload.get("current_build"),
+            payload.get("latest_version"),
+            payload.get("latest_build"),
+            payload.get("update_available"),
+        )
+        return payload
     except Exception as exc:
         reason = f"{type(exc).__name__}: {exc}"
-        logger.exception("Update metadata check failed: %s", reason)
-        fallback = dict(VERSION_METADATA)
-        fallback.update(
-            {
-                "current_version": current_version or VERSION_METADATA["current_version"],
-                "current_build": current_build or VERSION_METADATA["current_build"],
-                "update_available": False,
-                "status": "metadata_unavailable",
-                "reason": reason,
-            }
-        )
-        return fallback
+        logger.warning("Update metadata check failed: %s", reason)
+        return build_update_check_fallback(reason=reason, current_version=current_version, current_build=current_build)
 
 
 @api_router.get("/app/version")
@@ -2459,12 +2458,7 @@ async def app_update_check():
         return build_update_check_response(manifest)
     except ManifestUnavailable as exc:
         logger.warning("Update check unavailable: %s", exc)
-        return {
-            "status": "unavailable",
-            "update_available": False,
-            "message": "Update check unavailable",
-            "fallback": True,
-        }
+        return build_update_check_fallback(reason=str(exc))
 
 
 def _updater_script_path() -> Path:
@@ -3453,6 +3447,24 @@ async def list_medicines(
             merged["return_status"] = _return_status(merged)
             merged["status"] = merged["return_status"]
         item["batches"] = list(merged_batches.values())
+        distributors = {}
+        for batch in item["batches"]:
+            distributor_key = str(batch.get("distributor_id") or batch.get("distributor_name") or batch.get("distributor") or "").strip().casefold()
+            if distributor_key not in distributors:
+                distributors[distributor_key] = {
+                    "distributor_id": batch.get("distributor_id"),
+                    "distributor_name": batch.get("distributor_name"),
+                    "distributor": batch.get("distributor"),
+                    "total_stock": 0,
+                    "available_stock": 0,
+                    "quantity_units": 0,
+                    "batches": [],
+                }
+            distributors[distributor_key]["total_stock"] = round_qty(distributors[distributor_key]["total_stock"] + _safe_float(batch.get("available_stock")))
+            distributors[distributor_key]["available_stock"] = distributors[distributor_key]["total_stock"]
+            distributors[distributor_key]["quantity_units"] = distributors[distributor_key]["total_stock"]
+            distributors[distributor_key]["batches"].append(batch)
+        item["distributors"] = list(distributors.values())
         aggregate_stock = {
             **item,
             "purchased_units": item.get("total_stock"),
@@ -11204,7 +11216,8 @@ async def _delete_inventory_rows_for_medicine_names(medicine_names: Iterable[str
 def _po_item_group_identity(po: dict, item: dict) -> tuple:
     medicine_identity = str(item.get("medicine_id") or item.get("name") or "").strip().casefold()
     distributor_identity = str(po.get("distributor_id") or item.get("distributor_id") or po.get("distributor_name") or po.get("distributor") or item.get("distributor_name") or item.get("distributor") or "").strip().casefold()
-    return medicine_identity, distributor_identity
+    batch_identity = str(item.get("batch_no") or item.get("batch_number") or "").strip().upper()
+    return medicine_identity, distributor_identity, batch_identity
 
 
 async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], updated_pos: Optional[Iterable[dict]] = None) -> dict:
@@ -11212,8 +11225,8 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
 
     Purchase orders are the source of truth. For every affected medicine, all
     existing inventory rows are deleted first; fresh rows are then aggregated
-    from active purchase orders only, grouped by medicine identity and
-    distributor identity. No previous inventory quantity is reused.
+    from active purchase orders only, grouped by medicine identity,
+    distributor identity, and batch number. No previous inventory quantity is reused.
     """
     target_names = {str(name or "").strip().casefold() for name in medicine_names if str(name or "").strip()}
     if not target_names:
@@ -11252,14 +11265,24 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
             if group_key not in rebuilt:
                 distributor_id = po_distributor_id or item.get("distributor_id")
                 distributor_name = po_distributor_name or item.get("distributor_name") or item.get("distributor")
-                medicine_key = _stock_lot_key(item_name, "", distributor_id, distributor_name)
-                legacy_batch_identity = f"{item_name.strip().casefold()}::{str(item.get('batch_no') or item.get('batch_number') or '').strip().upper()}"
+                batch_no = item.get("batch_no") or item.get("batch_number")
+                medicine_key = _stock_lot_key(
+                    item_name,
+                    batch_no,
+                    distributor_id,
+                    distributor_name,
+                    item.get("expiry_date"),
+                    item.get("pack_size"),
+                    item.get("purchase_price"),
+                    item.get("mrp"),
+                )
+                legacy_batch_identity = f"{item_name.strip().casefold()}::{str(batch_no or '').strip().upper()}::{str(distributor_id or distributor_name or '').strip().casefold()}"
                 rebuilt[group_key] = {
                     "id": item.get("medicine_id") or legacy_batch_identity or medicine_key,
                     "medicine_key": medicine_key,
                     "medicine_id": item.get("medicine_id") or legacy_batch_identity or medicine_key,
                     "name": item_name,
-                    "batch_no": item.get("batch_no"),
+                    "batch_no": batch_no,
                     "expiry_date": item.get("expiry_date"),
                     "manufacturer": item.get("manufacturer"),
                     "category": item.get("category"),

@@ -40,17 +40,15 @@ def _require_string(manifest: Mapping[str, Any], field: str) -> str:
     return value.strip()
 
 
-def _coerce_build(value: Any, field: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"Manifest field {field} must be an integer >= 0")
-    if isinstance(value, int):
-        build = value
-    elif isinstance(value, str) and value.strip().isdigit():
-        build = int(value.strip())
+def _coerce_build(value: Any, field: str) -> str:
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"Manifest field {field} must be a non-empty build identifier")
+    if isinstance(value, (int, str)):
+        build = str(value).strip()
     else:
-        raise ValueError(f"Manifest field {field} must be an integer >= 0")
-    if build < 0:
-        raise ValueError(f"Manifest field {field} must be an integer >= 0")
+        raise ValueError(f"Manifest field {field} must be a non-empty build identifier")
+    if not build:
+        raise ValueError(f"Manifest field {field} must be a non-empty build identifier")
     return build
 
 
@@ -98,6 +96,8 @@ def validate_update_manifest(manifest: Mapping[str, Any]) -> Dict[str, Any]:
         "mandatory": _optional_bool(manifest, "mandatory", False),
         "update_size_bytes": _optional_int(manifest, "update_size_bytes", 0),
         "download_url": _optional_string(manifest, "download_url", ""),
+        "artifact_url": _optional_string(manifest, "artifact_url", ""),
+        "frontend_artifact_url": _optional_string(manifest, "frontend_artifact_url", ""),
         "release_date": _optional_string(manifest, "release_date", ""),
         "release_notes": release_notes,
         "whats_new": release_notes,
@@ -129,23 +129,51 @@ def fetch_update_manifest(manifest_url: str, timeout: float = MANIFEST_TIMEOUT_S
         raise ManifestUnavailable(str(exc)) from exc
 
 
-def build_update_check_response(manifest: Mapping[str, Any]) -> Dict[str, Any]:
-    """Compare the manifest against the current backend build and return stable JSON."""
+def _current_build_id(current_build: Any = None) -> str:
+    return str(APP_BUILD if current_build is None or current_build == "" else current_build).strip()
+
+
+def build_update_check_response(
+    manifest: Mapping[str, Any],
+    current_version: Any = None,
+    current_build: Any = None,
+) -> Dict[str, Any]:
+    """Compare remote manifest build identity against the current build and return stable JSON."""
     normalized = validate_update_manifest(manifest)
+    current_build_id = _current_build_id(current_build)
     latest_build = normalized["latest_build"]
-    if latest_build <= APP_BUILD:
-        return {
-            "status": "ok",
-            "update_available": False,
-            "message": "You are up to date",
-        }
-    return {
+    update_available = latest_build != current_build_id
+    payload = {
         "status": "ok",
-        "update_available": True,
-        "current_version": APP_VERSION,
+        "update_available": update_available,
+        "current_version": str(APP_VERSION if current_version is None or current_version == "" else current_version),
         "latest_version": normalized["latest_version"],
-        "current_build": APP_BUILD,
+        "current_build": current_build_id,
         "latest_build": latest_build,
-        "message": "Update available",
+        "message": "Update available" if update_available else "You are up to date",
         "release_notes": normalized["release_notes"],
+        "whats_new": normalized["whats_new"],
+    }
+    artifact_url = normalized.get("artifact_url") or normalized.get("download_url")
+    frontend_artifact_url = normalized.get("frontend_artifact_url") or artifact_url
+    if artifact_url:
+        payload["artifact_url"] = artifact_url
+    if frontend_artifact_url:
+        payload["frontend_artifact_url"] = frontend_artifact_url
+    return payload
+
+
+def build_update_check_fallback(reason: str = "", current_version: Any = None, current_build: Any = None) -> Dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "update_available": False,
+        "current_version": str(APP_VERSION if current_version is None or current_version == "" else current_version),
+        "latest_version": str(APP_VERSION),
+        "current_build": _current_build_id(current_build),
+        "latest_build": _current_build_id(current_build),
+        "message": "Update check unavailable",
+        "release_notes": [],
+        "whats_new": [],
+        "fallback": True,
+        "reason": reason,
     }
