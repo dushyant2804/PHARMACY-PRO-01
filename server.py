@@ -2809,6 +2809,35 @@ def _medicine_identity_filter(medicine_id: str) -> dict:
     }
 
 
+def canonical_medicine_key(
+    medicine_name: str,
+    batch_no: str,
+    distributor_id: Optional[str] = None,
+    expiry_date: Optional[str] = None,
+    pack_size: Optional[str] = None,
+) -> str:
+    """Return the one canonical identity for a physical medicine batch.
+
+    Inventory reconstruction, purchase orders, invoices, purchase returns, and
+    medicines must all join on this key only. Price, MRP, generated document
+    ids, and legacy name-only fallbacks are intentionally excluded because they
+    are mutable commercial attributes, not batch identity.
+    """
+
+    def normalize(value, *, upper: bool = False) -> str:
+        normalized = str(value or "").strip()
+        normalized = normalized.upper() if upper else normalized.casefold()
+        return normalized or "-"
+
+    return "::".join([
+        normalize(medicine_name),
+        normalize(distributor_id),
+        normalize(batch_no, upper=True),
+        normalize(expiry_date),
+        normalize(pack_size),
+    ])
+
+
 def _stock_lot_key(
     medicine_name: str,
     batch_no: str,
@@ -2819,28 +2848,8 @@ def _stock_lot_key(
     purchase_rate=None,
     mrp=None,
 ) -> str:
-    """Stable physical lot key: medicine + distributor + batch + known lot fields."""
-
-    def normalize(value, *, upper: bool = False) -> str:
-        normalized = str(value or "").strip()
-        normalized = normalized.upper() if upper else normalized.casefold()
-        return normalized or "-"
-
-    def normalize_money(value) -> str:
-        if value in (None, ""):
-            return "-"
-        return str(_money_float(_to_decimal(value)))
-
-    distributor_identity = distributor_id or distributor_name
-    return "::".join([
-        normalize(medicine_name),
-        normalize(distributor_identity),
-        normalize(batch_no, upper=True),
-        normalize(expiry_date),
-        normalize(pack_size),
-        normalize_money(purchase_rate),
-        normalize_money(mrp),
-    ])
+    """Backward-compatible wrapper for the canonical medicine batch key."""
+    return canonical_medicine_key(medicine_name, batch_no, distributor_id, expiry_date, pack_size)
 
 
 def _threshold_response(medicine: dict) -> dict:
@@ -12329,183 +12338,204 @@ async def delete_daily_sale(
     return {"ok": True}
 
 
-async def rebuild_inventory():
+def _canonical_key_from_complete_fields(row: dict, *, distributor_id: Optional[str] = None) -> Optional[str]:
+    """Normalize a legacy source row only when every canonical identity field exists."""
+    name = row.get("name") or row.get("medicine_name")
+    batch_no = row.get("batch_no") or row.get("batch_number")
+    source_distributor_id = distributor_id or row.get("distributor_id")
+    expiry_date = row.get("expiry_date")
+    pack_size = row.get("pack_size")
+    required = (name, source_distributor_id, batch_no, expiry_date, pack_size)
+    if not all(str(value or "").strip() for value in required):
+        return None
+    return canonical_medicine_key(name, batch_no, source_distributor_id, expiry_date, pack_size)
 
-    medicines = {}
 
-    # PRESERVE EXISTING MANUAL VALUES
-    existing_medicines = {}
+def _source_row_medicine_key(row: dict, *, distributor_id: Optional[str] = None, allow_legacy_normalize: bool = False) -> Optional[str]:
+    """Return the row's single canonical key; never use ids, names, or partial batches."""
+    key = str(row.get("medicine_key") or "").strip()
+    if key:
+        return key
+    if allow_legacy_normalize:
+        return _canonical_key_from_complete_fields(row, distributor_id=distributor_id)
+    return None
 
-    existing_cursor = db.medicines.find({})
 
-    async for old in existing_cursor:
+def _unmatched_source_record(source: str, document: dict, row: dict, reason: str, index: int) -> dict:
+    """Small deterministic unmatched entry for rebuild safety reporting."""
+    return {
+        "source": source,
+        "document_id": document.get("id"),
+        "document_no": document.get("invoice_no") or document.get("po_no") or document.get("return_no"),
+        "row_index": index,
+        "reason": reason,
+        "medicine_key": row.get("medicine_key"),
+        "medicine_id": row.get("medicine_id"),
+        "name": row.get("name") or row.get("medicine_name"),
+        "batch_no": row.get("batch_no") or row.get("batch_number"),
+    }
 
-        key = old.get("medicine_key")
 
-        if key:
-            existing_medicines[key] = old
+async def _aggregate_invoice_units_by_medicine_key() -> tuple[dict, list]:
+    """Aggregate invoice deductions strictly by medicine_key.
 
-    # Invoice stock deductions are the source of truth for rebuild sales.
-    # Legacy/manual sold values are intentionally not preserved here: if a batch
-    # has no invoice-backed deduction, rebuild must not carry stale sold_units.
-    invoice_sold_by_id = defaultdict(float)
-    invoice_sold_by_key = defaultdict(float)
+    Legacy rows are normalized exactly once only when all canonical identity
+    fields are present. Rows that cannot produce medicine_key are logged as
+    unmatched and excluded from stock math.
+    """
+    sold_by_key = defaultdict(float)
+    unmatched_invoices_log = []
     invoices_collection = getattr(db, "invoices", None)
-    if invoices_collection is not None:
-        async for invoice in invoices_collection.find({}):
-            deductions = invoice.get("stock_deductions") or []
-            if deductions:
-                for deduction in deductions:
-                    quantity = round_qty(deduction.get("deduct", deduction.get("quantity", 0)))
-                    if quantity <= 0:
-                        continue
-                    if deduction.get("medicine_id"):
-                        invoice_sold_by_id[deduction["medicine_id"]] += quantity
-                    if deduction.get("medicine_key"):
-                        invoice_sold_by_key[deduction["medicine_key"]] += quantity
-                continue
+    if invoices_collection is None:
+        return sold_by_key, unmatched_invoices_log
 
-            # Legacy invoices without stock_deductions can still support rebuild
-            # only when they identify the exact batch by stored medicine id/key.
-            for item in invoice.get("items", []):
+    async for invoice in invoices_collection.find({}):
+        changed = False
+        deductions = invoice.get("stock_deductions") or []
+        if deductions:
+            normalized_deductions = []
+            for index, deduction in enumerate(deductions):
+                key = _source_row_medicine_key(deduction, allow_legacy_normalize=True)
+                quantity = round_qty(deduction.get("deduct", deduction.get("quantity", 0)))
+                if not key:
+                    unmatched = _unmatched_source_record("invoice_stock_deduction", invoice, deduction, "missing_medicine_key", index)
+                    unmatched_invoices_log.append(unmatched)
+                    logger.warning("Inventory rebuild unmatched invoice deduction: %s", unmatched)
+                elif quantity > 0:
+                    sold_by_key[key] = round_qty(sold_by_key[key] + quantity)
+                    if deduction.get("medicine_key") != key:
+                        deduction = {**deduction, "medicine_key": key}
+                        changed = True
+                normalized_deductions.append(deduction)
+            if changed:
+                invoice["stock_deductions"] = normalized_deductions
+        else:
+            normalized_items = []
+            for index, item in enumerate(invoice.get("items", [])):
+                key = _source_row_medicine_key(item, allow_legacy_normalize=True)
                 quantity = round_qty(item.get("units_dispensed", item.get("quantity_units", item.get("quantity", 0))))
-                if quantity <= 0:
-                    continue
-                if item.get("medicine_id"):
-                    invoice_sold_by_id[item["medicine_id"]] += quantity
-                if item.get("medicine_key"):
-                    invoice_sold_by_key[item["medicine_key"]] += quantity
-
-    # REBUILD FROM PO
-    cursor = db.purchase_orders.find({})
-
-    async for po in cursor:
-
-        po_distributor_id = po.get("distributor_id")
-
-        po_distributor_name = (
-            po.get("distributor_name")
-            or po.get("distributor")
-        )
-
-        po_distributor = (
-            po.get("distributor")
-            or po.get("distributor_name")
-        )
-
-        for i in po.get("items", []):
-
-            key = i.get("medicine_key")
-
-            if not key:
-                continue
-
-            qty = (
-                round_qty(i.get("quantity", 0))
-                +
-                round_qty(i.get("free_quantity", 0))
+                if not key:
+                    unmatched = _unmatched_source_record("invoice_item", invoice, item, "missing_medicine_key", index)
+                    unmatched_invoices_log.append(unmatched)
+                    logger.warning("Inventory rebuild unmatched invoice item: %s", unmatched)
+                elif quantity > 0:
+                    sold_by_key[key] = round_qty(sold_by_key[key] + quantity)
+                    if item.get("medicine_key") != key:
+                        item = {**item, "medicine_key": key}
+                        changed = True
+                normalized_items.append(item)
+            if changed:
+                invoice["items"] = normalized_items
+        if changed and invoice.get("id"):
+            await invoices_collection.update_one(
+                {"id": invoice["id"]},
+                {"$set": {"items": invoice.get("items", []), "stock_deductions": invoice.get("stock_deductions", [])}},
             )
+    return sold_by_key, unmatched_invoices_log
 
-            existing = existing_medicines.get(key)
 
+async def _aggregate_purchase_return_units_by_medicine_key() -> tuple[dict, list]:
+    """Aggregate active purchase returns strictly by medicine_key."""
+    returned_by_key = defaultdict(float)
+    unmatched_returns_log = []
+    returns_collection = getattr(db, "purchase_returns", None)
+    if returns_collection is None:
+        return returned_by_key, unmatched_returns_log
+    async for index, return_doc in _async_enumerate(returns_collection.find({})):
+        if return_doc.get("voided_at") or return_doc.get("deleted_at") or return_doc.get("settlement_status") == "deleted":
+            continue
+        key = _source_row_medicine_key(return_doc, allow_legacy_normalize=False)
+        if not key:
+            unmatched = _unmatched_source_record("purchase_return", return_doc, return_doc, "missing_medicine_key", index)
+            unmatched_returns_log.append(unmatched)
+            logger.warning("Inventory rebuild unmatched purchase return: %s", unmatched)
+            continue
+        returned_by_key[key] = round_qty(returned_by_key[key] + _purchase_return_quantity(return_doc))
+    return returned_by_key, unmatched_returns_log
+
+
+async def _async_enumerate(aiterable):
+    index = 0
+    async for item in aiterable:
+        yield index, item
+        index += 1
+
+
+async def _aggregate_po_inventory_by_medicine_key() -> tuple[dict, list]:
+    """Aggregate purchased stock strictly from active purchase orders by medicine_key."""
+    medicines = {}
+    unmatched_purchase_orders_log = []
+    async for po in db.purchase_orders.find({}):
+        if po.get("deleted_at") or po.get("voided_at") or po.get("status") == "deleted":
+            continue
+        distributor_id = po.get("distributor_id")
+        distributor_name = po.get("distributor_name") or po.get("distributor")
+        for index, item in enumerate(po.get("items", [])):
+            key = _source_row_medicine_key(item, distributor_id=distributor_id, allow_legacy_normalize=True)
+            if not key:
+                unmatched = _unmatched_source_record("purchase_order_item", po, item, "missing_medicine_key", index)
+                unmatched_purchase_orders_log.append(unmatched)
+                logger.warning("Inventory rebuild unmatched purchase order item: %s", unmatched)
+                continue
+            qty = round_qty(round_qty(item.get("quantity", 0)) + round_qty(item.get("free_quantity", 0)))
+            if qty <= 0:
+                continue
             if key not in medicines:
-
                 medicines[key] = {
-
+                    "id": key,
+                    "medicine_id": key,
                     "medicine_key": key,
-
-                    "name": i.get("name"),
-
-                    "batch_no": i.get("batch_no"),
-
-                    "expiry_date": i.get("expiry_date"),
-
-                    "manufacturer": i.get("manufacturer"),
-
-                    "category": i.get("category"),
-
-                    "mrp": i.get("mrp"),
-
-                    "purchase_price": i.get("purchase_price"),
-
-                    "pack_size": i.get("pack_size"),
-
-                    "gst_rate": i.get("gst_rate"),
-
-                    "distributor_id":
-                        po_distributor_id
-                        or i.get("distributor_id")
-                        or (existing.get("distributor_id") if existing else None),
-
-                    "distributor_name":
-                        po_distributor_name
-                        or i.get("distributor_name")
-                        or i.get("distributor")
-                        or (existing.get("distributor_name") if existing else None)
-                        or (existing.get("distributor") if existing else None),
-
-                    "distributor":
-                        po_distributor
-                        or i.get("distributor")
-                        or i.get("distributor_name")
-                        or (existing.get("distributor") if existing else None)
-                        or (existing.get("distributor_name") if existing else None),
-
-                    # PURCHASE STOCK FROM PO
+                    "name": item.get("name") or item.get("medicine_name"),
+                    "batch_no": item.get("batch_no") or item.get("batch_number"),
+                    "expiry_date": item.get("expiry_date"),
+                    "manufacturer": item.get("manufacturer"),
+                    "category": item.get("category"),
+                    "mrp": item.get("mrp"),
+                    "purchase_price": item.get("purchase_price"),
+                    "pack_size": item.get("pack_size"),
+                    "gst_rate": item.get("gst_rate"),
+                    "distributor_id": distributor_id or item.get("distributor_id"),
+                    "distributor_name": distributor_name or item.get("distributor_name") or item.get("distributor"),
+                    "distributor": distributor_name or item.get("distributor") or item.get("distributor_name"),
                     "purchased_units": 0,
-
-                    # Rebuild sold stock only from invoice-backed evidence.
-                    "sold_units":
-                        round_qty(
-                            invoice_sold_by_id.get(existing.get("id"))
-                            if existing and existing.get("id") in invoice_sold_by_id
-                            else invoice_sold_by_key.get(key, 0)
-                        ),
-
-                    # PURCHASE RETURNS PRESERVED
-                    "purchase_return_units":
-                        _purchase_return_stock(existing)
-                        if existing else 0,
-
-                    # AUDITED STOCK ADJUSTMENTS PRESERVED
-                    "stock_adjustment_units":
-                        _stock_adjustment_stock(existing)
-                        if existing else 0,
-
-                    # MANUAL THRESHOLD PRESERVED
-                    "low_stock_threshold":
-                        existing.get("low_stock_threshold")
-                        if existing else None,
-
-                    "low_stock_status":
-                        _low_stock_status(existing or {}),
-
-                    "id":
-                       existing.get("id")
-                       if existing
-                       else str(uuid.uuid4()),
+                    "sold_units": 0,
+                    "purchase_return_units": 0,
+                    "stock_adjustment_units": 0,
                 }
-
             medicines[key]["purchased_units"] = round_qty(medicines[key]["purchased_units"] + qty)
+    return medicines, unmatched_purchase_orders_log
 
-    # Upsert calculated batches rather than deleting the collection. This keeps
-    # historical/orphaned and long-expired inventory records intact.
-    for m in medicines.values():
+
+async def rebuild_inventory():
+    """Rebuild the materialized medicine stock view from ledger source tables only."""
+    medicines, unmatched_purchase_orders_log = await _aggregate_po_inventory_by_medicine_key()
+    sold_by_key, unmatched_invoices_log = await _aggregate_invoice_units_by_medicine_key()
+    returned_by_key, unmatched_returns_log = await _aggregate_purchase_return_units_by_medicine_key()
+
+    for key in sorted(medicines):
+        medicine = medicines[key]
+        medicine["sold_units"] = round_qty(sold_by_key.get(key, 0))
+        medicine["purchase_return_units"] = round_qty(returned_by_key.get(key, 0))
         derivatives = {
-            "available_stock": _available_stock(m),
-            "quantity_units": _available_stock(m),
-            "return_status": _return_status(m),
-            "status": _return_status(m),
+            "available_stock": _available_stock(medicine),
+            "quantity_units": _available_stock(medicine),
+            "return_status": _return_status(medicine),
+            "status": _return_status(medicine),
         }
-        await db.medicines.update_one(
-            {"medicine_key": m["medicine_key"]},
-            {"$set": {**m, **derivatives}},
-            upsert=True,
-        )
+        await db.medicines.update_one({"medicine_key": key}, {"$set": {**medicine, **derivatives}}, upsert=True)
 
-    # Rebuild the derived return quantity from the source-of-truth return
-    # collection, including legacy records created before this field existed.
-    await recalculate_purchase_return_stock()
+    if hasattr(db.medicines, "delete_many"):
+        await db.medicines.delete_many({"medicine_key": {"$nin": sorted(medicines.keys())}})
+    elif hasattr(db.medicines, "rows"):
+        db.medicines.rows[:] = [row for row in db.medicines.rows if row.get("medicine_key") in medicines]
+
+    return {
+        "ok": True,
+        "medicine_batches_rebuilt": len(medicines),
+        "unmatched_purchase_orders_log": unmatched_purchase_orders_log,
+        "unmatched_invoices_log": unmatched_invoices_log,
+        "unmatched_returns_log": unmatched_returns_log,
+    }
 
 # ---------------- Mount ----------------
 
