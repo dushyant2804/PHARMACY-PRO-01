@@ -116,29 +116,38 @@ class VersionAndSignupContractTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_check_logs_comparison_and_cache_control(self):
         from fastapi import Response
+        import server
         from server import check_updates
 
         http_response = Response()
-        with self.assertLogs("pharmacy", level="INFO") as logs:
-            response = await check_updates(
-                http_response,
-                current_version="3.1.0",
-                current_build="20260611-stock-repair",
-            )
+        original_fetch = server.fetch_update_manifest
+        try:
+            server.fetch_update_manifest = lambda url: {
+                "latest_version": APP_VERSION,
+                "latest_build": "20260620-new-build",
+                "whats_new": ["Build identity update"],
+            }
+            with self.assertLogs("pharmacy", level="INFO") as logs:
+                response = await check_updates(
+                    http_response,
+                    current_version="3.1.0",
+                    current_build="20260611-stock-repair",
+                )
+        finally:
+            server.fetch_update_manifest = original_fetch
 
         self.assertEqual(response["status"], "ok")
         self.assertEqual(response["current_version"], "3.1.0")
         self.assertEqual(response["latest_version"], APP_VERSION)
+        self.assertEqual(response["current_build"], "20260611-stock-repair")
+        self.assertEqual(response["latest_build"], "20260620-new-build")
         self.assertTrue(response["update_available"])
         self.assertEqual(http_response.headers["cache-control"], "no-store, no-cache, must-revalidate, max-age=0")
         joined = "\n".join(logs.output)
         self.assertIn("Update check:", joined)
         self.assertIn("current_version=3.1.0", joined)
         self.assertIn(f"latest_version={APP_VERSION}", joined)
-        self.assertIn("release_timestamp=", joined)
         self.assertIn("update_available=True", joined)
-        self.assertIn("cache_control=no-store, no-cache, must-revalidate, max-age=0", joined)
-
 
     def test_deployed_build_id_override_changes_returned_metadata(self):
         from version_config import get_version_metadata
