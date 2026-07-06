@@ -4064,6 +4064,51 @@ async def add_patient(
     await db.regular_patients.insert_one(data)
     return {"success": True}
 
+@api_router.post("/patients/{phone}/refill")
+async def refill_patient(
+    phone: str,
+    payload: dict,
+    user: dict = Depends(get_current_user)
+):
+    phone = phone.strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="Patient phone is required")
+
+    date = payload.get("date")
+    medicines = payload.get("medicines", [])
+
+    if not date:
+        raise HTTPException(status_code=400, detail="Refill date is required")
+
+    patient = await db.regular_patients.find_one({"phone": phone})
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    update_data = {
+        "last_refill_date": date,
+        "last_refill_medicines": medicines
+    }
+
+    # OPTIONAL: keep history
+    await db.regular_patients.update_one(
+        {"phone": phone},
+        {
+            "$set": update_data,
+            "$push": {
+                "refill_history": {
+                    "date": date,
+                    "medicines": medicines,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            }
+        }
+    )
+
+    return {
+        "success": True,
+        "message": "Refill updated"
+    }
+
 @api_router.put("/patients/{phone}")
 async def update_patient(
     phone: str,
