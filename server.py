@@ -12421,7 +12421,7 @@ def _unmatched_source_record(source: str, document: dict, row: dict, reason: str
     }
 
 
-async def _aggregate_invoice_units_by_medicine_key() -> tuple[dict, list]:
+async def _aggregate_invoice_units_by_medicine_key() -> Tuple[dict, list]:
     """Aggregate invoice deductions strictly by medicine_key.
 
     Legacy rows are normalized exactly once only when all canonical identity
@@ -12479,7 +12479,7 @@ async def _aggregate_invoice_units_by_medicine_key() -> tuple[dict, list]:
     return sold_by_key, unmatched_invoices_log
 
 
-async def _aggregate_purchase_return_units_by_medicine_key() -> tuple[dict, list]:
+async def _aggregate_purchase_return_units_by_medicine_key() -> Tuple[dict, list]:
     """Aggregate active purchase returns strictly by medicine_key."""
     returned_by_key = defaultdict(float)
     unmatched_returns_log = []
@@ -12506,7 +12506,7 @@ async def _async_enumerate(aiterable):
         index += 1
 
 
-async def _aggregate_po_inventory_by_medicine_key() -> tuple[dict, list]:
+async def _aggregate_po_inventory_by_medicine_key() -> Tuple[dict, list]:
     """Aggregate purchased stock strictly from active purchase orders by medicine_key."""
     medicines = {}
     unmatched_purchase_orders_log = []
