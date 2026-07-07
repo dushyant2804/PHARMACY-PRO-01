@@ -12461,7 +12461,9 @@ def _canonical_key_from_complete_fields(row: dict, *, distributor_id: Optional[s
 def _source_row_medicine_key(row: dict, *, distributor_id: Optional[str] = None, allow_legacy_normalize: bool = False) -> Optional[str]:
     """Return the row's single canonical key; never use ids, names, or partial batches."""
     key = str(row.get("medicine_key") or "").strip()
-    if key:
+
+    # Old keys without distributor are invalid
+    if key and "::" in key and key.count("::") >= 4:
         return key
     if allow_legacy_normalize:
         return _canonical_key_from_complete_fields(row, distributor_id=distributor_id)
