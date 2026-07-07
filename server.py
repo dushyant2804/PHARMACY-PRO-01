@@ -3063,13 +3063,15 @@ async def list_medicines(
         {"_id": 0}
     ).to_list(5000)
 
-    def normalized_medicine_key(name, batch_no):
-
+    def normalized_medicine_key(name, batch_no, distributor_id=None):
         if not name or not batch_no:
-
             return None
 
-        return f"{str(name).strip().lower()}::{str(batch_no).strip().upper()}"
+        return canonical_medicine_key(
+            name,
+            batch_no,
+            distributor_id,
+        )
 
     medicine_lookup_keys = set()
 
@@ -3132,7 +3134,8 @@ async def list_medicines(
 
                 normalized_item_key = normalized_medicine_key(
                     item.get("name"),
-                    item.get("batch_no")
+                    item.get("batch_no"),
+                    po.get("distributor_id"),
                 )
 
                 if normalized_item_key:
