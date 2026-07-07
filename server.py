@@ -1133,6 +1133,50 @@ async def _get_patient_stock_alerts() -> list:
             })
     return alerts
 
+def normalize_phone_number(phone: str) -> str:
+    if not phone:
+        return ""
+
+    phone = str(phone).strip()
+    phone = phone.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+    # Already +91
+    if phone.startswith("+91"):
+        return phone
+
+    # 91XXXXXXXXXX
+    if phone.startswith("91") and len(phone) == 12:
+        return "+" + phone
+
+    # 10 digit Indian mobile
+    if len(phone) == 10:
+        return "+91" + phone
+
+    return phone
+
+async def normalize_existing_phone_numbers():
+    collections = [
+        db.patients,
+        db.customers,
+        db.distributors,
+        db.regular_patients,
+    ]
+
+    for collection in collections:
+        async for item in collection.find({"phone": {"$exists": True}}):
+            old_phone = item.get("phone")
+            new_phone = normalize_phone_number(old_phone)
+
+            if old_phone != new_phone:
+                await collection.update_one(
+                    {"_id": item["_id"]},
+                    {
+                        "$set": {
+                            "phone": new_phone
+                        }
+                    }
+                )
+
 
 # ---------------- Auth helpers ----------------
 def hash_password(password: str) -> str:
@@ -2265,6 +2309,7 @@ def _start_deferred_startup_maintenance(now_iso: str) -> None:
 
 @app.on_event("startup")
 async def startup():
+    await normalize_existing_phone_numbers()
     startup_started = time.perf_counter()
     _record_startup_timing("FastAPI startup event started")
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -4061,6 +4106,7 @@ async def add_patient(
     user: dict = Depends(get_current_user)
 ):
     data = await _link_patient_medicine(payload.model_dump())
+    data["phone"] = normalize_phone_number(data.get("phone"))
     await db.regular_patients.insert_one(data)
     return {"success": True}
 
@@ -4120,6 +4166,7 @@ async def update_patient(
         raise HTTPException(status_code=400, detail="Patient phone is required")
 
     data = await _link_patient_medicine(payload.model_dump())
+    data["phone"] = normalize_phone_number(data.get("phone"))
     result = await db.regular_patients.update_one(
         {"phone": phone},
         {
@@ -4316,14 +4363,21 @@ async def list_distributors(
 
 @api_router.post("/distributors")
 async def create_distributor(d: Distributor, user: dict = Depends(require_role("admin", "pharmacist"))):
-    await db.distributors.insert_one(d.model_dump())
-    return d.model_dump()
+    data = d.model_dump()
 
+    data["phone"] = normalize_phone_number(data.get("phone"))
+
+    await db.distributors.insert_one(data)
+
+    return data
 
 @api_router.put("/distributors/{did}")
 async def update_distributor(did: str, d: Distributor, user: dict = Depends(require_role("admin", "pharmacist"))):
     existing = await db.distributors.find_one({"id": did}, {"_id": 0}) or {}
     data = d.model_dump()
+
+    data["phone"] = normalize_phone_number(data.get("phone"))
+
     data["id"] = did
 
     if "created_at" not in d.model_fields_set and existing.get("created_at"):
@@ -4426,13 +4480,18 @@ async def list_customers(search: Optional[str] = None, user: dict = Depends(get_
 
 @api_router.post("/customers")
 async def create_customer(c: Customer, user: dict = Depends(get_current_user)):
-    await db.customers.insert_one(c.model_dump())
-    return c.model_dump()
+    data = c.model_dump()
 
+    data["phone"] = normalize_phone_number(data.get("phone"))
+
+    await db.customers.insert_one(data)
+
+    return data
 
 @api_router.put("/customers/{cid}")
 async def update_customer(cid: str, c: Customer, user: dict = Depends(get_current_user)):
     data = c.model_dump()
+    data["phone"] = normalize_phone_number(data.get("phone"))
     data["id"] = cid
     await db.customers.update_one({"id": cid}, {"$set": data})
     return data
