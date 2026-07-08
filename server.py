@@ -2467,7 +2467,8 @@ async def check_updates(
     _set_update_metadata_no_cache_headers(response)
     manifest_url = os.environ.get("PHARMACYOS_UPDATE_MANIFEST_URL", "")
     try:
-        manifest = await asyncio.to_thread(fetch_update_manifest, manifest_url)
+        loop = asyncio.get_running_loop()
+        manifest = await loop.run_in_executor(None, fetch_update_manifest, manifest_url)
         payload = build_update_check_response(manifest, current_version=current_version, current_build=current_build)
         logger.info(
             "Update check: current_version=%s current_build=%s latest_version=%s latest_build=%s update_available=%s",
@@ -2499,7 +2500,8 @@ async def app_version_endpoint():
 async def app_update_check():
     manifest_url = os.environ.get("PHARMACYOS_UPDATE_MANIFEST_URL", "")
     try:
-        manifest = await asyncio.to_thread(fetch_update_manifest, manifest_url)
+        loop = asyncio.get_running_loop()
+        manifest = await loop.run_in_executor(None, fetch_update_manifest, manifest_url)
         return build_update_check_response(manifest)
     except ManifestUnavailable as exc:
         logger.warning("Update check unavailable: %s", exc)
