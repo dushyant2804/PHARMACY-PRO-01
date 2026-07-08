@@ -2431,13 +2431,9 @@ async def _send_signup_otp(method: str, identifier: str, otp: str) -> bool:
         with urllib.request.urlopen(request, timeout=10) as response:
             return 200 <= response.status < 300
 
-    return bool(
-        loop = asyncio.get_running_loop()
-
-        await loop.run_in_executor(
-            None,
-            send_sms
-        ))
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, send_sms)
+    return bool(result)
 
 
 def _set_update_metadata_no_cache_headers(response: Response) -> None:
