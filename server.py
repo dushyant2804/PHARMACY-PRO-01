@@ -2380,7 +2380,12 @@ async def _send_password_reset_email(email: str, otp: str) -> bool:
                 smtp.login(username, password)
             smtp.send_message(message)
 
-    await asyncio.to_thread(send)
+    loop = asyncio.get_running_loop()
+
+    await loop.run_in_executor(
+        None,
+        send
+    )
     return True
 
 
@@ -2408,7 +2413,12 @@ async def _send_signup_otp(method: str, identifier: str, otp: str) -> bool:
                     smtp.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
                 smtp.send_message(message)
 
-        await asyncio.to_thread(send_email)
+        loop = asyncio.get_running_loop()
+
+        await loop.run_in_executor(
+            None,
+            send_email
+        )
         return True
 
     webhook = os.environ.get("SMS_OTP_WEBHOOK_URL")
@@ -2421,7 +2431,13 @@ async def _send_signup_otp(method: str, identifier: str, otp: str) -> bool:
         with urllib.request.urlopen(request, timeout=10) as response:
             return 200 <= response.status < 300
 
-    return bool(await asyncio.to_thread(send_sms))
+    return bool(
+        loop = asyncio.get_running_loop()
+
+        await loop.run_in_executor(
+            None,
+            send_sms
+        ))
 
 
 def _set_update_metadata_no_cache_headers(response: Response) -> None:
@@ -9935,7 +9951,12 @@ async def _internet_available() -> bool:
     if LOCAL_MODE and not mongo_url:
         return False
     try:
-        await asyncio.to_thread(urllib.request.urlopen, "https://www.google.com/generate_204", timeout=3)
+        loop = asyncio.get_running_loop()
+
+        await loop.run_in_executor(
+            None,
+            urllib.request.urlopen, "https://www.google.com/generate_204", timeout=3
+        )
         return True
     except Exception:
         return False
@@ -10115,14 +10136,17 @@ async def _google_service_account_access_token() -> str:
         "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "assertion": assertion,
     }).encode()
-    token = await asyncio.to_thread(
-        _google_api_request,
-        service_account.get("token_uri") or GOOGLE_DRIVE_TOKEN_URI,
-        None,
-        form,
-        {"Content-Type": "application/x-www-form-urlencoded"},
-        "POST",
-    )
+    token = loop = asyncio.get_running_loop()
+
+         await loop.run_in_executor(
+             None,
+             _google_api_request,
+             service_account.get("token_uri") or GOOGLE_DRIVE_TOKEN_URI,
+             None,
+             form,
+             {"Content-Type": "application/x-www-form-urlencoded"},
+             "POST",
+         )
     if not token.get("access_token"):
         raise RuntimeError("Google Drive service account token request did not return an access token")
     return token["access_token"]
@@ -10147,7 +10171,12 @@ async def _upload_backup_to_google_drive(backup_file: str, reason: str = "manual
     boundary = "pharmacyosbackup"
     meta = {"name": package.name, "parents": [folder_id], "description": f"PharmacyOS {reason} backup sha256={_file_sha256(package)}"}
     body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(meta)}\r\n--{boundary}\r\nContent-Type: application/zip\r\n\r\n").encode() + package.read_bytes() + f"\r\n--{boundary}--".encode()
-    uploaded = await asyncio.to_thread(_google_api_request, "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink", access_token, body, {"Content-Type": f"multipart/related; boundary={boundary}"}, "POST")
+    uploaded = loop = asyncio.get_running_loop()
+
+               await loop.run_in_executor(
+                   None,
+                   _google_api_request, "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink", access_token, body, {"Content-Type": f"multipart/related; boundary={boundary}"}, "POST"
+               )
     uploaded_at = datetime.now(timezone.utc).isoformat()
     await raw_db.backup_status.update_one({"id": "google_drive"}, {"$set": {"id": "google_drive", "status": "Google Drive backup successful", "connection_status": "connected", "last_successful_google_drive_backup": uploaded_at, "last_upload_time": uploaded_at, "last_backup_file": str(path), "last_drive_folder_id": folder_id, "last_drive_file_id": uploaded.get("id")}}, upsert=True)
     return {"ok": True, "status": "Google Drive backup successful", "message": "Google Drive backup successful", "drive_file_id": uploaded.get("id"), "drive_file_name": uploaded.get("name")}
