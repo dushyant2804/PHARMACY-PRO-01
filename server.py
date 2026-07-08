@@ -10132,17 +10132,17 @@ async def _google_service_account_access_token() -> str:
         "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "assertion": assertion,
     }).encode()
-    token = loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
 
-         await loop.run_in_executor(
-             None,
-             _google_api_request,
-             service_account.get("token_uri") or GOOGLE_DRIVE_TOKEN_URI,
-             None,
-             form,
-             {"Content-Type": "application/x-www-form-urlencoded"},
-             "POST",
-         )
+    token = await loop.run_in_executor(
+        None,
+        _google_api_request,
+        service_account.get("token_uri") or GOOGLE_DRIVE_TOKEN_URI,
+        None,
+        form,
+        {"Content-Type": "application/x-www-form-urlencoded"},
+        "POST",
+    )
     if not token.get("access_token"):
         raise RuntimeError("Google Drive service account token request did not return an access token")
     return token["access_token"]
