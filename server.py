@@ -10167,12 +10167,17 @@ async def _upload_backup_to_google_drive(backup_file: str, reason: str = "manual
     boundary = "pharmacyosbackup"
     meta = {"name": package.name, "parents": [folder_id], "description": f"PharmacyOS {reason} backup sha256={_file_sha256(package)}"}
     body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(meta)}\r\n--{boundary}\r\nContent-Type: application/zip\r\n\r\n").encode() + package.read_bytes() + f"\r\n--{boundary}--".encode()
-    uploaded = loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
 
-               await loop.run_in_executor(
-                   None,
-                   _google_api_request, "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink", access_token, body, {"Content-Type": f"multipart/related; boundary={boundary}"}, "POST"
-               )
+    uploaded = await loop.run_in_executor(
+        None,
+        _google_api_request,
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
+        access_token,
+        body,
+        {"Content-Type": f"multipart/related; boundary={boundary}"},
+        "POST"
+    )
     uploaded_at = datetime.now(timezone.utc).isoformat()
     await raw_db.backup_status.update_one({"id": "google_drive"}, {"$set": {"id": "google_drive", "status": "Google Drive backup successful", "connection_status": "connected", "last_successful_google_drive_backup": uploaded_at, "last_upload_time": uploaded_at, "last_backup_file": str(path), "last_drive_folder_id": folder_id, "last_drive_file_id": uploaded.get("id")}}, upsert=True)
     return {"ok": True, "status": "Google Drive backup successful", "message": "Google Drive backup successful", "drive_file_id": uploaded.get("id"), "drive_file_name": uploaded.get("name")}
