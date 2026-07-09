@@ -10593,6 +10593,8 @@ async def backup_health(user: dict = Depends(get_current_user)):
         "last_atlas_backup_at": atlas_status.get("last_successful_atlas_backup"),
         "last_google_drive_backup_at": google_status.get("last_successful_google_drive_backup"),
         "last_google_drive_upload_time": google_status.get("last_upload_time") or google_status.get("last_successful_google_drive_backup"),
+        "google_drive_last_error": google_status.get("last_error"),
+        "google_drive_last_failed_at": google_status.get("last_failed_at"),
         "pending_atlas_sync_count": await _pending_backup_count("atlas"),
         "pending_google_drive_upload_count": await _pending_backup_count("google_drive"),
         "last_backup": last_local,
