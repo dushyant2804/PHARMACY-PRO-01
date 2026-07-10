@@ -3294,8 +3294,18 @@ async def list_medicines(
                 "purchase_price":
                     m.get("purchase_price"),
 
+                "gst_rate":
+                    m.get("gst_rate"),
+
+                "actual_cost":
+                  round(
+                    float(m.get("purchase_price") or 0)
+                    * (1 + float(m.get("gst_rate") or 0) / 100),
+                    2
+                  ),
+
                 "total_stock":
-                    0,
+                   0,
 
                 "expiry_status":
                     "safe",
@@ -3468,7 +3478,17 @@ async def list_medicines(
                 m.get("pack_size"),
 
             "purchase_price":
-              m.get("purchase_price"),
+                m.get("purchase_price"),
+
+            "gst_rate":
+                m.get("gst_rate"),
+
+            "actual_cost":
+              round(
+                float(m.get("purchase_price") or 0)
+                * (1 + float(m.get("gst_rate") or 0) / 100),
+                2
+              ),
 
             "mrp":
               m.get("mrp"),
@@ -3551,7 +3571,17 @@ async def list_medicines(
             item["stock_status"] = "expired"
         item["current_stock"] = item["total_stock"]
         item["available_qty"] = item["total_stock"]
-        item["cost_value"] = round(float(item.get("purchase_price") or 0) * item["total_stock"], 2)
+        
+        actual_cost = round(
+          float(item.get("purchase_price") or 0) *
+          (1 + float(item.get("gst_rate") or 0) / 100),
+          2
+        )
+
+        item["cost_value"] = round(
+           actual_cost * item["total_stock"],
+           2
+        )
         item["mrp_value"] = round(float(item.get("mrp") or 0) * item["total_stock"], 2)
 
     result.sort(
