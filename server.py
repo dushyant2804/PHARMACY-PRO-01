@@ -12169,6 +12169,22 @@ async def create_daily_sale(
         if key not in {"_id", "stock_deductions"}
     }
 
+@api_router.get("/expenses")
+async def get_expenses(
+    date: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    query = {}
+    if date:
+        query["date"] = date
+
+    expenses = await db.expenses.find(
+        query,
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(2000)
+
+    return expenses
+
 def _daily_closing_money(value: float) -> float:
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
