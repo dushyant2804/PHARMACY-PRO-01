@@ -12161,8 +12161,15 @@ async def create_daily_sale(
     }
     entry = _normalize_daily_sale(entry)
 
-    await db.daily_sales.insert_one(entry)
+    existing = await db.daily_sales.find_one({"sale_date": sale_date})
 
+    if existing:
+        await db.daily_sales.update_one(
+            {"sale_date": sale_date},
+            {"$set": entry}
+        )
+    else:
+        await db.daily_sales.insert_one(entry)
     return {
         key: value
         for key, value in entry.items()
@@ -12471,17 +12478,12 @@ async def daily_sales_summary(
         {"_id": 0}
     ).to_list(2000)
 
-    historical = await db.historical_sales.find(
-        {"date": target},
-        {"_id": 0}
-    ).to_list(2000)
-
     expenses = await db.expenses.find({"date": target}, {"_id": 0}).to_list(2000)
     normalized = [_normalize_daily_sale(item) for item in items]
-    cash = sum(i["cash_sales"] for i in normalized) + sum(_money(h.get("cash_amount")) for h in historical)
-    upi = sum(i["upi_sales"] for i in normalized) + sum(_money(h.get("upi_amount")) for h in historical)
-    card = sum(i["card_sales"] for i in normalized) + sum(_money(h.get("card_amount")) for h in historical)
-    pending = sum(i["outstanding_sales"] for i in normalized) + sum(_money(h.get("pending_amount")) for h in historical)
+    cash = sum(i["cash_sales"] for i in normalized)
+    upi = sum(i["upi_sales"] for i in normalized)
+    card = sum(i["card_sales"] for i in normalized)
+    pending = sum(i["outstanding_sales"] for i in normalized)
     expense_total = sum(_money(expense.get("amount")) for expense in expenses)
     paid = cash + upi + card
     total = paid + pending
