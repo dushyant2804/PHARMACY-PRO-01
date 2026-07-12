@@ -12188,7 +12188,7 @@ async def get_expenses(
     expenses = await db.expenses.find(
         query,
         {"_id": 0}
-    ).sort("created_at", -1).to_list(2000)
+    ).sort("created_at", -1).to_list(100)
 
     return expenses
 
@@ -12476,7 +12476,7 @@ async def daily_sales_summary(
     items = await db.daily_sales.find(
         {"sale_date": target},
         {"_id": 0}
-    ).to_list(2000)
+    ).to_list(100)
 
     expenses = await db.expenses.find({"date": target}, {"_id": 0}).to_list(2000)
     normalized = [_normalize_daily_sale(item) for item in items]
