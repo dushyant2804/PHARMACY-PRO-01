@@ -12136,6 +12136,26 @@ def _normalize_daily_sale(entry: dict) -> dict:
     })
     return item
 
+# =============================================================================
+# REGISTER API
+# =============================================================================
+
+@api_router.get("/register/years")
+async def list_register_financial_years(
+    user: dict = Depends(get_current_user),
+):
+    current_fy = _current_financial_year()
+
+    return {
+        "current_financial_year": current_fy,
+        "years": [
+            {
+                "financial_year": current_fy,
+                "is_current": True,
+            }
+        ],
+    }
+
 @api_router.post("/daily-sales")
 async def create_daily_sale(
     payload: DailySaleCreate,
