@@ -13310,7 +13310,7 @@ async def create_daily_sale(
          {"sale_date": sale_date},
          {"$set": entry},
        )
-     else:
+    else:
        entry["updated_at"] = entry["created_at"]
        entry["updated_by"] = entry["created_by"]
 
