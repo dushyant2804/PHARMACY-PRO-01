@@ -4056,6 +4056,29 @@ async def create_expense(
 ):
     data = payload.model_dump()
 
+    expense_month = data["date"][:7]
+    expense_fy = _financial_year_for_date(
+      datetime.strptime(
+        data["date"],
+        "%Y-%m-%d"
+      ).date()
+    )
+
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    if expense_month < current_month:
+       unlocked = await _register_month_unlock_active(
+         expense_fy,
+         expense_month,
+         user,
+       )
+
+       if not unlocked:
+          raise HTTPException(
+             status_code=403,
+             detail="Closed month is locked. Unlock the month first.",
+          )
+
     expense = {
         "id": str(uuid.uuid4()),
         "date": data["date"],
@@ -4067,8 +4090,27 @@ async def create_expense(
 
     await db.expenses.insert_one(expense)
 
-    return expense
+    expense_month = data["date"][:7]
 
+    expense_fy = _financial_year_for_date(
+      datetime.strptime(
+        data["date"],
+        "%Y-%m-%d"
+      ).date()
+    )
+
+    if expense_month < datetime.now(timezone.utc).strftime("%Y-%m"):
+       await _create_register_audit(
+         expense_fy,
+         expense_month,
+         "expense",
+         expense["id"],
+         {},
+         expense,
+         user,
+       )
+
+    return expense
 
 @api_router.get("/s/monthly-summary")
 async def monthly_summary(
@@ -12071,7 +12113,7 @@ class DailySaleCreate(BaseModel):
     upi_sales: float = 0
     outstanding_sales: float = 0
     card_sales: float = 0
-    notes: str = ""
+    notes: List[dict] = Field(default_factory=list)
     sale_date: Optional[str] = None  # YYYY-MM-DD; defaults to today
 
     # Legacy quick-sale fields remain accepted so existing clients and records
@@ -12114,16 +12156,47 @@ def _money(value) -> float:
 def _normalize_daily_sale(entry: dict) -> dict:
     """Expose both standardized summary fields and legacy aliases."""
     item = dict(entry)
+
     legacy_total = _money(item.get("total_amount"))
-    cash = _money(item.get("cash_sales", legacy_total if item.get("payment_status") == "paid" else 0))
+
+    cash = _money(
+        item.get(
+            "cash_sales",
+            legacy_total if item.get("payment_status") == "paid" else 0,
+        )
+    )
+
     upi = _money(item.get("upi_sales"))
+
     card = _money(item.get("card_sales"))
-    outstanding = _money(item.get(
-        "outstanding_sales",
-        legacy_total if item.get("payment_status") == "pending" else 0,
-    ))
+
+    outstanding = _money(
+        item.get(
+            "outstanding_sales",
+            legacy_total if item.get("payment_status") == "pending" else 0,
+        )
+    )
+
     gross = _money(cash + upi + card + outstanding)
+
+    notes = item.get("notes", [])
+
+    if isinstance(notes, str):
+        notes = (
+            [{
+                "id": str(uuid.uuid4()),
+                "text": notes,
+                "created_at": item.get("created_at"),
+                "created_by": item.get("created_by", ""),
+            }]
+            if notes.strip()
+            else []
+        )
+    elif not isinstance(notes, list):
+        notes = []
+
     item = _ensure_action_aliases(item)
+
     item.update({
         "cash_sales": cash,
         "upi_sales": upi,
@@ -12133,9 +12206,87 @@ def _normalize_daily_sale(entry: dict) -> dict:
         "total_paid": _money(cash + upi + card),
         "total_outstanding": outstanding,
         "total_amount": gross,
+        "notes": notes,
     })
+
     return item
 
+
+async def _register_month_unlock_active(
+    financial_year: str,
+    month_key: str,
+    user: dict,
+):
+    unlock = await db.register_unlocks.find_one(
+        {
+            "financial_year": financial_year,
+            "month_key": month_key,
+            "user_id": user.get("id"),
+        },
+        {
+            "_id": 0
+        }
+    )
+
+    if not unlock:
+        return False
+
+    expiry = unlock.get("expires_at")
+
+    if not expiry:
+        return False
+
+    try:
+        expiry_time = datetime.fromisoformat(
+            expiry
+        )
+    except Exception:
+        return False
+
+    return datetime.now(timezone.utc) < expiry_time
+
+
+async def _create_register_audit(
+    financial_year: str,
+    month_key: str,
+    record_type: str,
+    record_id: str,
+    old_value: dict,
+    new_value: dict,
+    user: dict,
+):
+    changed_fields = {}
+
+    all_fields = set(old_value.keys()) | set(new_value.keys())
+
+    for field in all_fields:
+        old = old_value.get(field)
+        new = new_value.get(field)
+
+        if old != new:
+            changed_fields[field] = {
+                "old": old,
+                "new": new,
+            }
+
+    if not changed_fields:
+        return
+
+    audit = {
+        "id": str(uuid.uuid4()),
+        "financial_year": financial_year,
+        "month_key": month_key,
+        "record_type": record_type,
+        "record_id": record_id,
+
+        "changed_fields": changed_fields,
+
+        "changed_by": user.get("name") or user.get("id", ""),
+        "changed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await db.register_audit.insert_one(audit)
+    
 # =============================================================================
 # REGISTER API
 # =============================================================================
@@ -12155,6 +12306,971 @@ async def list_register_financial_years(
             }
         ],
     }
+
+@api_router.get("/register/{financial_year}")
+async def get_register_financial_year(
+    financial_year: str,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        start_date, end_date = _financial_year_date_range(financial_year)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid financial year format"
+        )
+
+    start_iso = start_date.strftime("%Y-%m-%d")
+    end_iso = end_date.strftime("%Y-%m-%d")
+
+    daily_sales = await db.daily_sales.find(
+        {
+            "sale_date": {
+                "$gte": start_iso,
+                "$lte": end_iso,
+            }
+        },
+        {
+            "_id": 0
+        }
+    ).to_list(5000)
+
+    expenses = await db.expenses.find(
+        {
+            "date": {
+                "$gte": start_iso,
+                "$lte": end_iso,
+            }
+        },
+        {
+            "_id": 0
+        }
+    ).to_list(5000)
+
+
+    months = []
+
+    for i in range(12):
+        month_date = start_date.replace(day=1)
+
+        if month_date.month + i <= 12:
+            year = start_date.year
+            month = 4 + i
+            if month > 12:
+                month -= 12
+                year += 1
+        else:
+            continue
+
+        month_key = f"{year}-{month:02d}"
+
+        month_sales = [
+            row for row in daily_sales
+            if row.get("sale_date", "")[:7] == month_key
+        ]
+
+        month_expenses = [
+            row for row in expenses
+            if row.get("date", "")[:7] == month_key
+        ]
+
+        cash = sum(
+            _money(row.get("cash_sales"))
+            for row in month_sales
+        )
+
+        upi = sum(
+            _money(row.get("upi_sales"))
+            for row in month_sales
+        )
+
+        card = sum(
+            _money(row.get("card_sales"))
+            for row in month_sales
+        )
+
+        credit = sum(
+            _money(row.get("outstanding_sales"))
+            for row in month_sales
+        )
+
+        expense_total = sum(
+            _money(row.get("amount"))
+            for row in month_expenses
+        )
+
+        gross = _money(
+            cash + upi + card + credit
+        )
+
+        months.append({
+            "month_key": month_key,
+            "month_label": datetime(
+                year,
+                month,
+                1
+            ).strftime("%B %Y"),
+
+            "status": (
+                "open"
+                if month_key == datetime.now(timezone.utc).strftime("%Y-%m")
+                else
+                "future"
+                if month_key > datetime.now(timezone.utc).strftime("%Y-%m")
+                else
+                "closed"
+            ),
+
+            "cash_sales": cash,
+            "upi_sales": upi,
+            "card_sales": card,
+            "credit_sales": credit,
+            "gross_sales": gross,
+            "total_expenses": expense_total,
+            "net_profit": _money(
+                gross - expense_total
+            ),
+        })
+
+
+    totals = {
+        "cash_sales": _money(
+            sum(row["cash_sales"] for row in months)
+        ),
+
+        "upi_sales": _money(
+            sum(row["upi_sales"] for row in months)
+        ),
+
+        "card_sales": _money(
+            sum(row["card_sales"] for row in months)
+        ),
+
+        "credit_sales": _money(
+            sum(row["credit_sales"] for row in months)
+        ),
+
+        "gross_sales": _money(
+            sum(row["gross_sales"] for row in months)
+        ),
+
+        "total_expenses": _money(
+            sum(row["total_expenses"] for row in months)
+        ),
+
+        "net_profit": _money(
+            sum(row["net_profit"] for row in months)
+        ),
+    }
+
+
+    return {
+        "financial_year": financial_year,
+
+        "start_date": start_iso,
+
+        "end_date": end_iso,
+
+        "is_closed": end_date < datetime.now(timezone.utc).date(),
+
+        "totals": totals,
+
+        "months": months,
+    }
+
+
+@api_router.get("/register/{financial_year}/{month_key}")
+async def get_register_month(
+    financial_year: str,
+    month_key: str,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        month_date = datetime.strptime(
+            month_key,
+            "%Y-%m"
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="month_key must use YYYY-MM format",
+        )
+
+    expected_fy = _financial_year_for_date(
+        month_date.date()
+    )
+
+    if financial_year != expected_fy:
+        raise HTTPException(
+            status_code=400,
+            detail="Month does not belong to financial year",
+        )
+
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    if month_key == current_month:
+        status = "open"
+    elif month_key < current_month:
+        status = "closed"
+    else:
+        status = "future"
+
+
+    # Month date range
+    year = month_date.year
+    month = month_date.month
+
+    start_date = f"{year}-{month:02d}-01"
+
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1)
+    else:
+        next_month = datetime(year, month + 1, 1)
+
+    end_date = (
+        next_month - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+
+    # Existing source collections
+    sales = await db.daily_sales.find(
+        {
+            "sale_date": {
+                "$gte": start_date,
+                "$lte": end_date,
+            }
+        },
+        {
+            "_id": 0
+        }
+    ).to_list(5000)
+
+
+    expenses = await db.expenses.find(
+        {
+            "date": {
+                "$gte": start_date,
+                "$lte": end_date,
+            }
+        },
+        {
+            "_id": 0
+        }
+    ).to_list(5000)
+
+
+    closings = await db.daily_closings.find(
+        {
+            "closing_date": {
+                "$gte": start_date,
+                "$lte": end_date,
+            }
+        },
+        {
+            "_id": 0
+        }
+    ).to_list(5000)
+
+
+    days = {}
+
+
+    for sale in sales:
+        sale = _normalize_daily_sale(sale)
+
+        date = sale.get("sale_date")
+
+        days.setdefault(
+            date,
+            {
+                "date": date,
+                "cash_sales": 0,
+                "upi_sales": 0,
+                "card_sales": 0,
+                "credit_sales": 0,
+                "gross_sales": 0,
+                "expenses": [],
+                "has_closing": False,
+                "note_count": 0,
+            }
+        )
+
+        days[date].update({
+            "cash_sales": sale.get("cash_sales", 0),
+            "upi_sales": sale.get("upi_sales", 0),
+            "card_sales": sale.get("card_sales", 0),
+            "credit_sales": sale.get("outstanding_sales", 0),
+            "gross_sales": sale.get("gross_sales", 0),
+        })
+
+        if sale.get("notes"):
+            days[date]["note_count"] += 1
+
+
+    for expense in expenses:
+        date = expense.get("date")
+
+        days.setdefault(
+            date,
+            {
+                "date": date,
+                "cash_sales": 0,
+                "upi_sales": 0,
+                "card_sales": 0,
+                "credit_sales": 0,
+                "gross_sales": 0,
+                "expenses": [],
+                "has_closing": False,
+                "note_count": 0,
+            }
+        )
+
+        days[date]["expenses"].append(expense)
+
+
+    for closing in closings:
+        date = closing.get("closing_date")
+
+        days.setdefault(
+            date,
+            {
+                "date": date,
+                "cash_sales": 0,
+                "upi_sales": 0,
+                "card_sales": 0,
+                "credit_sales": 0,
+                "gross_sales": 0,
+                "expenses": [],
+                "has_closing": False,
+                "note_count": 0,
+            }
+        )
+
+        days[date]["has_closing"] = True
+
+
+    day_rows = sorted(
+        days.values(),
+        key=lambda x: x["date"]
+    )
+
+
+    total_cash = sum(
+        row["cash_sales"]
+        for row in day_rows
+    )
+
+    total_upi = sum(
+        row["upi_sales"]
+        for row in day_rows
+    )
+
+    total_card = sum(
+        row["card_sales"]
+        for row in day_rows
+    )
+
+    total_credit = sum(
+        row["credit_sales"]
+        for row in day_rows
+    )
+
+    gross_sales = _money(
+        total_cash +
+        total_upi +
+        total_card +
+        total_credit
+    )
+
+    total_expenses = _money(
+        sum(
+            _money(exp.get("amount", 0))
+            for exp in expenses
+        )
+    )
+
+
+    highest_sales = max(
+        day_rows,
+        key=lambda x: x.get("gross_sales", 0),
+        default=None
+    )
+
+
+    expense_by_day = {}
+
+    for expense in expenses:
+        expense_by_day.setdefault(
+            expense.get("date"),
+            0
+        )
+
+        expense_by_day[expense.get("date")] += _money(
+            expense.get("amount", 0)
+        )
+
+
+    highest_expense_day = max(
+        expense_by_day,
+        key=expense_by_day.get,
+        default=None
+    )
+
+
+    return {
+        "financial_year": financial_year,
+        "month_key": month_key,
+        "month_label": month_date.strftime("%B %Y"),
+        "status": status,
+        "unlock_expires_at": None,
+
+        "summary": {
+            "cash_sales": _money(total_cash),
+            "upi_sales": _money(total_upi),
+            "card_sales": _money(total_card),
+            "credit_sales": _money(total_credit),
+            "gross_sales": gross_sales,
+            "total_expenses": total_expenses,
+            "net_profit": _money(
+                gross_sales - total_expenses
+            ),
+            "highest_sales_day": (
+                highest_sales.get("date")
+                if highest_sales
+                else None
+            ),
+            "highest_expense_day": highest_expense_day,
+            "average_daily_sales": _money(
+                gross_sales / len(day_rows)
+            ) if day_rows else 0,
+            "working_days": len(day_rows),
+            "remaining_days": 0,
+            "vs_previous_month": None,
+        },
+
+        "days": day_rows,
+
+        "notes": await db.register_notes.find(
+          {
+             "financial_year": financial_year,
+             "month_key": month_key,
+          },
+          {"_id": 0},
+        ).sort(
+           "created_at",
+           -1,
+        ).to_list(5000),
+    }
+
+
+@api_router.get("/register/{financial_year}/{month_key}/days/{date}")
+async def get_register_day(
+    financial_year: str,
+    month_key: str,
+    date: str,
+    user: dict = Depends(get_current_user),
+):
+    if not parse_iso_date(date):
+        raise HTTPException(
+            status_code=422,
+            detail="date must be a valid ISO date"
+        )
+
+    parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    expected_fy = _financial_year_for_date(parsed_date)
+
+    if financial_year != expected_fy:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to financial year"
+        )
+
+    if month_key != date[:7]:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to month"
+        )
+
+    sale = await db.daily_sales.find_one(
+        {"sale_date": date},
+        {"_id": 0}
+    )
+
+    if sale:
+        sale = _normalize_daily_sale(sale)
+
+
+    expenses = await db.expenses.find(
+        {"date": date},
+        {"_id": 0}
+    ).sort(
+        "created_at",
+        -1
+    ).to_list(200)
+
+
+    closing = await db.daily_closings.find_one(
+        {"closing_date": date},
+        {"_id": 0}
+    )
+
+
+    notes = []
+
+    if sale and sale.get("notes"):
+        notes.append({
+            "text": sale.get("notes"),
+            "source": "daily_sales"
+        })
+
+
+    return {
+        "date": date,
+
+        "cashSales": sale.get("cash_sales", 0) if sale else 0,
+        "upiSales": sale.get("upi_sales", 0) if sale else 0,
+        "cardSales": sale.get("card_sales", 0) if sale else 0,
+        "creditSales": sale.get("outstanding_sales", 0) if sale else 0,
+
+        "grossSales": sale.get("gross_sales", 0) if sale else 0,
+
+        "expenses": expenses,
+
+        "closing": closing,
+
+        "notes": notes
+    }
+
+@api_router.post("/register/{financial_year}/{month_key}/days/{date}")
+async def save_register_day(
+    financial_year: str,
+    month_key: str,
+    date: str,
+    payload: dict,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    if not parse_iso_date(date):
+        raise HTTPException(
+            status_code=422,
+            detail="date must be a valid ISO date"
+        )
+
+    parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    expected_fy = _financial_year_for_date(parsed_date)
+
+    if financial_year != expected_fy:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to financial year"
+        )
+
+    if month_key != date[:7]:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to month"
+        )
+
+
+    # Closed months require temporary unlock
+    today_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    if month_key < today_month:
+       unlocked = await _register_month_unlock_active(
+         financial_year,
+         month_key,
+         user,
+       )
+
+       if not unlocked:
+          raise HTTPException(
+             status_code=403,
+             detail="Closed month is locked. Unlock the month first.",
+          )
+
+
+    existing = await db.daily_sales.find_one(
+        {
+            "sale_date": date
+        },
+        {
+            "_id": 0
+        }
+    )
+
+
+    entry = {
+        "id": existing.get("id")
+        if existing
+        else str(uuid.uuid4()),
+
+        "sale_date": date,
+
+        "cash_sales": _money(
+            payload.get("cash_sales", 0)
+        ),
+
+        "upi_sales": _money(
+            payload.get("upi_sales", 0)
+        ),
+
+        "card_sales": _money(
+            payload.get("card_sales", 0)
+        ),
+
+        "outstanding_sales": _money(
+            payload.get("credit_sales", 0)
+        ),
+
+        "notes": payload.get(
+            "notes",
+            existing.get("notes", "")
+            if existing else ""
+        ),
+
+        "created_at": existing.get("created_at")
+        if existing
+        else datetime.now(timezone.utc).isoformat(),
+
+        "created_by": existing.get("created_by")
+        if existing
+        else user.get("name", ""),
+
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+
+        "updated_by": user.get("name", ""),
+    }
+
+
+    entry = _normalize_daily_sale(entry)
+
+
+    if existing:
+       await db.daily_sales.update_one(
+         {
+            "sale_date": date
+         },
+         {
+            "$set": entry
+         }
+       )
+
+       if month_key < datetime.now(timezone.utc).strftime("%Y-%m"):
+          await _create_register_audit(
+            financial_year,
+            month_key,
+            "daily_sale",
+            existing.get("id"),
+            existing,
+            entry,
+            user,
+          )
+
+    else:
+       await db.daily_sales.insert_one(entry)
+
+    return {
+        key: value
+        for key, value in entry.items()
+        if key != "_id"
+    }
+
+
+@api_router.get("/register/{financial_year}/{month_key}/summary")
+async def get_register_month_summary(
+    financial_year: str,
+    month_key: str,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        datetime.strptime(month_key, "%Y-%m")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="month_key must use YYYY-MM format",
+        )
+
+    start_date = f"{month_key}-01"
+
+    year, month = map(int, month_key.split("-"))
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1)
+    else:
+        next_month = datetime(year, month + 1, 1)
+
+    end_date = (next_month - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    sales = await db.daily_sales.find(
+        {
+            "sale_date": {
+                "$gte": start_date,
+                "$lte": end_date,
+            }
+        },
+        {"_id": 0},
+    ).to_list(5000)
+
+    expenses = await db.expenses.find(
+        {
+            "date": {
+                "$gte": start_date,
+                "$lte": end_date,
+            }
+        },
+        {"_id": 0},
+    ).to_list(5000)
+
+    cash_sales = 0
+    upi_sales = 0
+    card_sales = 0
+    credit_sales = 0
+
+    highest_sales_day = None
+    highest_sales_amount = 0
+
+    for row in sales:
+        row = _normalize_daily_sale(row)
+
+        cash_sales += row.get("cash_sales", 0)
+        upi_sales += row.get("upi_sales", 0)
+        card_sales += row.get("card_sales", 0)
+        credit_sales += row.get("outstanding_sales", 0)
+
+        if row.get("gross_sales", 0) > highest_sales_amount:
+            highest_sales_amount = row.get("gross_sales", 0)
+            highest_sales_day = row.get("sale_date")
+
+    total_expenses = sum(
+        _money(row.get("amount", 0))
+        for row in expenses
+    )
+
+    gross_sales = _money(
+        cash_sales +
+        upi_sales +
+        card_sales +
+        credit_sales
+    )
+
+    working_days = len(sales)
+
+    average_daily_sales = (
+        _money(gross_sales / working_days)
+        if working_days
+        else 0
+    )
+
+    highest_expense_day = None
+    highest_expense_amount = 0
+
+    for row in expenses:
+        amount = _money(row.get("amount", 0))
+        if amount > highest_expense_amount:
+            highest_expense_amount = amount
+            highest_expense_day = row.get("date")
+
+    return {
+        "financial_year": financial_year,
+        "month_key": month_key,
+
+        "summary": {
+            "cash_sales": _money(cash_sales),
+            "upi_sales": _money(upi_sales),
+            "card_sales": _money(card_sales),
+            "credit_sales": _money(credit_sales),
+
+            "gross_sales": gross_sales,
+            "total_expenses": _money(total_expenses),
+
+            "net_profit": _money(
+                gross_sales - total_expenses
+            ),
+
+            "highest_sales_day": highest_sales_day,
+            "highest_expense_day": highest_expense_day,
+
+            "average_daily_sales": average_daily_sales,
+            "working_days": working_days,
+        }
+    }
+
+
+@api_router.post("/register/{financial_year}/{month_key}/notes")
+async def add_register_note(
+    financial_year: str,
+    month_key: str,
+    payload: dict,
+    user: dict = Depends(get_current_user),
+):
+    text = str(payload.get("text", "")).strip()
+    entry_date = payload.get("entry_date")
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Note text is required",
+        )
+
+    if entry_date and not parse_iso_date(entry_date):
+        raise HTTPException(
+            status_code=422,
+            detail="entry_date must be a valid ISO date",
+        )
+
+    note = {
+        "id": str(uuid.uuid4()),
+        "financial_year": financial_year,
+        "month_key": month_key,
+        "entry_date": entry_date,
+        "text": text,
+        "created_by": user.get("name") or user.get("id", ""),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await db.register_notes.insert_one(note)
+
+    return {
+        key: value
+        for key, value in note.items()
+        if key != "_id"
+    }
+
+@api_router.get("/register/{financial_year}/{month_key}/notes")
+async def get_register_notes(
+    financial_year: str,
+    month_key: str,
+    user: dict = Depends(get_current_user),
+):
+    notes = await db.register_notes.find(
+        {
+            "financial_year": financial_year,
+            "month_key": month_key,
+        },
+        {"_id": 0},
+    ).sort(
+        "created_at",
+        -1
+    ).to_list(5000)
+
+    return notes
+
+@api_router.post("/register/{financial_year}/{month_key}/unlock")
+async def unlock_register_month(
+    financial_year: str,
+    month_key: str,
+    payload: dict,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    password = payload.get("privacy_password")
+
+    if not password:
+        raise HTTPException(
+            status_code=400,
+            detail="Privacy password required",
+        )
+
+
+    stored_hash = await _privacy_password_hash()
+
+    if not stored_hash or not verify_password(
+        password,
+        stored_hash
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid privacy password",
+        )
+
+
+    duration_minutes = int(
+        payload.get(
+            "duration_minutes",
+            30
+        )
+    )
+
+    expires = (
+        datetime.now(timezone.utc)
+        +
+        timedelta(minutes=duration_minutes)
+    )
+
+
+    unlock = {
+        "id": str(uuid.uuid4()),
+        "financial_year": financial_year,
+        "month_key": month_key,
+        "user_id": user.get("id"),
+        "user_name": user.get("name", ""),
+        "reason": payload.get("reason", ""),
+        "expires_at": expires.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+    await db.register_unlocks.insert_one(
+        unlock
+    )
+
+
+    return {
+        "message": "Month unlocked",
+        "expires_at": unlock["expires_at"],
+    }
+
+@api_router.post("/register/{financial_year}/{month_key}/lock")
+async def lock_register_month(
+    financial_year: str,
+    month_key: str,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    await db.register_unlocks.update_many(
+        {
+            "financial_year": financial_year,
+            "month_key": month_key,
+            "user_id": user.get("id"),
+        },
+        {
+            "$set": {
+                "expires_at": datetime.now(timezone.utc).isoformat(),
+                "locked_at": datetime.now(timezone.utc).isoformat(),
+                "locked_by": user.get("name", ""),
+            }
+        }
+    )
+
+    return {
+        "message": "Month locked",
+        "financial_year": financial_year,
+        "month_key": month_key,
+    }
+
+@api_router.get("/register/{financial_year}/{month_key}/audit")
+async def get_register_audit(
+    financial_year: str,
+    month_key: str,
+    user: dict = Depends(get_current_user),
+):
+    audits = await db.register_audit.find(
+        {
+            "financial_year": financial_year,
+            "month_key": month_key,
+        },
+        {
+            "_id": 0
+        }
+    ).sort(
+        "changed_at",
+        -1
+    ).to_list(5000)
+
+    return audits
+
+    
+# ------------------------------
+# OLD DAILY SALES API
+# ------------------------------
 
 @api_router.post("/daily-sales")
 async def create_daily_sale(
@@ -12184,12 +13300,21 @@ async def create_daily_sale(
     existing = await db.daily_sales.find_one({"sale_date": sale_date})
 
     if existing:
-        await db.daily_sales.update_one(
-            {"sale_date": sale_date},
-            {"$set": entry}
-        )
-    else:
-        await db.daily_sales.insert_one(entry)
+       entry["id"] = existing.get("id", entry["id"])
+       entry["created_at"] = existing.get("created_at", entry["created_at"])
+       entry["created_by"] = existing.get("created_by", entry["created_by"])
+       entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+       entry["updated_by"] = user.get("name", "")
+ 
+       await db.daily_sales.update_one(
+         {"sale_date": sale_date},
+         {"$set": entry},
+       )
+     else:
+       entry["updated_at"] = entry["created_at"]
+       entry["updated_by"] = entry["created_by"]
+
+       await db.daily_sales.insert_one(entry)
     return {
         key: value
         for key, value in entry.items()
@@ -12420,29 +13545,130 @@ async def update_daily_closing(
     payload: DailyClosingUpdate,
     user: dict = Depends(get_current_user),
 ):
-    existing = await db.daily_closings.find_one({"id": closing_id}, {"_id": 0})
+    existing = await db.daily_closings.find_one(
+        {"id": closing_id},
+        {"_id": 0}
+    )
+
     if not existing:
-        raise HTTPException(status_code=404, detail="Daily closing not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Daily closing not found"
+        )
+
+    closing_date = existing.get("closing_date")
+
+    if closing_date:
+        closing_month = closing_date[:7]
+
+        closing_fy = _financial_year_for_date(
+            datetime.strptime(
+                closing_date,
+                "%Y-%m-%d"
+            ).date()
+        )
+
+        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+        if closing_month < current_month:
+            unlocked = await _register_month_unlock_active(
+                closing_fy,
+                closing_month,
+                user,
+            )
+
+            if not unlocked:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Closed month is locked. Unlock the month first.",
+                )
+
     if existing.get("locked") and user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only an admin can edit a locked closing")
+        raise HTTPException(
+            status_code=403,
+            detail="Only an admin can edit a locked closing"
+        )
 
     changes = payload.model_dump(exclude_unset=True)
+
     target_date = changes.get("closing_date")
+
     if target_date and target_date != existing.get("closing_date"):
-        duplicate = await db.daily_closings.find_one({"closing_date": target_date}, {"_id": 0})
+        duplicate = await db.daily_closings.find_one(
+            {"closing_date": target_date},
+            {"_id": 0}
+        )
+
         if duplicate:
-            raise HTTPException(status_code=409, detail="A closing already exists for this date")
+            raise HTTPException(
+                status_code=409,
+                detail="A closing already exists for this date"
+            )
 
-    target_date = changes.get("closing_date", existing.get("closing_date"))
-    opening_cash = changes.get("opening_cash", existing.get("opening_cash", 0))
-    expected = await _daily_closing_expected(target_date, opening_cash)
-    updated = _prepare_daily_closing({**existing, **changes, **expected})
-    mutable_fields = {*DAILY_CLOSING_AMOUNT_FIELDS, "closing_date", "notes", "closing_notes", "locked",
-                      "mismatch_amount", "expected_cash", "cash_mismatch", "total_expenses", "closing_status"}
-    update_values = {key: updated[key] for key in mutable_fields if key in updated}
-    await db.daily_closings.update_one({"id": closing_id}, {"$set": update_values})
-    return _daily_closing_public({**existing, **update_values})
+    target_date = changes.get(
+        "closing_date",
+        existing.get("closing_date")
+    )
 
+    opening_cash = changes.get(
+        "opening_cash",
+        existing.get("opening_cash", 0)
+    )
+
+    expected = await _daily_closing_expected(
+        target_date,
+        opening_cash
+    )
+
+    updated = _prepare_daily_closing({
+        **existing,
+        **changes,
+        **expected
+    })
+
+    mutable_fields = {
+        *DAILY_CLOSING_AMOUNT_FIELDS,
+        "closing_date",
+        "notes",
+        "closing_notes",
+        "locked",
+        "mismatch_amount",
+        "expected_cash",
+        "cash_mismatch",
+        "total_expenses",
+        "closing_status",
+    }
+
+    update_values = {
+        key: updated[key]
+        for key in mutable_fields
+        if key in updated
+    }
+
+    await db.daily_closings.update_one(
+        {"id": closing_id},
+        {
+            "$set": update_values
+        }
+    )
+    if closing_date and closing_month < current_month:
+       await _create_register_audit(
+         closing_fy,
+         closing_month,
+         "daily_closing",
+         closing_id,
+         existing,
+         {
+            **existing,
+            **update_values
+         },
+         user,
+       )
+
+    return _daily_closing_public({
+        **existing,
+        **update_values
+    })
 
 @api_router.get("/daily-sales")
 async def list_daily_sales(
