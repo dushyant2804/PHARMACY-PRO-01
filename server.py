@@ -13159,7 +13159,7 @@ async def get_register_notes(
 async def unlock_register_month(
     financial_year: str,
     month_key: str,
-    payload: dict,
+    payload: Dict[str, Any],
     user: dict = Depends(require_role("admin", "pharmacist")),
 ):
     password = payload.get("privacy_password")
