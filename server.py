@@ -13170,32 +13170,32 @@ async def unlock_register_month(
             detail="Privacy password required",
         )
 
-
     stored_hash = await _privacy_password_hash(user)
 
-    if not stored_hash or not verify_password(
-        password,
-        stored_hash
-    ):
+    if not stored_hash:
+        raise HTTPException(
+            status_code=500,
+            detail="Privacy password is not configured",
+        )
+
+    if not verify_password(password, stored_hash):
         raise HTTPException(
             status_code=403,
             detail="Invalid privacy password",
         )
 
-
-    duration_minutes = int(
-        payload.get(
-            "duration_minutes",
-            30
+    try:
+        duration_minutes = int(
+            payload.get("duration_minutes", 30)
         )
-    )
+    except Exception:
+        duration_minutes = 30
 
     expires = (
         datetime.now(timezone.utc)
         +
         timedelta(minutes=duration_minutes)
     )
-
 
     unlock = {
         "id": str(uuid.uuid4()),
@@ -13208,16 +13208,19 @@ async def unlock_register_month(
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-
-    await db.register_unlocks.insert_one(
-        unlock
-    )
-
+    try:
+        await db.register_unlocks.insert_one(unlock)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save unlock record: {str(e)}",
+        )
 
     return {
         "message": "Month unlocked",
         "expires_at": unlock["expires_at"],
     }
+
 
 @api_router.post("/register/{financial_year}/{month_key}/lock")
 async def lock_register_month(
