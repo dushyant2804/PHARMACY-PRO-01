@@ -13171,7 +13171,7 @@ async def unlock_register_month(
         )
 
 
-    stored_hash = await _privacy_password_hash()
+    stored_hash = await _privacy_password_hash(user)
 
     if not stored_hash or not verify_password(
         password,
