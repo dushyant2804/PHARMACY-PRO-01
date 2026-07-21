@@ -12747,7 +12747,7 @@ async def get_register_month(
         "month_key": month_key,
         "month_label": month_date.strftime("%B %Y"),
         "status": status,
-        "unlock_expires_at": None,
+        "unlock_expires_at": unlock_expires_at,
 
         "summary": {
             "cash_sales": _money(total_cash),
