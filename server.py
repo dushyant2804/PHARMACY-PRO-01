@@ -12515,6 +12515,31 @@ async def get_register_month(
     else:
         status = "future"
 
+    unlock_expires_at = None
+
+    if status == "closed":
+        unlock = await db.register_unlocks.find_one(
+            {
+                "financial_year": financial_year,
+                "month_key": month_key,
+                "user_id": user.get("id"),
+            },
+            {"_id": 0},
+        )
+
+        if unlock:
+            expiry = unlock.get("expires_at")
+
+            if expiry:
+                try:
+                    expiry_time = datetime.fromisoformat(expiry)
+
+                    if datetime.now(timezone.utc) < expiry_time:
+                        status = "open"
+                        unlock_expires_at = expiry
+                except Exception:
+                    pass
+
 
     # Month date range
     year = month_date.year
