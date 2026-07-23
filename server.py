@@ -1416,7 +1416,7 @@ class PrivacyPasswordUpdate(BaseModel):
     current_password: Optional[str] = None
     new_password: str
 
-    @field_validator("privacy_password")
+    @field_validator("new_password")
     @classmethod
     def _privacy_password_not_blank(cls, value: str) -> str:
         if not value or not value.strip():
