@@ -1407,10 +1407,14 @@ class LowStockThresholdUpdate(BaseModel):
 
 class LowStockThresholdUnlock(BaseModel):
     privacy_password: str
-
+    
+class PrivacyPasswordReset(BaseModel):
+    admin_password: str
+    new_password: str
 
 class PrivacyPasswordUpdate(BaseModel):
-    privacy_password: str
+    current_password: Optional[str] = None
+    new_password: str
 
     @field_validator("privacy_password")
     @classmethod
@@ -2835,13 +2839,27 @@ async def set_privacy_password(
 ):
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Insufficient permissions")
+        stored_hash = await _privacy_password_hash(user)
+
+        if stored_hash:
+            if not payload.current_password:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Current privacy password is required",
+                )
+
+            if not verify_password(payload.current_password, stored_hash):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Invalid current privacy password",
+                )
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         await db.settings.update_one(
             _privacy_settings_filter(user),
             {
                 "$set": {
-                    "privacy_password_hash": hash_password(payload.privacy_password),
+                    "privacy_password_hash": hash_password(payload.new_password),
                     "updated_at": now_iso,
                     "updated_by": user.get("id") or user.get("email"),
                 },
@@ -2856,6 +2874,63 @@ async def set_privacy_password(
         logger.exception("Failed to save privacy password setting")
         raise HTTPException(status_code=503, detail="Unable to save privacy password") from exc
     return {"ok": True, "privacy_password_configured": True, "updated_at": now_iso}
+
+@api_router.post("/settings/privacy-password/reset")
+async def reset_privacy_password(
+    payload: PrivacyPasswordReset,
+    user: dict = Depends(require_role("admin")),
+):
+    if user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions",
+        )
+
+    # Get the full user document (including password_hash)
+    db_user = await raw_db.users.find_one(
+        {"id": user.get("id")},
+        {"_id": 0},
+    )
+
+    if not db_user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    if not verify_password(
+        payload.admin_password,
+        db_user.get("password_hash", ""),
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid admin login password",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    await db.settings.update_one(
+        _privacy_settings_filter(user),
+        {
+            "$set": {
+                "privacy_password_hash": hash_password(
+                    payload.new_password
+                ),
+                "updated_at": now_iso,
+                "updated_by": user.get("id"),
+            },
+            "$setOnInsert": {
+                "key": "privacy_password",
+                "created_at": now_iso,
+            },
+        },
+        upsert=True,
+    )
+
+    return {
+        "ok": True,
+        "message": "Privacy password reset successfully",
+    }
 
 
 # ---------------- Medicines ----------------
