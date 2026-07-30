@@ -13321,6 +13321,29 @@ async def unlock_register_month(
         "expires_at": unlock["expires_at"],
     }
 
+@api_router.get("/register/{financial_year}/{month_key}/unlock-debug")
+async def register_unlock_debug(
+    financial_year: str,
+    month_key: str,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    records = await db.register_unlocks.find(
+        {
+            "financial_year": financial_year,
+            "month_key": month_key,
+            "user_id": user.get("id"),
+        },
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(100)
+
+    return {
+        "financial_year": financial_year,
+        "month_key": month_key,
+        "user_id": user.get("id"),
+        "count": len(records),
+        "records": records,
+    }
+
 
 @api_router.post("/register/{financial_year}/{month_key}/lock")
 async def lock_register_month(
