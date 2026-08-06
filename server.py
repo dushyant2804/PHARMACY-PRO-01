@@ -12292,7 +12292,7 @@ async def _register_month_unlock_active(
     month_key: str,
     user: dict,
 ):
-    unlock = await db.register_unlocks.find_one(
+    unlocks = await db.register_unlocks.find(
         {
             "financial_year": financial_year,
             "month_key": month_key,
@@ -12301,25 +12301,37 @@ async def _register_month_unlock_active(
         {
             "_id": 0
         }
-    )
+    ).sort(
+        "created_at",
+        -1,
+    ).to_list(100)
 
-    if not unlock:
+    if not unlocks:
         return False
 
-    expiry = unlock.get("expires_at")
+    now = datetime.now(timezone.utc)
 
-    if not expiry:
-        return False
+    for unlock in unlocks:
+        expiry = unlock.get("expires_at")
 
-    try:
-        expiry_time = datetime.fromisoformat(
-            expiry
-        )
-    except Exception:
-        return False
+        if not expiry:
+            continue
 
-    return datetime.now(timezone.utc) < expiry_time
+        try:
+            expiry_time = datetime.fromisoformat(expiry)
 
+            if expiry_time.tzinfo is None:
+                expiry_time = expiry_time.replace(
+                    tzinfo=timezone.utc
+                )
+
+        except Exception:
+            continue
+
+        if now < expiry_time:
+            return True
+
+    return False
 
 async def _create_register_audit(
     financial_year: str,
@@ -12593,27 +12605,45 @@ async def get_register_month(
     unlock_expires_at = None
 
     if status == "closed":
-        unlock = await db.register_unlocks.find_one(
-            {
-                "financial_year": financial_year,
-                "month_key": month_key,
-                "user_id": user.get("id"),
-            },
-            {"_id": 0},
-        )
+    unlocks = await db.register_unlocks.find(
+        {
+            "financial_year": financial_year,
+            "month_key": month_key,
+            "user_id": user.get("id"),
+        },
+        {
+            "_id": 0
+        }
+    ).sort(
+        "created_at",
+        -1,
+    ).to_list(100)
 
-        if unlock:
-            expiry = unlock.get("expires_at")
+    now = datetime.now(timezone.utc)
 
-            if expiry:
-                try:
-                    expiry_time = datetime.fromisoformat(expiry)
+    for unlock in unlocks:
+        expiry = unlock.get("expires_at")
 
-                    if datetime.now(timezone.utc) < expiry_time:
-                        status = "open"
-                        unlock_expires_at = expiry
-                except Exception:
-                    pass
+        if not expiry:
+            continue
+
+        try:
+            expiry_time = datetime.fromisoformat(
+                expiry
+            )
+
+            if expiry_time.tzinfo is None:
+                expiry_time = expiry_time.replace(
+                    tzinfo=timezone.utc
+                )
+
+        except Exception:
+            continue
+
+        if now < expiry_time:
+            status = "open"
+            unlock_expires_at = expiry
+            break
 
 
     # Month date range
