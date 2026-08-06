@@ -12605,7 +12605,7 @@ async def get_register_month(
     unlock_expires_at = None
 
     if status == "closed":
-    unlocks = await db.register_unlocks.find(
+       unlocks = await db.register_unlocks.find(
         {
             "financial_year": financial_year,
             "month_key": month_key,
