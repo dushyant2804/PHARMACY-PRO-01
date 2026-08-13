@@ -13255,75 +13255,180 @@ async def get_register_day(
     if not parse_iso_date(date):
         raise HTTPException(
             status_code=422,
-            detail="date must be a valid ISO date"
+            detail="date must be a valid ISO date",
         )
 
-    parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+    parsed_date = datetime.strptime(
+        date,
+        "%Y-%m-%d",
+    ).date()
 
-    expected_fy = _financial_year_for_date(parsed_date)
+    expected_fy = _financial_year_for_date(
+        parsed_date
+    )
 
     if financial_year != expected_fy:
         raise HTTPException(
             status_code=400,
-            detail="Date does not belong to financial year"
+            detail="Date does not belong to financial year",
         )
 
     if month_key != date[:7]:
         raise HTTPException(
             status_code=400,
-            detail="Date does not belong to month"
+            detail="Date does not belong to month",
         )
 
+    # ---------------------------------------------------------
+    # Sales
+    # ---------------------------------------------------------
+
     sale = await db.daily_sales.find_one(
-        {"sale_date": date},
-        {"_id": 0}
+        {
+            "sale_date": date
+        },
+        {
+            "_id": 0
+        }
     )
 
     if sale:
         sale = _normalize_daily_sale(sale)
 
-
-    expenses = await db.expenses.find(
-        {"date": date},
-        {"_id": 0}
-    ).sort(
-        "created_at",
-        -1
-    ).to_list(200)
-
-
-    closing = await db.daily_closings.find_one(
-        {"closing_date": date},
-        {"_id": 0}
+    cash_sales = _money(
+        sale.get("cash_sales", 0)
+        if sale
+        else 0
     )
 
+    upi_sales = _money(
+        sale.get("upi_sales", 0)
+        if sale
+        else 0
+    )
 
-    notes = []
+    card_sales = _money(
+        sale.get("card_sales", 0)
+        if sale
+        else 0
+    )
+
+    credit_sales = _money(
+        sale.get("outstanding_sales", 0)
+        if sale
+        else 0
+    )
+
+    gross_sales = _money(
+        sale.get("gross_sales", 0)
+        if sale
+        else 0
+    )
+
+    # ---------------------------------------------------------
+    # Expenses
+    # ---------------------------------------------------------
+
+    expenses = await db.expenses.find(
+        {
+            "date": date
+        },
+        {
+            "_id": 0
+        }
+    ).sort(
+        "created_at",
+        -1,
+    ).to_list(200)
+
+    total_expenses = _money(
+        sum(
+            _money(expense.get("amount", 0))
+            for expense in expenses
+        )
+    )
+
+    net_collection = _money(
+        gross_sales - total_expenses
+    )
+
+    # ---------------------------------------------------------
+    # Closing
+    # ---------------------------------------------------------
+
+    closing = await db.daily_closings.find_one(
+        {
+            "closing_date": date
+        },
+        {
+            "_id": 0
+        }
+    )
+
+    # ---------------------------------------------------------
+    # Register notes
+    #
+    # Only notes specifically belonging to this day.
+    # ---------------------------------------------------------
+
+    notes = await db.register_notes.find(
+        {
+            "financial_year": financial_year,
+            "month_key": month_key,
+            "entry_date": date,
+        },
+        {
+            "_id": 0
+        }
+    ).sort(
+        "created_at",
+        -1,
+    ).to_list(200)
+
+    # ---------------------------------------------------------
+    # Legacy daily-sales note
+    #
+    # Keep this for compatibility with older data.
+    # ---------------------------------------------------------
 
     if sale and sale.get("notes"):
         notes.append({
+            "id": f"daily-sale-note-{date}",
+            "financial_year": financial_year,
+            "month_key": month_key,
+            "entry_date": date,
             "text": sale.get("notes"),
-            "source": "daily_sales"
+            "created_by_name": sale.get("created_by", ""),
+            "created_at": sale.get(
+                "updated_at",
+                sale.get("created_at"),
+            ),
         })
 
+    # ---------------------------------------------------------
+    # Final response
+    # ---------------------------------------------------------
 
     return {
         "date": date,
 
-        "cashSales": sale.get("cash_sales", 0) if sale else 0,
-        "upiSales": sale.get("upi_sales", 0) if sale else 0,
-        "cardSales": sale.get("card_sales", 0) if sale else 0,
-        "creditSales": sale.get("outstanding_sales", 0) if sale else 0,
+        "cash_sales": cash_sales,
+        "upi_sales": upi_sales,
+        "card_sales": card_sales,
+        "credit_sales": credit_sales,
 
-        "grossSales": sale.get("gross_sales", 0) if sale else 0,
+        "gross_sales": gross_sales,
+
+        "total_expenses": total_expenses,
+
+        "net_collection": net_collection,
 
         "expenses": expenses,
 
         "closing": closing,
 
-        "notes": notes
+        "notes": notes,
     }
-
 @api_router.post("/register/{financial_year}/{month_key}/days/{date}")
 async def save_register_day(
     financial_year: str,
