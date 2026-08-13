@@ -12845,7 +12845,7 @@ async def get_register_month(
     now = datetime.now(timezone.utc)
 
     for unlock in unlocks:
-    expiry = unlock.get("expires_at")
+        expiry = unlock.get("expires_at")
 
     if not expiry:
         continue
