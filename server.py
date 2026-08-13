@@ -12845,20 +12845,31 @@ async def get_register_month(
     now = datetime.now(timezone.utc)
 
     for unlock in unlocks:
-        expiry = unlock.get("expires_at")
+    expiry = unlock.get("expires_at")
 
-        if not expiry:
-            continue
+    if not expiry:
+        continue
 
-        try:
-            expiry_time = datetime.fromisoformat(
-                expiry
+    try:
+        expiry_time = datetime.fromisoformat(
+            expiry
+        )
+
+        if expiry_time.tzinfo is None:
+            expiry_time = expiry_time.replace(
+                tzinfo=timezone.utc
             )
 
-            if expiry_time.tzinfo is None:
-                expiry_time = expiry_time.replace(
-                    tzinfo=timezone.@api_router.get("/register/{financial_year}/{month_key}")
-                    
+    except Exception:
+        continue
+
+    if now < expiry_time:
+        status = "open"
+        unlock_expires_at = expiry
+        break
+
+
+@api_router.get("/register/{financial_year}/{month_key}")
 async def get_register_month(
     financial_year: str,
     month_key: str,
