@@ -4187,6 +4187,229 @@ async def create_expense(
 
     return expense
 
+@api_router.put(
+    "/register/{financial_year}/{month_key}/days/{date}/expenses/{expense_id}"
+)
+async def update_register_expense(
+    financial_year: str,
+    month_key: str,
+    date: str,
+    expense_id: str,
+    payload: dict,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    if not parse_iso_date(date):
+        raise HTTPException(
+            status_code=422,
+            detail="date must be a valid ISO date",
+        )
+
+    parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    expected_fy = _financial_year_for_date(parsed_date)
+
+    if financial_year != expected_fy:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to financial year",
+        )
+
+    if month_key != date[:7]:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to month",
+        )
+
+    today_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    if month_key < today_month:
+        unlocked = await _register_month_unlock_active(
+            financial_year,
+            month_key,
+            user,
+        )
+
+        if not unlocked:
+            raise HTTPException(
+                status_code=403,
+                detail="Closed month is locked. Unlock the month first.",
+            )
+
+    existing = await db.expenses.find_one(
+        {
+            "id": expense_id,
+            "date": date,
+        },
+        {
+            "_id": 0
+        }
+    )
+
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="Expense not found for this date",
+        )
+
+    category = str(payload.get("category", "")).strip()
+    remarks = str(
+        payload.get(
+            "remarks",
+            payload.get("notes", existing.get("notes", "")),
+        )
+        or ""
+    ).strip()
+
+    try:
+        amount = float(payload.get("amount", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="Expense amount must be a valid number",
+        )
+
+    if not category:
+        raise HTTPException(
+            status_code=400,
+            detail="Expense category is required",
+        )
+
+    if amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Expense amount must be greater than zero",
+        )
+
+    updated = {
+        **existing,
+        "category": category,
+        "amount": _money(amount),
+        "notes": remarks,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_by": user.get("name", ""),
+    }
+
+    await db.expenses.update_one(
+        {
+            "id": expense_id,
+            "date": date,
+        },
+        {
+            "$set": {
+                "category": updated["category"],
+                "amount": updated["amount"],
+                "notes": updated["notes"],
+                "updated_at": updated["updated_at"],
+                "updated_by": updated["updated_by"],
+            }
+        },
+    )
+
+    if month_key < today_month:
+        await _create_register_audit(
+            financial_year,
+            month_key,
+            "expense",
+            expense_id,
+            existing,
+            updated,
+            user,
+        )
+
+    return {
+        key: value
+        for key, value in updated.items()
+        if key != "_id"
+    }
+
+@api_router.delete(
+    "/register/{financial_year}/{month_key}/days/{date}/expenses/{expense_id}"
+)
+async def delete_register_expense(
+    financial_year: str,
+    month_key: str,
+    date: str,
+    expense_id: str,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    if not parse_iso_date(date):
+        raise HTTPException(
+            status_code=422,
+            detail="date must be a valid ISO date",
+        )
+
+    parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    expected_fy = _financial_year_for_date(parsed_date)
+
+    if financial_year != expected_fy:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to financial year",
+        )
+
+    if month_key != date[:7]:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to month",
+        )
+
+    today_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    if month_key < today_month:
+        unlocked = await _register_month_unlock_active(
+            financial_year,
+            month_key,
+            user,
+        )
+
+        if not unlocked:
+            raise HTTPException(
+                status_code=403,
+                detail="Closed month is locked. Unlock the month first.",
+            )
+
+    existing = await db.expenses.find_one(
+        {
+            "id": expense_id,
+            "date": date,
+        },
+        {
+            "_id": 0
+        }
+    )
+
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="Expense not found for this date",
+        )
+
+    await db.expenses.delete_one(
+        {
+            "id": expense_id,
+            "date": date,
+        }
+    )
+
+    if month_key < today_month:
+        await _create_register_audit(
+            financial_year,
+            month_key,
+            "expense",
+            expense_id,
+            existing,
+            {},
+            user,
+        )
+
+    return {
+        "success": True,
+        "message": "Expense deleted",
+        "id": expense_id,
+        "date": date,
+    }
+
 @api_router.get("/s/monthly-summary")
 async def monthly_summary(
     month: str,
@@ -13106,6 +13329,91 @@ async def save_register_day(
         if key != "_id"
     }
 
+@api_router.delete("/register/{financial_year}/{month_key}/days/{date}")
+async def delete_register_day(
+    financial_year: str,
+    month_key: str,
+    date: str,
+    user: dict = Depends(require_role("admin", "pharmacist")),
+):
+    if not parse_iso_date(date):
+        raise HTTPException(
+            status_code=422,
+            detail="date must be a valid ISO date",
+        )
+
+    parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    expected_fy = _financial_year_for_date(parsed_date)
+
+    if financial_year != expected_fy:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to financial year",
+        )
+
+    if month_key != date[:7]:
+        raise HTTPException(
+            status_code=400,
+            detail="Date does not belong to month",
+        )
+
+    # Closed months require temporary unlock
+    today_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    if month_key < today_month:
+        unlocked = await _register_month_unlock_active(
+            financial_year,
+            month_key,
+            user,
+        )
+
+        if not unlocked:
+            raise HTTPException(
+                status_code=403,
+                detail="Closed month is locked. Unlock the month first.",
+            )
+
+    existing = await db.daily_sales.find_one(
+        {
+            "sale_date": date
+        },
+        {
+            "_id": 0
+        }
+    )
+
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="No sales entry found for this date",
+        )
+
+    await db.daily_sales.delete_one(
+        {
+            "sale_date": date
+        }
+    )
+
+    # Audit deletion when working on a previously closed month.
+    if month_key < today_month:
+        await _create_register_audit(
+            financial_year,
+            month_key,
+            "daily_sale",
+            existing.get("id"),
+            existing,
+            {},
+            user,
+        )
+
+    return {
+        "success": True,
+        "message": "Daily sales entry deleted",
+        "id": existing.get("id"),
+        "date": date,
+    }
+
 
 @api_router.get("/register/{financial_year}/{month_key}/summary")
 async def get_register_month_summary(
@@ -13264,6 +13572,161 @@ async def add_register_note(
         key: value
         for key, value in note.items()
         if key != "_id"
+    }
+
+@api_router.put(
+    "/register/{financial_year}/{month_key}/notes/{note_id}"
+)
+async def update_register_note(
+    financial_year: str,
+    month_key: str,
+    note_id: str,
+    payload: dict,
+    user: dict = Depends(get_current_user),
+):
+    text = str(payload.get("text", "")).strip()
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Note text is required",
+        )
+
+    existing = await db.register_notes.find_one(
+        {
+            "id": note_id,
+            "financial_year": financial_year,
+            "month_key": month_key,
+        },
+        {
+            "_id": 0
+        }
+    )
+
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="Note not found",
+        )
+
+    today_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    if month_key < today_month:
+        unlocked = await _register_month_unlock_active(
+            financial_year,
+            month_key,
+            user,
+        )
+
+        if not unlocked:
+            raise HTTPException(
+                status_code=403,
+                detail="Closed month is locked. Unlock the month first.",
+            )
+
+    updated = {
+        **existing,
+        "text": text,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_by": user.get("name") or user.get("id", ""),
+    }
+
+    await db.register_notes.update_one(
+        {
+            "id": note_id,
+            "financial_year": financial_year,
+            "month_key": month_key,
+        },
+        {
+            "$set": {
+                "text": text,
+                "updated_at": updated["updated_at"],
+                "updated_by": updated["updated_by"],
+            }
+        },
+    )
+
+    if month_key < today_month:
+        await _create_register_audit(
+            financial_year,
+            month_key,
+            "register_note",
+            note_id,
+            existing,
+            updated,
+            user,
+        )
+
+    return {
+        key: value
+        for key, value in updated.items()
+        if key != "_id"
+    }
+
+@api_router.delete(
+    "/register/{financial_year}/{month_key}/notes/{note_id}"
+)
+async def delete_register_note(
+    financial_year: str,
+    month_key: str,
+    note_id: str,
+    user: dict = Depends(get_current_user),
+):
+    existing = await db.register_notes.find_one(
+        {
+            "id": note_id,
+            "financial_year": financial_year,
+            "month_key": month_key,
+        },
+        {
+            "_id": 0
+        }
+    )
+
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="Note not found",
+        )
+
+    today_month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    if month_key < today_month:
+        unlocked = await _register_month_unlock_active(
+            financial_year,
+            month_key,
+            user,
+        )
+
+        if not unlocked:
+            raise HTTPException(
+                status_code=403,
+                detail="Closed month is locked. Unlock the month first.",
+            )
+
+    await db.register_notes.delete_one(
+        {
+            "id": note_id,
+            "financial_year": financial_year,
+            "month_key": month_key,
+        }
+    )
+
+    if month_key < today_month:
+        await _create_register_audit(
+            financial_year,
+            month_key,
+            "register_note",
+            note_id,
+            existing,
+            {},
+            user,
+        )
+
+    return {
+        "success": True,
+        "message": "Note deleted",
+        "id": note_id,
     }
 
 @api_router.get("/register/{financial_year}/{month_key}/notes")
