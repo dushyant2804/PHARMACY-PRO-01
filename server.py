@@ -12858,6 +12858,7 @@ async def get_register_month(
             if expiry_time.tzinfo is None:
                 expiry_time = expiry_time.replace(
                     tzinfo=timezone.@api_router.get("/register/{financial_year}/{month_key}")
+                    
 async def get_register_month(
     financial_year: str,
     month_key: str,
