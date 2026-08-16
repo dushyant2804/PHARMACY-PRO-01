@@ -7078,7 +7078,7 @@ def _annotate_distributor_transaction_source(txn: dict) -> dict:
 
         annotated.setdefault(
             "is_purchase_order_generated",
-             is_purchase_order_generated,
+            is_purchase_order_generated,
         )
 
         if is_purchase_order_generated:
