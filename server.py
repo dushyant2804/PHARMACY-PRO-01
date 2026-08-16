@@ -7062,37 +7062,45 @@ def _annotate_distributor_transaction_source(txn: dict) -> dict:
     annotated.setdefault("backend_row_source", "distributor_transactions")
     annotated.setdefault("source", "distributor_transactions")
     annotated.setdefault("is_synthetic", False)
+
     persisted_id = _ledger_row_persisted_id(txn)
+
     if persisted_id:
         annotated.setdefault("transaction_id", persisted_id)
+
     if txn.get("_id") is not None:
         annotated.setdefault("transaction_object_id", str(txn.get("_id")))
-    is_opening_txn = _is_opening_balance_transaction(annotated, annotated.get("distributor_id"))
-        is_purchase_order_generated = bool(
-            annotated.get("is_purchase_order_generated")
-            or annotated.get("source") == "purchase_order"
-            or annotated.get("entry_source") == "purchase_order"
-            or annotated.get("purchase_order_id")
-            or annotated.get("po_id")
-        )
 
+    is_opening_txn = _is_opening_balance_transaction(
+        annotated,
+        annotated.get("distributor_id"),
+    )
+
+    is_purchase_order_generated = bool(
+        annotated.get("is_purchase_order_generated")
+        or annotated.get("source") == "purchase_order"
+        or annotated.get("entry_source") == "purchase_order"
+        or annotated.get("purchase_order_id")
+        or annotated.get("po_id")
+    )
+
+    annotated.setdefault(
+        "is_purchase_order_generated",
+        is_purchase_order_generated,
+    )
+
+    if is_purchase_order_generated:
+        # PO transactions are edited from the Purchase Order itself.
+        annotated["can_edit"] = True
+        annotated["can_delete"] = False
+    else:
+        annotated.setdefault("can_edit", bool(persisted_id))
         annotated.setdefault(
-            "is_purchase_order_generated",
-            is_purchase_order_generated,
+            "can_delete",
+            bool(persisted_id and not is_opening_txn),
         )
 
-        if is_purchase_order_generated:
-            # PO transactions are edited from the Purchase Order itself.
-            annotated["can_edit"] = True
-            annotated["can_delete"] = False
-        else:
-            annotated.setdefault("can_edit", bool(persisted_id))
-            annotated.setdefault(
-                "can_delete",
-                bool(persisted_id and not is_opening_txn),
-            )  
-
-        return annotated
+    return annotated
 
 
 
