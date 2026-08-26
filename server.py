@@ -7344,7 +7344,6 @@ async def _canonical_distributor_ledger_transactions(
                 if not po_id or po_id in matched_po_ids:
                     continue
 
-                # Strongest match: invoice/reference + date + amount.
                 refs_match = bool(
                     txn_refs
                     and candidate["refs"]
@@ -7352,17 +7351,30 @@ async def _canonical_distributor_ledger_transactions(
                 )
 
                 amount_match = txn_amount == candidate["amount"]
+
                 date_match = (
                     not txn_date
                     or not candidate["date"]
                     or txn_date == candidate["date"]
                 )
 
+                # Strong match:
+                # invoice/reference + amount + date
                 if refs_match and amount_match and date_match:
                     matching_candidate = candidate
                     break
 
-            if matching_candidate is not None:
+                # Legacy fallback:
+                # amount + date when neither side has an invoice/reference.
+                if (
+                   not txn_refs
+                   and not candidate["refs"]
+                   and amount_match
+                   and date_match
+                ):
+                   matching_candidate = candidate
+                   break
+           if matching_candidate is not None:
                 linked_po = matching_candidate["po"]
                 po_id = matching_candidate["po_id"]
                 po_row = _purchase_order_as_distributor_transaction(
@@ -7654,6 +7666,38 @@ async def _admin_distributor_ledger_debug_report(distributor_id: str) -> dict:
         ],
     }
 
+async def _get_purchase_order_for_ledger_transaction(
+    transaction: dict,
+) -> Optional[dict]:
+    po_id = str(
+        transaction.get("purchase_order_id")
+        or transaction.get("po_id")
+        or ""
+    ).strip()
+
+    if not po_id:
+        return None
+
+    po = await db.purchase_orders.find_one(
+        {"id": po_id},
+        {"_id": 0},
+    )
+
+    return po
+
+def _is_purchase_order_ledger_transaction(transaction: dict) -> bool:
+    if not isinstance(transaction, dict):
+        return False
+
+    return bool(
+        transaction.get("purchase_order_id")
+        or transaction.get("po_id")
+        or transaction.get("source") == "purchase_order"
+        or transaction.get("entry_source") == "purchase_order"
+        or transaction.get("is_purchase_order_generated")
+        or transaction.get("is_auto_generated")
+    )
+
 
 @api_router.get("/admin/distributor-ledger-debug/{distributor_id}")
 async def admin_distributor_ledger_debug(
@@ -7768,13 +7812,15 @@ async def distributor_ledger(
     if opening_balance_date:
         dist["opening_balance_date"] = opening_balance_date
 
-    # Materialize persisted distributor ledger rows only, then make the
-    # post-dedupe rows the sole source for display, running balances, period
-    # totals, and financial-year carry metadata.
+    # Build the canonical distributor ledger stream from persisted
+    # distributor transactions + active Purchase Orders, then apply the
+    # final purchase-invoice dedupe before any balances, totals, filters,
+    # FIFO metadata, or financial-year calculations.
     canonical_txns = await _canonical_distributor_ledger_transactions(
-            dist,
-            did,
-        )
+        distributor=dist,
+        requested_id=did,
+    )
+
     ledger_txns = _final_distributor_ledger_rows(
         canonical_txns,
         str(dist.get("id") or did),
@@ -7898,7 +7944,6 @@ async def update_distributor_transaction(
             status_code=400,
             detail="At least one editable transaction field is required",
         )
-
     if transaction_id.startswith("opening-balance-"):
         changes = _normalize_opening_balance_update_changes(changes)
         if not changes:
@@ -7977,6 +8022,23 @@ async def update_distributor_transaction(
     )
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if _is_purchase_order_ledger_transaction(transaction):
+        po_id = str(
+            transaction.get("purchase_order_id")
+            or transaction.get("po_id")
+            or ""
+        ).strip()
+
+        if po_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PURCHASE_ORDER_LEDGER_TRANSACTION",
+                    "message": "This ledger entry is controlled by its Purchase Order.",
+                    "purchase_order_id": po_id,
+                },
+            )
 
     is_opening_txn = _is_opening_balance_transaction(txn, txn.get("distributor_id"))
     if is_opening_txn:
@@ -8072,22 +8134,63 @@ async def delete_distributor_txn(
     user: dict = Depends(require_role("admin", "pharmacist"))
 ):
     if txn_id == _opening_balance_transaction_id(did):
-        raise HTTPException(status_code=400, detail="Opening balance cannot be deleted")
+        raise HTTPException(
+            status_code=400,
+            detail="Opening balance cannot be deleted",
+        )
+
+    # Synthetic Purchase Order ledger rows do not exist in
+    # distributor_transactions. Their stable IDs are po:<po_id>.
+    if txn_id.startswith("po:"):
+        po_id = txn_id.removeprefix("po:").strip()
+
+        if po_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PURCHASE_ORDER_LEDGER_TRANSACTION",
+                    "message": "This ledger entry is controlled by its Purchase Order.",
+                    "purchase_order_id": po_id,
+                },
+            )
 
     txn = await db.distributor_transactions.find_one(
         {"id": txn_id, "distributor_id": did},
         {"_id": 0},
     )
+
     if txn and _is_opening_balance_transaction(txn, did):
-        raise HTTPException(status_code=400, detail="Opening balance cannot be deleted")
+        raise HTTPException(
+            status_code=400,
+            detail="Opening balance cannot be deleted",
+        )
+
+    if txn and _is_purchase_order_ledger_transaction(txn):
+        po_id = str(
+            txn.get("purchase_order_id")
+            or txn.get("po_id")
+            or ""
+        ).strip()
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PURCHASE_ORDER_LEDGER_TRANSACTION",
+                "message": "This ledger entry is controlled by its Purchase Order.",
+                "purchase_order_id": po_id,
+            },
+        )
 
     result = await db.distributor_transactions.delete_one({
         "id": txn_id,
-        "distributor_id": did
+        "distributor_id": did,
     })
 
     if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Transaction not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Transaction not found",
+        )
 
     return {"ok": True}
 
@@ -10017,65 +10120,86 @@ def _outstanding_aging(transactions: List[dict], charge_types: Set[str], credit_
 
 def _purchase_order_as_distributor_transaction(po: dict) -> dict:
     """
-    Build the ledger representation of a Purchase Order.
+    Build the canonical ledger representation of a Purchase Order.
 
-    This is intentionally a display/accounting projection rather than a second
-    permanent distributor_transactions record. Existing distributor ledger
-    transactions can be matched to the PO and enriched with this metadata,
-    while POs that have no matching ledger transaction are represented
-    synthetically exactly once.
+    This is a synthetic projection only. It does NOT create a permanent
+    distributor_transactions record.
+
+    The Purchase Order remains the source of truth.
     """
-    po_id = str(po.get("id") or po.get("purchase_order_id") or "")
 
-    row = dict(po)
+    po_id = str(
+        po.get("id")
+        or po.get("purchase_order_id")
+        or ""
+    ).strip()
 
-    # Use a stable synthetic id that can never collide with a real ledger txn.
-    row["id"] = f"po-ledger-{po_id}" if po_id else str(uuid.uuid4())
-    row["transaction_id"] = row["id"]
-
-    row["type"] = "purchase"
-    row["amount"] = _safe_float(
-        po.get("grand_total", po.get("total", po.get("amount", 0)))
-    )
-
-    row["transaction_date"] = (
-        po.get("po_date")
-        or po.get("created_at")
-        or po.get("date")
-    )
-    row.setdefault(
-        "created_at",
-        po.get("created_at") or po.get("po_date")
-    )
-
-    row["purchase_order_id"] = po_id
-    row["po_id"] = po_id
-    row["purchase_order_no"] = (
-        po.get("po_no")
-        or po.get("purchase_order_no")
-        or po.get("po_number")
-    )
-
-    # Keep the PO's invoice reference available to the ledger.
     invoice_ref = (
         po.get("invoice_ref")
         or po.get("invoice_number")
         or po.get("invoice_no")
+        or ""
     )
-    if invoice_ref:
-        row.setdefault("invoice_number", invoice_ref)
-        row.setdefault("reference_number", invoice_ref)
 
-    row["source"] = "purchase_order"
-    row["backend_row_source"] = "purchase_orders"
-    row["is_synthetic"] = True
-    row["is_purchase_order_generated"] = True
-    row["is_auto_generated"] = True
-    row["can_edit"] = True
-    row["can_delete"] = False
+    return {
+        # Stable synthetic identity.
+        # This is intentionally NOT a distributor_transactions.id.
+        "id": f"po:{po_id}",
 
-    return row
+        "type": "purchase",
 
+        "amount": _safe_float(
+            po.get(
+                "grand_total",
+                po.get("total", po.get("amount", 0)),
+            )
+        ),
+
+        "transaction_date": (
+            po.get("po_date")
+            or po.get("date")
+            or po.get("created_at")
+        ),
+
+        "created_at": po.get("created_at"),
+
+        "invoice_number": invoice_ref,
+        "reference_number": invoice_ref,
+        "invoice_ref": invoice_ref,
+
+        "purchase_order_id": po_id,
+        "po_id": po_id,
+        "purchase_order_no": (
+            po.get("po_no")
+            or po.get("purchase_order_no")
+            or po.get("po_number")
+            or ""
+        ),
+
+        "distributor_id": po.get("distributor_id"),
+        "distributor_name": po.get("distributor_name"),
+
+        "notes": po.get("notes") or "",
+
+        # ---------------------------------------------------------
+        # Critical ERP metadata
+        # ---------------------------------------------------------
+        "source": "purchase_order",
+        "entry_source": "purchase_order",
+        "backend_row_source": "purchase_orders",
+
+        "is_synthetic": True,
+        "is_purchase_order_generated": True,
+        "is_auto_generated": True,
+
+        # A PO row is edited through the PO itself.
+        "can_edit": True,
+
+        # Deleting the ledger projection is never allowed.
+        # The user must delete the Purchase Order.
+        "can_delete": False,
+    }
+    
 def _distributor_monthly_outstanding_movement(distributors: List[dict], distributor_txns: List[dict]) -> List[dict]:
     """Build month-end distributor payable movement from real distributor payable sources."""
     distributor_by_id = {str(d.get("id") or ""): d for d in distributors if isinstance(d, dict)}
@@ -12291,10 +12415,11 @@ async def delete_po(
            "purchase_order_id": po_id,
            "$or": [
               {"is_purchase_order_generated": True},
+              {"is_auto_generated": True},
               {"source": "purchase_order"},
               {"entry_source": "purchase_order"},
            ],
-         }
+        }
     )
     timer.mark("purchase_order_ledger_cleanup")
 
