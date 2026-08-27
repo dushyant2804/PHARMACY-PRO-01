@@ -6887,6 +6887,191 @@ def _ledger_invoice_identity_variants(value) -> Set[str]:
     return variants
 
 
+def _normalize_ledger_identity_text(value) -> str:
+    """
+    Normalize text for stable PO/ledger identity matching.
+
+    Examples:
+        ABC123       -> ABC123
+        abc123       -> ABC123
+        Abc-123      -> ABC123
+        " Abc 123 "  -> ABC123
+    """
+    if value is None:
+        return ""
+
+    return "".join(
+        ch
+        for ch in str(value).strip().upper()
+        if ch.isalnum()
+    )
+
+
+def _distributor_identity_key(distributor: dict) -> str:
+    """
+    Build a short distributor identity from the first and
+    second name components.
+
+    Examples:
+        Abhi Enterprises       -> ABEN
+        Abhi Medical Agencies  -> ABMI
+        A to Z Medical Agency  -> ATZO
+    """
+    if not isinstance(distributor, dict):
+        return ""
+
+    name = (
+        distributor.get("name")
+        or distributor.get("distributor_name")
+        or ""
+    )
+
+    words = [
+        _normalize_ledger_identity_text(word)
+        for word in str(name).split()
+        if _normalize_ledger_identity_text(word)
+    ]
+
+    if not words:
+        return ""
+
+    if len(words) == 1:
+        return words[0][:4]
+
+    return (
+        words[0][0]
+        + words[1][0]
+        + words[0][-1]
+        + words[1][-1]
+    )[:4]
+
+
+def _purchase_order_identity_key(
+    po: dict,
+    distributor: Optional[dict] = None,
+) -> str:
+    """
+    Stable identity for a Purchase Order.
+
+    Formula:
+
+        distributor key
+        + normalized invoice
+        + DDMMYY
+
+    Example:
+
+        Abhi Enterprises
+        DEF456
+        12 Aug 2026
+
+        -> ABENDEF456120826
+    """
+
+    if not isinstance(po, dict):
+        return ""
+
+    distributor_name = (
+        po.get("distributor_name")
+        or (
+            distributor.get("name")
+            if isinstance(distributor, dict)
+            else ""
+        )
+        or ""
+    )
+
+    distributor_key = _distributor_identity_key({
+        "name": distributor_name
+    })
+
+    invoice_ref = (
+        po.get("invoice_ref")
+        or po.get("invoice_number")
+        or po.get("invoice_no")
+        or po.get("bill_no")
+        or po.get("bill_number")
+        or ""
+    )
+
+    invoice_key = _normalize_ledger_identity_text(invoice_ref)
+
+    transaction_date = _distributor_transaction_date({
+        "transaction_date": (
+            po.get("po_date")
+            or po.get("date")
+            or po.get("created_at")
+        )
+    })
+
+    date_key = (
+        transaction_date.strftime("%d%m%y")
+        if transaction_date
+        else ""
+    )
+
+    if not distributor_key or not invoice_key or not date_key:
+        return ""
+
+    return f"{distributor_key}{invoice_key}{date_key}"
+
+
+def _ledger_purchase_identity_key(
+    txn: dict,
+    distributor: Optional[dict] = None,
+) -> str:
+    """
+    Build the same identity key used by Purchase Orders
+    for an existing distributor ledger purchase transaction.
+    """
+
+    if not isinstance(txn, dict):
+        return ""
+
+    distributor_name = (
+        txn.get("distributor_name")
+        or (
+            distributor.get("name")
+            if isinstance(distributor, dict)
+            else ""
+        )
+        or ""
+    )
+
+    distributor_key = _distributor_identity_key({
+        "name": distributor_name
+    })
+
+    invoice_ref = (
+        txn.get("invoice_no")
+        or txn.get("invoice_number")
+        or txn.get("invoice_ref")
+        or txn.get("bill_no")
+        or txn.get("bill_number")
+        or txn.get("reference_no")
+        or txn.get("reference_number")
+        or txn.get("reference")
+        or txn.get("receipt_invoice_no")
+        or txn.get("po_no")
+        or ""
+    )
+
+    invoice_key = _normalize_ledger_identity_text(invoice_ref)
+
+    transaction_date = _distributor_transaction_date(txn)
+
+    date_key = (
+        transaction_date.strftime("%d%m%y")
+        if transaction_date
+        else ""
+    )
+
+    if not distributor_key or not invoice_key or not date_key:
+        return ""
+
+    return f"{distributor_key}{invoice_key}{date_key}"
+
+
 def _purchase_invoice_reference_values(txn: dict) -> Set[str]:
     if not isinstance(txn, dict):
         return set()
@@ -7155,23 +7340,43 @@ async def _canonical_distributor_ledger_transactions(
     """
     Build the canonical distributor ledger stream.
 
-    Purchase Orders are represented in the ledger without creating duplicate
-    permanent distributor_transactions rows.
+    Purchase Orders are projected into the ledger without creating
+    duplicate permanent distributor_transactions rows.
+
+    Identity strategy:
+
+        DISTRIBUTOR KEY + NORMALIZED INVOICE + DDMMYY
+
+    Example:
+
+        Abhi Enterprises
+        DEF456
+        12 Aug 2026
+
+        -> ABENDEF456120826
 
     Rules:
-      1. Existing distributor_transactions remain untouched financially.
-      2. If an existing purchase transaction matches a PO, it is enriched with
-         PO metadata and treated as the PO-linked ledger row.
-      3. If a persisted transaction already has purchase_order_id/po_id, that
-         PO becomes authoritative for amount/date/document metadata.
-      4. If a PO has no existing matching transaction, one synthetic ledger row
-         is created for display/accounting.
-      5. If a PO is deleted, its synthetic representation disappears and a
-         previously linked PO transaction is ignored.
-      6. No duplicate purchase ledger rows are created for the same PO.
+
+      1. Existing distributor_transactions are never financially rewritten.
+      2. Existing purchase transactions are matched to POs using the
+         stable identity key.
+      3. Invoice matching is case/format insensitive.
+      4. Explicit purchase_order_id/po_id remains authoritative.
+      5. If a PO has no existing ledger purchase transaction, a synthetic
+         PO row is created.
+      6. If a legacy ledger purchase has no corresponding PO, it remains
+         visible exactly as before.
+      7. Deleted/voided POs do not generate synthetic rows.
+      8. Auto-generated transactions whose source PO was deleted disappear.
+      9. Payment transactions are NOT used for PO identity matching.
+     10. Existing transaction IDs are preserved.
     """
 
-    did = str(distributor.get("id") or requested_id or "")
+    did = str(
+        distributor.get("id")
+        or requested_id
+        or ""
+    )
 
     identity_values = _distributor_identity_values(
         distributor,
@@ -7180,8 +7385,12 @@ async def _canonical_distributor_ledger_transactions(
 
     names = {
         str(distributor.get(field)).strip().casefold()
-        for field in ("name", "distributor_name")
-        if distributor.get(field) and str(distributor.get(field)).strip()
+        for field in (
+            "name",
+            "distributor_name",
+        )
+        if distributor.get(field)
+        and str(distributor.get(field)).strip()
     }
 
     if raw_transactions is None:
@@ -7196,57 +7405,89 @@ async def _canonical_distributor_ledger_transactions(
             {"_id": 0},
         ).to_list(10000)
 
-    # Only active POs participate in the ledger.
+    # -------------------------------------------------------------
+    # ACTIVE PURCHASE ORDERS
+    # -------------------------------------------------------------
+
     active_pos = [
         po
         for po in purchase_orders
-        if isinstance(po, dict)
-        and not po.get("deleted_at")
-        and not po.get("voided_at")
-        and str(po.get("status") or "").lower() != "deleted"
-        and _belongs_to_distributor(po, identity_values, names)
+        if (
+            isinstance(po, dict)
+            and not po.get("deleted_at")
+            and not po.get("voided_at")
+            and str(po.get("status") or "").lower() != "deleted"
+            and _belongs_to_distributor(
+                po,
+                identity_values,
+                names,
+            )
+        )
     ]
 
     po_by_id = {
-        str(po.get("id") or po.get("purchase_order_id")): po
+        str(
+            po.get("id")
+            or po.get("purchase_order_id")
+        ): po
         for po in active_pos
         if po.get("id") or po.get("purchase_order_id")
     }
 
-    # Build invoice/date/amount matching keys for legacy ledger rows.
+    # -------------------------------------------------------------
+    # BUILD PO CANDIDATES
+    # -------------------------------------------------------------
+
     po_match_candidates = []
 
     for po in active_pos:
-        po_id = str(po.get("id") or po.get("purchase_order_id") or "")
-        po_amount = _ledger_amount_key(
-            po.get("grand_total", po.get("total", po.get("amount", 0)))
-        )
-        po_date = _distributor_transaction_date(
-            {
-                "transaction_date": (
-                    po.get("po_date")
-                    or po.get("created_at")
-                    or po.get("date")
-                )
-            }
+        po_id = str(
+            po.get("id")
+            or po.get("purchase_order_id")
+            or ""
         )
 
-        invoice_refs = _purchase_invoice_reference_values(po)
+        po_identity_key = _purchase_order_identity_key(
+            po,
+            distributor,
+        )
 
         po_match_candidates.append(
             {
                 "po": po,
                 "po_id": po_id,
-                "amount": po_amount,
-                "date": po_date,
-                "refs": invoice_refs,
+                "identity_key": po_identity_key,
+                "amount": _ledger_amount_key(
+                    po.get(
+                        "grand_total",
+                        po.get(
+                            "total",
+                            po.get("amount", 0),
+                        ),
+                    )
+                ),
+                "date": _distributor_transaction_date(
+                    {
+                        "transaction_date": (
+                            po.get("po_date")
+                            or po.get("created_at")
+                            or po.get("date")
+                        )
+                    }
+                ),
+                "refs": _purchase_invoice_reference_values(po),
             }
         )
 
     canonical = []
     matched_po_ids = set()
 
+    # -------------------------------------------------------------
+    # EXISTING DISTRIBUTOR TRANSACTIONS
+    # -------------------------------------------------------------
+
     for raw_txn in raw_transactions:
+
         if not _belongs_to_distributor(
             raw_txn,
             identity_values,
@@ -7254,7 +7495,9 @@ async def _canonical_distributor_ledger_transactions(
         ):
             continue
 
-        txn = _annotate_distributor_transaction_source(raw_txn)
+        txn = _annotate_distributor_transaction_source(
+            raw_txn
+        )
 
         explicit_po_id = str(
             txn.get("purchase_order_id")
@@ -7262,15 +7505,17 @@ async def _canonical_distributor_ledger_transactions(
             or ""
         ).strip()
 
-        # -------------------------------------------------------------
-        # 1. Explicit PO-linked transaction
-        # -------------------------------------------------------------
+        # =========================================================
+        # 1. EXPLICIT PO LINK
+        # =========================================================
+
         if explicit_po_id:
+
             linked_po = po_by_id.get(explicit_po_id)
 
             if linked_po is None:
-                # This transaction was explicitly generated from a PO that no
-                # longer exists. It must no longer appear in the ledger.
+
+                # Auto-generated PO transaction whose PO was deleted.
                 if (
                     txn.get("is_purchase_order_generated")
                     or txn.get("is_auto_generated")
@@ -7279,17 +7524,18 @@ async def _canonical_distributor_ledger_transactions(
                 ):
                     continue
 
-                # A manually created transaction with a stale po_id should
-                # remain visible rather than silently disappearing.
+                # Manual transaction with stale PO reference:
+                # KEEP IT.
                 canonical.append(txn)
                 continue
 
-            po_row = _purchase_order_as_distributor_transaction(linked_po)
+            po_row = _purchase_order_as_distributor_transaction(
+                linked_po
+            )
 
-            # Preserve the real persisted transaction identity.
             merged = dict(txn)
 
-            # PO is authoritative for commercial/accounting fields.
+            # PO owns commercial/document metadata.
             for field_name in (
                 "type",
                 "amount",
@@ -7301,149 +7547,291 @@ async def _canonical_distributor_ledger_transactions(
                 "purchase_order_id",
                 "po_id",
                 "purchase_order_no",
+                "purchase_order_identity_key",
+                "ledger_identity_key",
                 "distributor_id",
                 "distributor_name",
                 "notes",
             ):
-                if field_name in po_row and po_row[field_name] not in (
-                    None,
-                    "",
+                if (
+                    field_name in po_row
+                    and po_row[field_name] not in (
+                        None,
+                        "",
+                    )
                 ):
                     merged[field_name] = po_row[field_name]
 
             merged["source"] = "purchase_order"
-            merged["backend_row_source"] = "distributor_transactions"
+            merged["backend_row_source"] = (
+                "distributor_transactions"
+            )
+
             merged["is_synthetic"] = False
             merged["is_purchase_order_generated"] = True
             merged["is_auto_generated"] = True
+
             merged["can_edit"] = True
             merged["can_delete"] = False
+
             merged["purchase_order_id"] = explicit_po_id
             merged["po_id"] = explicit_po_id
 
             matched_po_ids.add(explicit_po_id)
+
             canonical.append(merged)
             continue
 
-        # -------------------------------------------------------------
-        # 2. Try to match an existing legacy purchase transaction to a PO.
-        #    This prevents old entries from being duplicated.
-        # -------------------------------------------------------------
-        txn_type = str(txn.get("type") or "").strip().lower()
+        # =========================================================
+        # 2. LEGACY PURCHASE TRANSACTION
+        # =========================================================
+
+        txn_type = str(
+            txn.get("type") or ""
+        ).strip().lower()
 
         if txn_type == "purchase":
-            txn_amount = _ledger_amount_key(txn.get("amount"))
-            txn_date = _distributor_transaction_date(txn)
-            txn_refs = _purchase_invoice_reference_values(txn)
+
+            txn_identity_key = _ledger_purchase_identity_key(
+                txn,
+                distributor,
+            )
 
             matching_candidate = None
 
-            for candidate in po_match_candidates:
-                po_id = candidate["po_id"]
+            # -----------------------------------------------------
+            # PRIMARY MATCH:
+            #
+            # stable identity key
+            # -----------------------------------------------------
 
-                if not po_id or po_id in matched_po_ids:
-                    continue
+            if txn_identity_key:
 
-                refs_match = bool(
-                    txn_refs
-                    and candidate["refs"]
-                    and txn_refs.intersection(candidate["refs"])
+                for candidate in po_match_candidates:
+
+                    po_id = candidate["po_id"]
+
+                    if (
+                        not po_id
+                        or po_id in matched_po_ids
+                    ):
+                        continue
+
+                    if (
+                        candidate["identity_key"]
+                        and candidate["identity_key"]
+                        == txn_identity_key
+                    ):
+                        matching_candidate = candidate
+                        break
+
+            # -----------------------------------------------------
+            # FALLBACK:
+            #
+            # Only use the old matching method when an identity
+            # key cannot be generated.
+            #
+            # This protects unusual legacy records.
+            # -----------------------------------------------------
+
+            if matching_candidate is None:
+
+                txn_amount = _ledger_amount_key(
+                    txn.get("amount")
                 )
 
-                amount_match = txn_amount == candidate["amount"]
-
-                date_match = (
-                    not txn_date
-                    or not candidate["date"]
-                    or txn_date == candidate["date"]
+                txn_date = _distributor_transaction_date(
+                    txn
                 )
 
-                # Strong match:
-                # invoice/reference + amount + date
-                if refs_match and amount_match and date_match:
-                    matching_candidate = candidate
-                    break
+                txn_refs = (
+                    _purchase_invoice_reference_values(
+                        txn
+                    )
+                )
 
-                # Legacy fallback:
-                # amount + date when neither side has an invoice/reference.
-                if (
-                   not txn_refs
-                   and not candidate["refs"]
-                   and amount_match
-                   and date_match
-                ):
-                   matching_candidate = candidate
-                   break
-        if matching_candidate is not None:
+                for candidate in po_match_candidates:
+
+                    po_id = candidate["po_id"]
+
+                    if (
+                        not po_id
+                        or po_id in matched_po_ids
+                    ):
+                        continue
+
+                    refs_match = bool(
+                        txn_refs
+                        and candidate["refs"]
+                        and txn_refs.intersection(
+                            candidate["refs"]
+                        )
+                    )
+
+                    amount_match = (
+                        txn_amount
+                        == candidate["amount"]
+                    )
+
+                    date_match = (
+                        not txn_date
+                        or not candidate["date"]
+                        or txn_date
+                        == candidate["date"]
+                    )
+
+                    if (
+                        refs_match
+                        and amount_match
+                        and date_match
+                    ):
+                        matching_candidate = candidate
+                        break
+
+                    if (
+                        not txn_refs
+                        and not candidate["refs"]
+                        and amount_match
+                        and date_match
+                    ):
+                        matching_candidate = candidate
+                        break
+
+            # -----------------------------------------------------
+            # MATCH FOUND
+            # -----------------------------------------------------
+
+            if matching_candidate is not None:
+
                 linked_po = matching_candidate["po"]
+
                 po_id = matching_candidate["po_id"]
-                po_row = _purchase_order_as_distributor_transaction(
-                    linked_po
+
+                po_identity_key = (
+                    matching_candidate["identity_key"]
+                )
+
+                po_row = (
+                    _purchase_order_as_distributor_transaction(
+                        linked_po
+                    )
                 )
 
                 merged = dict(txn)
 
-                # Preserve the existing transaction id and all financial
-                # history. Only enrich/refresh PO-owned metadata.
+                # Preserve the ORIGINAL persisted transaction ID.
+                # We are linking the existing row, not creating one.
                 for field_name in (
                     "type",
                     "amount",
                     "transaction_date",
+                    "created_at",
                     "invoice_number",
                     "reference_number",
                     "invoice_ref",
                     "purchase_order_no",
+                    "purchase_order_identity_key",
+                    "ledger_identity_key",
                     "distributor_id",
                     "distributor_name",
                     "notes",
                 ):
-                    if field_name in po_row and po_row[field_name] not in (
-                        None,
-                        "",
+                    if (
+                        field_name in po_row
+                        and po_row[field_name] not in (
+                            None,
+                            "",
+                        )
                     ):
-                        merged[field_name] = po_row[field_name]
+                        merged[field_name] = (
+                            po_row[field_name]
+                        )
 
                 merged["purchase_order_id"] = po_id
                 merged["po_id"] = po_id
+
+                merged["purchase_order_identity_key"] = (
+                    po_identity_key
+                )
+
+                merged["ledger_identity_key"] = (
+                    po_identity_key
+                )
+
                 merged["source"] = "purchase_order"
-                merged["backend_row_source"] = "distributor_transactions"
+
+                merged["backend_row_source"] = (
+                    "distributor_transactions"
+                )
+
                 merged["is_synthetic"] = False
                 merged["is_purchase_order_generated"] = True
                 merged["is_auto_generated"] = True
+
                 merged["can_edit"] = True
                 merged["can_delete"] = False
 
                 matched_po_ids.add(po_id)
+
                 canonical.append(merged)
                 continue
 
-        # Ordinary/manual transaction — leave it exactly as it is.
+        # =========================================================
+        # 3. EVERYTHING ELSE
+        #
+        # Payment, receipt, adjustment, manual purchase without PO,
+        # etc. remain untouched.
+        # =========================================================
+
         canonical.append(txn)
 
     # -------------------------------------------------------------
-    # 3. Add a synthetic row for every PO that has no matching persisted
-    #    ledger transaction.
+    # 4. SYNTHETIC PO ROWS
+    #
+    # Only POs that do not already have a ledger purchase row
+    # receive a synthetic projection.
     # -------------------------------------------------------------
-    for po in active_pos:
-        po_id = str(po.get("id") or po.get("purchase_order_id") or "")
 
-        if not po_id or po_id in matched_po_ids:
+    for po in active_pos:
+
+        po_id = str(
+            po.get("id")
+            or po.get("purchase_order_id")
+            or ""
+        )
+
+        if (
+            not po_id
+            or po_id in matched_po_ids
+        ):
             continue
 
         canonical.append(
-            _purchase_order_as_distributor_transaction(po)
+            _purchase_order_as_distributor_transaction(
+                po
+            )
         )
 
-    # Opening-balance normalization remains part of the canonical stream.
-    canonical = _distributor_opening_balance_deduped_transactions(
-        distributor,
-        canonical,
+    # -------------------------------------------------------------
+    # 5. OPENING BALANCE NORMALIZATION
+    # -------------------------------------------------------------
+
+    canonical = (
+        _distributor_opening_balance_deduped_transactions(
+            distributor,
+            canonical,
+        )
     )
 
-    canonical.sort(key=_distributor_fifo_sort_key)
+    # -------------------------------------------------------------
+    # 6. FINAL SORT
+    # -------------------------------------------------------------
+
+    canonical.sort(
+        key=_distributor_fifo_sort_key
+    )
 
     return canonical
-
 
 def _debug_purchase_invoice_identity(txn: dict) -> List[str]:
     return sorted(_purchase_invoice_reference_values(txn))
@@ -10133,6 +10521,8 @@ def _purchase_order_as_distributor_transaction(po: dict) -> dict:
         or po.get("purchase_order_id")
         or ""
     ).strip()
+    
+    po_identity_key = _purchase_order_identity_key(po)
 
     invoice_ref = (
         po.get("invoice_ref")
@@ -10167,14 +10557,15 @@ def _purchase_order_as_distributor_transaction(po: dict) -> dict:
         "reference_number": invoice_ref,
         "invoice_ref": invoice_ref,
 
-        "purchase_order_id": po_id,
-        "po_id": po_id,
         "purchase_order_no": (
             po.get("po_no")
             or po.get("purchase_order_no")
             or po.get("po_number")
             or ""
         ),
+
+        "purchase_order_identity_key": po_identity_key,
+        "ledger_identity_key": po_identity_key,
 
         "distributor_id": po.get("distributor_id"),
         "distributor_name": po.get("distributor_name"),
