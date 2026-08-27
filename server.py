@@ -7374,7 +7374,7 @@ async def _canonical_distributor_ledger_transactions(
                 ):
                    matching_candidate = candidate
                    break
-           if matching_candidate is not None:
+        if matching_candidate is not None:
                 linked_po = matching_candidate["po"]
                 po_id = matching_candidate["po_id"]
                 po_row = _purchase_order_as_distributor_transaction(
