@@ -12542,16 +12542,47 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
 
 def _apply_po_return_credit(po_totals: dict, returns: List[dict], credit: float) -> dict:
     credit = _money_float(_to_decimal(credit))
-    payable_base = _to_decimal(po_totals.get("sub_total", po_totals["grand_total"]))
-    payable = _money_float(max(Decimal("0"), payable_base - _to_decimal(credit)))
+
+    # Purchase return credit must reduce the final PO payable amount,
+    # including GST and other charges already included in grand_total.
+    grand_total = _to_decimal(po_totals.get("grand_total", 0))
+    payable = _money_float(
+        max(Decimal("0"), grand_total - _to_decimal(credit))
+    )
+
     return {
         "purchase_return_ids": [item["id"] for item in returns],
         "purchase_return_adjustment": credit,
-        "purchase_return_details": [{"id": item["id"], "medicine_name": item.get("medicine_name"), "batch_number": item.get("batch_number"), "return_amount": _money_float(_to_decimal(item.get("return_amount")))} for item in returns],
+        "purchase_return_credit": credit,
+
+        "purchase_return_details": [
+            {
+                "id": item["id"],
+                "medicine_id": item.get("medicine_id"),
+                "medicine_name": item.get("medicine_name"),
+                "batch_number": item.get("batch_number"),
+                "expiry_date": item.get("expiry_date"),
+                "return_quantity": _money_float(
+                    _to_decimal(item.get("return_quantity", 0))
+                ),
+                "purchase_rate": _money_float(
+                    _to_decimal(item.get("purchase_rate", 0))
+                ),
+                "gst_rate": (
+                    _money_float(_to_decimal(item.get("gst_rate")))
+                    if item.get("gst_rate") is not None
+                    else None
+                ),
+                "return_amount": _money_float(
+                    _to_decimal(item.get("return_amount", 0))
+                ),
+            }
+            for item in returns
+        ],
+
         "subtotal_after_purchase_return": payable,
         "final_payable_total": payable,
     }
-
 
 def _po_return_settlement_fields(po_id: str, settled_at: str) -> dict:
     return {
