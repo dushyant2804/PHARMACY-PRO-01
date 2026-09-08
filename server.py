@@ -32,9 +32,17 @@ def _flush_startup_timing_buffer():
     while _STARTUP_TIMING_BUFFER:
         logger_obj.info("STARTUP_TIMING %s", _STARTUP_TIMING_BUFFER.pop(0))
 
+_DOTENV_PATH = (ROOT_DIR / ".env").resolve()
 _load_config_started = time.perf_counter()
-load_dotenv(ROOT_DIR / '.env')
-_record_startup_timing("Load configuration", time.perf_counter() - _load_config_started, root=ROOT_DIR)
+# Keep process-provided configuration authoritative while loading the
+# installation-local backend/.env when it exists.
+load_dotenv(_DOTENV_PATH, override=False)
+_record_startup_timing(
+    "Load configuration",
+    time.perf_counter() - _load_config_started,
+    root=ROOT_DIR,
+    env_file_exists=_DOTENV_PATH.is_file(),
+)
 
 import os
 import subprocess
@@ -87,6 +95,38 @@ from app_version import APP_BUILD as BACKEND_APP_BUILD, APP_CHANNEL, APP_VERSION
 from app_update_service import ManifestUnavailable, build_update_check_fallback, build_update_check_response, fetch_update_manifest
 
 
+def _resolve_backend_relative_path(value: Optional[str], default: Path) -> Path:
+    """Resolve configured paths from the backend installation root.
+
+    Absolute paths remain absolute. Relative paths are anchored to the
+    directory containing server.py rather than depending on the caller's
+    current working directory.
+    """
+    if value is None or not str(value).strip():
+        return default.resolve()
+    candidate = Path(str(value).strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = ROOT_DIR / candidate
+    return candidate.resolve()
+
+
+def _configured_service_account_path() -> Path:
+    configured = os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
+    if configured is None or not configured.strip():
+        configured = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    return _resolve_backend_relative_path(
+        configured,
+        ROOT_DIR / "local_data" / "google_drive_service_account.json",
+    )
+
+
+def _service_account_path_configured() -> bool:
+    return bool(
+        (os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH") or "").strip()
+        or (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    )
+
+
 # Runtime database mode
 # CLOUD_MODE preserves the existing Render + MongoDB Atlas behavior.
 # LOCAL_MODE uses a SQLite-backed local adapter that exposes the same async
@@ -101,7 +141,7 @@ BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 SYNC_QUEUE_COLLECTION = "sync_queue"
 ATLAS_BACKUP_MONGO_URL = os.environ.get("ATLAS_BACKUP_MONGO_URL", "")
 ATLAS_BACKUP_DB_NAME = os.environ.get("ATLAS_BACKUP_DB_NAME", os.environ.get("DB_NAME", "pharmacyos_local_backups"))
-GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH = Path(os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH", os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", ROOT_DIR / "local_data" / "google_drive_service_account.json"))).expanduser()
+GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH = _configured_service_account_path()
 GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 GOOGLE_DRIVE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 BACKUP_ENCRYPTION_KEY = os.environ.get("BACKUP_ENCRYPTION_KEY", os.environ.get("JWT_SECRET", ""))
@@ -11538,7 +11578,26 @@ async def _create_local_backup(reason: str = "manual") -> dict:
 
 
 def _mark_queue_failed_fields(exc: Exception) -> dict:
-    return {"status": "pending", "last_error": str(exc), "last_attempt_at": datetime.now(timezone.utc).isoformat()}
+    return {"status": "pending", "last_error": _safe_backup_error(exc), "last_attempt_at": datetime.now(timezone.utc).isoformat()}
+
+
+def _safe_backup_error(exc: Exception) -> str:
+    """Return useful backup diagnostics without leaking configured credentials."""
+    message = str(exc) or exc.__class__.__name__
+    sensitive_values = [
+        ATLAS_BACKUP_MONGO_URL,
+        BACKUP_ENCRYPTION_KEY,
+        GOOGLE_DRIVE_FOLDER_ID,
+    ]
+    for value in sensitive_values:
+        if value:
+            message = message.replace(value, "[redacted]")
+    message = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", message)
+    message = re.sub(r"(?i)(access[_-]?token[\"']?\s*[:=]\s*[\"']?)[^,\\s\"'}]+", r"\1[redacted]", message)
+    message = re.sub(r"(?i)mongodb(?:\+srv)?://[^\s\"']+", "mongodb://[redacted]", message)
+    message = re.sub(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", "[private key redacted]", message, flags=re.DOTALL)
+    message = re.sub(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b", "[token redacted]", message)
+    return message[:500]
 
 
 async def _upload_backup_to_atlas(backup_file: str, reason: str = "manual", queue_id: Optional[str] = None) -> dict:
@@ -11578,7 +11637,7 @@ def _google_api_request(url: str, token: Optional[str] = None, data: Optional[by
 
 
 def _load_google_service_account() -> dict:
-    if not GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.exists():
+    if not GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.is_file():
         raise RuntimeError("Google Drive service account key is not configured or file does not exist")
     try:
         data = json.loads(GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.read_text(encoding="utf-8"))
@@ -11679,10 +11738,20 @@ async def _process_pending_backup_queue(destination: Optional[str] = None) -> di
             result["succeeded"] += 1
         except Exception as exc:
             await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row["id"]}, {"$set": _mark_queue_failed_fields(exc), "$inc": {"attempts": 1}})
-            if dest == "google_drive":
-                await raw_db.backup_status.update_one({"id": "google_drive"}, {"$set": {"id": "google_drive", "status": "upload_failed_queued", "connection_status": "error", "last_error": str(exc), "last_failed_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+            if dest in {"atlas", "google_drive"}:
+                await raw_db.backup_status.update_one(
+                    {"id": dest},
+                    {"$set": {
+                        "id": dest,
+                        "status": "upload_failed_queued",
+                        "connection_status": "error",
+                        "last_error": _safe_backup_error(exc),
+                        "last_failed_at": datetime.now(timezone.utc).isoformat(),
+                    }},
+                    upsert=True,
+                )
             result["failed"] += 1
-            result["errors"].append({"id": row.get("id"), "destination": dest, "error": str(exc)})
+            result["errors"].append({"id": row.get("id"), "destination": dest, "error": _safe_backup_error(exc)})
     return result
 
 
@@ -12054,6 +12123,10 @@ async def backup_health(user: dict = Depends(get_current_user)):
     last_local = await _last_backup_metadata()
     atlas_status = await _last_destination_status("atlas")
     google_status = await _last_destination_status("google_drive")
+    atlas_configured = bool(ATLAS_BACKUP_MONGO_URL)
+    google_key_configured = _service_account_path_configured()
+    google_key_exists = GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.is_file()
+    google_folder_configured = bool(GOOGLE_DRIVE_FOLDER_ID)
     return {
         "runtime_mode": RUNTIME_MODE,
         "local_backend_running": True,
@@ -12061,15 +12134,31 @@ async def backup_health(user: dict = Depends(get_current_user)):
         "local_database_path": str(LOCAL_DB_PATH) if LOCAL_MODE else None,
         "local_backup_status": "ok" if last_local else "never_run",
         "atlas_backup_status": atlas_status.get("status", "pending"),
+        "atlas_configuration": "configured" if atlas_configured else "not_configured",
+        "atlas_connection_status": atlas_status.get("connection_status", "not_tested"),
         "google_drive_backup_status": google_status.get("status", "pending"),
-        "google_drive_connection_status": google_status.get("connection_status", "configured" if GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.exists() and GOOGLE_DRIVE_FOLDER_ID else "not_configured"),
+        "google_drive_configuration": (
+            "configured"
+            if google_key_configured and google_key_exists and google_folder_configured
+            else "not_configured"
+        ),
+        "google_drive_connection_status": google_status.get(
+            "connection_status",
+            "not_tested" if google_key_configured and google_key_exists and google_folder_configured else "not_configured",
+        ),
         "google_drive_service_account_key_path": str(GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH),
-        "google_drive_folder_id_configured": bool(GOOGLE_DRIVE_FOLDER_ID),
+        "google_drive_service_account_key_configured": google_key_configured,
+        "google_drive_service_account_key_exists": google_key_exists,
+        "google_drive_folder_id_configured": google_folder_configured,
         "last_local_backup_at": (last_local or {}).get("created_at"),
         "last_atlas_backup_at": atlas_status.get("last_successful_atlas_backup"),
         "last_google_drive_backup_at": google_status.get("last_successful_google_drive_backup"),
         "last_google_drive_upload_time": google_status.get("last_upload_time") or google_status.get("last_successful_google_drive_backup"),
-        "google_drive_last_error": google_status.get("last_error"),
+        "google_drive_last_error": (
+            _safe_backup_error(RuntimeError(str(google_status.get("last_error"))))
+            if google_status.get("last_error")
+            else None
+        ),
         "google_drive_last_failed_at": google_status.get("last_failed_at"),
         "pending_atlas_sync_count": await _pending_backup_count("atlas"),
         "pending_google_drive_upload_count": await _pending_backup_count("google_drive"),
