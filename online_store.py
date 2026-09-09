@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Body
+from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Body, Depends
 
 
 ORDER_STATUSES = {
@@ -188,14 +188,35 @@ def build_online_store_router(
         )
 
     async def _next_customer_sequence(first_name: str, last_name: str) -> int:
-        # Sequence is per customer identity, not a global order count.
-        query = {
-            "tenant_id": tenant_id,
-            "customer.first_name_normalized": _clean_name_part(first_name),
-            "customer.last_name_normalized": _clean_name_part(last_name),
-        }
-        count = await raw_db.online_orders.count_documents(query)
-        return count + 1
+        """Reserve the next customer sequence atomically.
+
+        MongoDB performs the increment atomically. The local SQLite adapter
+        implements the same find_one_and_update/$inc contract, which keeps the
+        order-ID rule consistent between LOCAL_MODE and CLOUD_MODE.
+        """
+        first = _clean_name_part(first_name)
+        last = _clean_name_part(last_name)
+        counter_id = f"{tenant_id}:{first}:{last}"
+        counter = await raw_db.online_order_counters.find_one_and_update(
+            {"id": counter_id, "tenant_id": tenant_id},
+            {
+                "$setOnInsert": {
+                    "id": counter_id,
+                    "tenant_id": tenant_id,
+                    "first_name_normalized": first,
+                    "last_name_normalized": last,
+                    "sequence": 0,
+                },
+                "$inc": {"sequence": 1},
+            },
+            upsert=True,
+            return_document=True,
+            projection={"_id": 0},
+        )
+        sequence = int((counter or {}).get("sequence") or 0)
+        if sequence < 1 or sequence > 99:
+            raise HTTPException(status_code=409, detail="Customer order sequence limit reached (99)")
+        return sequence
 
     @router.get("/api/store/medicines/search")
     async def search_store_medicines(
@@ -205,9 +226,6 @@ def build_online_store_router(
         term = str(q).strip()
         if not term:
             return []
-        # Mongo-compatible regex query; local SQLite adapter translates the
-        # supported query subset while the final filtering below keeps the
-        # public response predictable across both modes.
         pattern = re.escape(term)
         rows = await raw_db.medicines.find(
             {"tenant_id": tenant_id, "name": {"$regex": pattern, "$options": "i"}},
@@ -329,7 +347,7 @@ def build_online_store_router(
 
     if require_current_user:
         @router.get("/api/online-orders")
-        async def list_online_orders(user=__import__("fastapi").Depends(require_current_user)):
+        async def list_online_orders(user=Depends(require_current_user)):
             rows = await raw_db.online_orders.find(
                 {"tenant_id": tenant_id},
                 {"_id": 0},
@@ -337,7 +355,7 @@ def build_online_store_router(
             return rows
 
         @router.get("/api/online-orders/{order_id}")
-        async def get_online_order(order_id: str, user=__import__("fastapi").Depends(require_current_user)):
+        async def get_online_order(order_id: str, user=Depends(require_current_user)):
             order = await raw_db.online_orders.find_one(
                 {"tenant_id": tenant_id, "order_id": order_id},
                 {"_id": 0},
@@ -347,7 +365,7 @@ def build_online_store_router(
             return order
 
         @router.post("/api/online-orders/{order_id}/status")
-        async def update_online_order_status(order_id: str, payload: Dict[str, Any] = Body(...), user=__import__("fastapi").Depends(require_current_user)):
+        async def update_online_order_status(order_id: str, payload: Dict[str, Any] = Body(...), user=Depends(require_current_user)):
             status = str(payload.get("status") or "").upper().strip()
             if status not in ORDER_STATUSES:
                 raise HTTPException(status_code=422, detail="Invalid online order status")
