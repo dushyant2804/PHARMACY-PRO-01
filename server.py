@@ -93,7 +93,7 @@ from starlette.datastructures import UploadFile
 from version_config import VERSION_METADATA, get_version_metadata
 from app_version import APP_BUILD as BACKEND_APP_BUILD, APP_CHANNEL, APP_VERSION as BACKEND_APP_VERSION
 from app_update_service import ManifestUnavailable, build_update_check_fallback, build_update_check_response, fetch_update_manifest
-
+from online_store import build_online_store_router
 
 def _resolve_backend_relative_path(value: Optional[str], default: Path) -> Path:
     """Resolve configured paths from the backend installation root.
@@ -16096,6 +16096,17 @@ app.add_middleware(
 app.add_middleware(LocalImportRequestLoggingMiddleware)
 
 app.include_router(api_router)
+
+app.include_router(
+    build_online_store_router(
+        raw_db,
+        tenant_id=REAL_TENANT_ID,
+        whatsapp_number=os.environ.get("WHATSAPP_BUSINESS_NUMBER", ""),
+        private_upload_dir=ROOT_DIR / "private_uploads" / "prescriptions",
+        require_current_user=get_current_user,
+    )
+)
+
 _record_startup_timing("Register routes", time.perf_counter() - _routes_started)
 
 
