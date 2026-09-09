@@ -10,6 +10,7 @@ this module can be tested independently before touching the large monolith.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import datetime, timezone
@@ -21,22 +22,13 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Body, Dep
 
 
 ORDER_STATUSES = {
-    "NEW",
-    "REVIEWING",
-    "CONFIRMED",
-    "PREPARING",
-    "READY",
-    "COMPLETED",
-    "REJECTED",
-    "CANCELLED",
-    "PARTIALLY_AVAILABLE",
-    "AWAITING_PAYMENT",
-    "PAID",
+    "NEW", "REVIEWING", "CONFIRMED", "PREPARING", "READY", "COMPLETED",
+    "REJECTED", "CANCELLED", "PARTIALLY_AVAILABLE", "AWAITING_PAYMENT", "PAID",
 }
-
 TERMINAL_STATUSES = {"COMPLETED", "REJECTED", "CANCELLED"}
 ALLOWED_PRESCRIPTION_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 MAX_PRESCRIPTION_BYTES = 10 * 1024 * 1024
+_SEQUENCE_LOCK = asyncio.Lock()
 
 
 def _now() -> str:
@@ -44,8 +36,7 @@ def _now() -> str:
 
 
 def _clean_name_part(value: Any) -> str:
-    value = re.sub(r"[^A-Za-z]", "", str(value or "")).upper()
-    return value
+    return re.sub(r"[^A-Za-z]", "", str(value or "")).upper()
 
 
 def build_order_id(first_name: str, last_name: str, order_date: datetime, sequence: int) -> str:
@@ -87,28 +78,23 @@ def normalize_order_items(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
             quantity = float(raw.get("quantity", 1))
         except (TypeError, ValueError):
             quantity = 0
-        if quantity <= 0 or not medicine_id and not name:
+        if quantity <= 0 or (not medicine_id and not name):
             continue
-        normalized.append(
-            {
-                "medicine_id": medicine_id or None,
-                "medicine_name": name,
-                "quantity": quantity,
-                "unit_price": raw.get("unit_price"),
-                "line_total": raw.get("line_total"),
-                "availability_at_order": raw.get("availability_at_order"),
-            }
-        )
+        normalized.append({
+            "medicine_id": medicine_id or None,
+            "medicine_name": name,
+            "quantity": quantity,
+            "unit_price": raw.get("unit_price"),
+            "line_total": raw.get("line_total"),
+            "availability_at_order": raw.get("availability_at_order"),
+        })
     return normalized
 
 
 def medicine_display_name(medicine: Dict[str, Any]) -> str:
     return str(
-        medicine.get("name")
-        or medicine.get("medicine_name")
-        or medicine.get("brand_name")
-        or medicine.get("generic_name")
-        or ""
+        medicine.get("name") or medicine.get("medicine_name") or
+        medicine.get("brand_name") or medicine.get("generic_name") or ""
     ).strip()
 
 
@@ -139,9 +125,7 @@ def make_whatsapp_url(phone_number: str, order: Dict[str, Any]) -> str:
     if not phone:
         raise ValueError("WhatsApp business number is not configured")
     lines = [
-        "SHREE SHYAM PHARMACY",
-        "New Medicine Order",
-        "",
+        "SHREE SHYAM PHARMACY", "New Medicine Order", "",
         f"Order ID: {order['order_id']}",
         f"Customer: {order['customer']['name']}",
         f"Mobile: {order['customer']['mobile']}",
@@ -160,21 +144,9 @@ def make_whatsapp_url(phone_number: str, order: Dict[str, Any]) -> str:
     return f"https://wa.me/{phone}?text={quote(chr(10).join(lines))}"
 
 
-def build_online_store_router(
-    raw_db,
-    *,
-    tenant_id: str,
-    whatsapp_number: str,
-    private_upload_dir: str | Path,
-    require_current_user=None,
-):
-    """Build public store and private pharmacist order routes.
-
-    ``raw_db`` is used intentionally for public endpoints so the public store
-    does not depend on an authenticated PharmacyOS session. The tenant is
-    fixed by configuration rather than accepted from the browser.
-    """
-
+def build_online_store_router(raw_db, *, tenant_id: str, whatsapp_number: str,
+                              private_upload_dir: str | Path, require_current_user=None):
+    """Build public store and private pharmacist order routes."""
     router = APIRouter()
     upload_dir = Path(private_upload_dir).resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -182,50 +154,37 @@ def build_online_store_router(
     async def _find_medicine(medicine_id: str) -> Optional[dict]:
         if not medicine_id:
             return None
-        return await raw_db.medicines.find_one(
-            {"id": medicine_id, "tenant_id": tenant_id},
-            {"_id": 0},
-        )
+        return await raw_db.medicines.find_one({"id": medicine_id, "tenant_id": tenant_id}, {"_id": 0})
 
     async def _next_customer_sequence(first_name: str, last_name: str) -> int:
-        """Reserve the next customer sequence atomically.
+        """Allocate a per-customer sequence safely in the single-process local app.
 
-        MongoDB performs the increment atomically. The local SQLite adapter
-        implements the same find_one_and_update/$inc contract, which keeps the
-        order-ID rule consistent between LOCAL_MODE and CLOUD_MODE.
+        The SQLite adapter's find_one_and_update is not itself a transaction,
+        so the local critical section is protected by a process lock. MongoDB
+        deployments still perform the database-side increment atomically.
         """
         first = _clean_name_part(first_name)
         last = _clean_name_part(last_name)
         counter_id = f"{tenant_id}:{first}:{last}"
-        counter = await raw_db.online_order_counters.find_one_and_update(
-            {"id": counter_id, "tenant_id": tenant_id},
-            {
-                "$setOnInsert": {
-                    "id": counter_id,
-                    "tenant_id": tenant_id,
-                    "first_name_normalized": first,
-                    "last_name_normalized": last,
+        async with _SEQUENCE_LOCK:
+            counter = await raw_db.online_order_counters.find_one_and_update(
+                {"id": counter_id, "tenant_id": tenant_id},
+                {"$setOnInsert": {
+                    "id": counter_id, "tenant_id": tenant_id,
+                    "first_name_normalized": first, "last_name_normalized": last,
                     "sequence": 0,
-                },
-                "$inc": {"sequence": 1},
-            },
-            upsert=True,
-            return_document=True,
-            projection={"_id": 0},
-        )
+                }, "$inc": {"sequence": 1}},
+                upsert=True, return_document=True, projection={"_id": 0},
+            )
         sequence = int((counter or {}).get("sequence") or 0)
         if sequence < 1 or sequence > 99:
             raise HTTPException(status_code=409, detail="Customer order sequence limit reached (99)")
         return sequence
 
     @router.get("/api/store/medicines/search")
-    async def search_store_medicines(
-        q: str = Query("", min_length=1, max_length=100),
-        limit: int = Query(20, ge=1, le=50),
-    ):
+    async def search_store_medicines(q: str = Query("", min_length=1, max_length=100),
+                                     limit: int = Query(20, ge=1, le=50)):
         term = str(q).strip()
-        if not term:
-            return []
         pattern = re.escape(term)
         rows = await raw_db.medicines.find(
             {"tenant_id": tenant_id, "name": {"$regex": pattern, "$options": "i"}},
@@ -237,15 +196,12 @@ def build_online_store_router(
             name = medicine_display_name(medicine)
             if needle not in name.lower():
                 continue
-            result.append(
-                {
-                    "id": medicine.get("id") or medicine.get("_id"),
-                    "name": name,
-                    "price": medicine_price(medicine),
-                    "available": medicine_available_quantity(medicine) > 0,
-                    "available_quantity": medicine_available_quantity(medicine),
-                }
-            )
+            result.append({
+                "id": medicine.get("id") or medicine.get("_id"), "name": name,
+                "price": medicine_price(medicine),
+                "available": medicine_available_quantity(medicine) > 0,
+                "available_quantity": medicine_available_quantity(medicine),
+            })
             if len(result) >= limit:
                 break
         return result
@@ -259,26 +215,17 @@ def build_online_store_router(
         if len(content) > MAX_PRESCRIPTION_BYTES:
             raise HTTPException(status_code=413, detail="Prescription file is too large")
         token = uuid.uuid4().hex
-        target = upload_dir / f"{token}{extension}"
-        target.write_bytes(content)
-        return {
-            "prescription_id": token,
-            "filename": file.filename,
-            "content_type": file.content_type,
-        }
+        (upload_dir / f"{token}{extension}").write_bytes(content)
+        return {"prescription_id": token, "filename": file.filename, "content_type": file.content_type}
 
     @router.post("/api/store/orders")
     async def create_store_order(payload: Dict[str, Any] = Body(...)):
         first_name, last_name, display_name = normalize_customer_name(
-            payload.get("first_name"),
-            payload.get("last_name"),
-            payload.get("name"),
-        )
+            payload.get("first_name"), payload.get("last_name"), payload.get("name"))
         mobile = str(payload.get("mobile") or payload.get("phone") or "").strip()
         address = str(payload.get("address") or payload.get("house_number") or "").strip()
         if not display_name or not mobile or not address:
             raise HTTPException(status_code=422, detail="Name, mobile number and address/house number are required")
-
         items = normalize_order_items(payload.get("items") or [])
         prescription = payload.get("prescription")
         medicine_request = str(payload.get("medicine_request") or "").strip()
@@ -288,7 +235,6 @@ def build_online_store_router(
         sequence = await _next_customer_sequence(first_name, last_name)
         created = datetime.now(timezone.utc)
         order_id = build_order_id(first_name, last_name, created, sequence)
-
         checked_items = []
         for item in items:
             medicine = await _find_medicine(item.get("medicine_id")) if item.get("medicine_id") else None
@@ -301,65 +247,38 @@ def build_online_store_router(
             checked_items.append(item)
 
         order = {
-            "id": str(uuid.uuid4()),
-            "order_id": order_id,
-            "tenant_id": tenant_id,
-            "shop_id": tenant_id,
-            "source": "website",
-            "status": "NEW",
+            "id": str(uuid.uuid4()), "order_id": order_id, "tenant_id": tenant_id,
+            "shop_id": tenant_id, "source": "website", "status": "NEW",
             "customer": {
-                "first_name": first_name,
-                "last_name": last_name,
+                "first_name": first_name, "last_name": last_name,
                 "first_name_normalized": _clean_name_part(first_name),
                 "last_name_normalized": _clean_name_part(last_name),
-                "name": display_name,
-                "mobile": mobile,
-                "address": address,
+                "name": display_name, "mobile": mobile, "address": address,
             },
-            "items": checked_items,
-            "prescription": prescription,
+            "items": checked_items, "prescription": prescription,
             "medicine_request": medicine_request or None,
             "customer_note": str(payload.get("customer_note") or "").strip(),
-            "created_at": _now(),
-            "updated_at": _now(),
+            "created_at": _now(), "updated_at": _now(),
         }
         order["whatsapp_url"] = make_whatsapp_url(whatsapp_number, order)
         await raw_db.online_orders.insert_one(order)
-        return {
-            "order_id": order["order_id"],
-            "status": order["status"],
-            "whatsapp_url": order["whatsapp_url"],
-        }
+        return {"order_id": order["order_id"], "status": order["status"], "whatsapp_url": order["whatsapp_url"]}
 
     @router.get("/api/store/orders/{order_id}")
     async def get_store_order(order_id: str):
-        order = await raw_db.online_orders.find_one(
-            {"tenant_id": tenant_id, "order_id": order_id},
-            {"_id": 0},
-        )
+        order = await raw_db.online_orders.find_one({"tenant_id": tenant_id, "order_id": order_id}, {"_id": 0})
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        return {
-            "order_id": order.get("order_id"),
-            "status": order.get("status"),
-            "created_at": order.get("created_at"),
-        }
+        return {"order_id": order.get("order_id"), "status": order.get("status"), "created_at": order.get("created_at")}
 
     if require_current_user:
         @router.get("/api/online-orders")
         async def list_online_orders(user=Depends(require_current_user)):
-            rows = await raw_db.online_orders.find(
-                {"tenant_id": tenant_id},
-                {"_id": 0},
-            ).sort("created_at", -1).to_list(500)
-            return rows
+            return await raw_db.online_orders.find({"tenant_id": tenant_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
 
         @router.get("/api/online-orders/{order_id}")
         async def get_online_order(order_id: str, user=Depends(require_current_user)):
-            order = await raw_db.online_orders.find_one(
-                {"tenant_id": tenant_id, "order_id": order_id},
-                {"_id": 0},
-            )
+            order = await raw_db.online_orders.find_one({"tenant_id": tenant_id, "order_id": order_id}, {"_id": 0})
             if not order:
                 raise HTTPException(status_code=404, detail="Order not found")
             return order
@@ -374,14 +293,10 @@ def build_online_store_router(
                 raise HTTPException(status_code=404, detail="Order not found")
             if existing.get("status") in TERMINAL_STATUSES and status != existing.get("status"):
                 raise HTTPException(status_code=409, detail="Completed, rejected or cancelled orders cannot be reopened")
-            update = {
-                "$set": {
-                    "status": status,
-                    "updated_at": _now(),
-                    "updated_by": user.get("name", ""),
-                }
-            }
-            await raw_db.online_orders.update_one({"tenant_id": tenant_id, "order_id": order_id}, update)
+            await raw_db.online_orders.update_one(
+                {"tenant_id": tenant_id, "order_id": order_id},
+                {"$set": {"status": status, "updated_at": _now(), "updated_by": user.get("name", "")}},
+            )
             return {"order_id": order_id, "status": status}
 
     return router
