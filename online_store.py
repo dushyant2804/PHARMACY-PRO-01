@@ -144,6 +144,21 @@ def make_whatsapp_url(phone_number: str, order: Dict[str, Any]) -> str:
     return f"https://wa.me/{phone}?text={quote(chr(10).join(lines))}"
 
 
+def _customer_order_response(order: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only customer-safe order fields for the public tracking endpoint."""
+    return {
+        "order_id": order.get("order_id"),
+        "status": order.get("status"),
+        "customer": order.get("customer"),
+        "items": order.get("items") or [],
+        "prescription": order.get("prescription"),
+        "medicine_request": order.get("medicine_request"),
+        "customer_note": order.get("customer_note") or "",
+        "created_at": order.get("created_at"),
+        "updated_at": order.get("updated_at"),
+    }
+
+
 def build_online_store_router(raw_db, *, tenant_id: str, whatsapp_number: str,
                               private_upload_dir: str | Path, require_current_user=None):
     """Build public store and private pharmacist order routes."""
@@ -244,6 +259,11 @@ def build_online_store_router(raw_db, *, tenant_id: str, whatsapp_number: str,
                 item["availability_at_order"] = medicine_available_quantity(medicine) > 0
             else:
                 item["availability_at_order"] = None
+            unit_price = item.get("unit_price")
+            try:
+                item["line_total"] = round(float(unit_price) * float(item["quantity"]), 2) if unit_price is not None else None
+            except (TypeError, ValueError):
+                item["line_total"] = None
             checked_items.append(item)
 
         order = {
@@ -269,7 +289,7 @@ def build_online_store_router(raw_db, *, tenant_id: str, whatsapp_number: str,
         order = await raw_db.online_orders.find_one({"tenant_id": tenant_id, "order_id": order_id}, {"_id": 0})
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        return {"order_id": order.get("order_id"), "status": order.get("status"), "created_at": order.get("created_at")}
+        return _customer_order_response(order)
 
     if require_current_user:
         @router.get("/api/online-orders")
