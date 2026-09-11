@@ -12116,6 +12116,10 @@ async def backup_export(user: dict = Depends(require_role("admin"))):
 async def backup_manual(user: dict = Depends(require_role("admin"))):
     return await _create_and_sync_backup("manual")
 
+@api_router.post("/backup/run")
+async def backup_run(user: dict = Depends(require_role("admin"))):
+    return await _create_and_sync_backup("manual")
+
 
 @api_router.get("/backup/health")
 @api_router.get("/backup/status")
