@@ -110,23 +110,6 @@ def _resolve_backend_relative_path(value: Optional[str], default: Path) -> Path:
     return candidate.resolve()
 
 
-def _configured_service_account_path() -> Path:
-    configured = os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
-    if configured is None or not configured.strip():
-        configured = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    return _resolve_backend_relative_path(
-        configured,
-        ROOT_DIR / "local_data" / "google_drive_service_account.json",
-    )
-
-
-def _service_account_path_configured() -> bool:
-    return bool(
-        (os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH") or "").strip()
-        or (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    )
-
-
 # Runtime database mode
 # CLOUD_MODE preserves the existing Render + MongoDB Atlas behavior.
 # LOCAL_MODE uses a SQLite-backed local adapter that exposes the same async
@@ -141,9 +124,6 @@ BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 SYNC_QUEUE_COLLECTION = "sync_queue"
 ATLAS_BACKUP_MONGO_URL = os.environ.get("ATLAS_BACKUP_MONGO_URL", "")
 ATLAS_BACKUP_DB_NAME = os.environ.get("ATLAS_BACKUP_DB_NAME", os.environ.get("DB_NAME", "pharmacyos_local_backups"))
-GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH = _configured_service_account_path()
-GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
-GOOGLE_DRIVE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 BACKUP_ENCRYPTION_KEY = os.environ.get("BACKUP_ENCRYPTION_KEY", os.environ.get("JWT_SECRET", ""))
 BACKUP_COLLECTIONS = [
     "medicines", "invoices", "purchase_orders", "distributors", "customers",
@@ -2285,6 +2265,7 @@ async def _run_deferred_startup_maintenance(now_iso: str) -> None:
     _mark_startup_maintenance_started()
     _record_startup_timing("Background startup maintenance started")
     try:
+        await _time_startup_awaitable("Remove legacy Google Drive backup queue", _purge_legacy_google_drive_queue())
         await _time_startup_awaitable("Tenant initialization/backfill", _backfill_tenant_data(now_iso))
         _STARTUP_STABILITY["tenant_initialization_complete"] = True
         await _time_startup_awaitable("Tenant/user repair cleanup", _cleanup_unsafe_real_users())
@@ -11521,8 +11502,8 @@ async def _queue_backup_destination(destination: str, reason: str, backup_file: 
 
 
 async def _enqueue_cloud_sync(reason: str, backup_file: Optional[str] = None, checksum: Optional[str] = None) -> None:
+    # Google Drive backup was intentionally removed. Cloud backup queue now targets Atlas only.
     await _queue_backup_destination("atlas", reason, backup_file, checksum)
-    await _queue_backup_destination("google_drive", reason, backup_file, checksum)
 
 
 def _backup_record_id(checksum: str, reason: str) -> str:
@@ -11587,7 +11568,6 @@ def _safe_backup_error(exc: Exception) -> str:
     sensitive_values = [
         ATLAS_BACKUP_MONGO_URL,
         BACKUP_ENCRYPTION_KEY,
-        GOOGLE_DRIVE_FOLDER_ID,
     ]
     for value in sensitive_values:
         if value:
@@ -11626,96 +11606,14 @@ async def _upload_backup_to_atlas(backup_file: str, reason: str = "manual", queu
         atlas_client.close()
 
 
-def _google_api_request(url: str, token: Optional[str] = None, data: Optional[bytes] = None, headers: Optional[dict] = None, method: Optional[str] = None) -> dict:
-    req_headers = dict(headers or {})
-    if token:
-        req_headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        body = resp.read().decode("utf-8")
-        return json.loads(body) if body else {}
-
-
-def _load_google_service_account() -> dict:
-    if not GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.is_file():
-        raise RuntimeError("Google Drive service account key is not configured or file does not exist")
+async def _purge_legacy_google_drive_queue() -> int:
+    """Remove obsolete Google Drive queue/status records after Drive backup removal."""
+    result = await raw_db[SYNC_QUEUE_COLLECTION].delete_many({"destination": "google_drive"})
     try:
-        data = json.loads(GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"Google Drive service account key could not be read: {exc}")
-    required = {"client_email", "private_key"}
-    missing = sorted(field for field in required if not data.get(field))
-    if missing:
-        raise RuntimeError(f"Google Drive service account key is missing: {', '.join(missing)}")
-    return data
-
-
-async def _google_service_account_access_token() -> str:
-    service_account = _load_google_service_account()
-    now = int(datetime.now(timezone.utc).timestamp())
-    claims = {
-        "iss": service_account["client_email"],
-        "scope": "https://www.googleapis.com/auth/drive",
-        "aud": service_account.get("token_uri") or GOOGLE_DRIVE_TOKEN_URI,
-        "iat": now,
-        "exp": now + 3600,
-    }
-    assertion = jwt.encode(claims, service_account["private_key"], algorithm="RS256")
-    if isinstance(assertion, bytes):
-        assertion = assertion.decode("utf-8")
-    form = urllib.parse.urlencode({
-        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        "assertion": assertion,
-    }).encode()
-    loop = asyncio.get_running_loop()
-
-    token = await loop.run_in_executor(
-        None,
-        _google_api_request,
-        service_account.get("token_uri") or GOOGLE_DRIVE_TOKEN_URI,
-        None,
-        form,
-        {"Content-Type": "application/x-www-form-urlencoded"},
-        "POST",
-    )
-    if not token.get("access_token"):
-        raise RuntimeError("Google Drive service account token request did not return an access token")
-    return token["access_token"]
-
-
-async def _backup_package_for_file(path: Path, reason: str) -> Path:
-    metadata = await raw_db.backup_metadata.find_one({"file": str(path)}, {"_id": 0})
-    package = Path((metadata or {}).get("package_file") or path.with_suffix(".zip"))
-    if not package.exists():
-        package = _write_encrypted_backup_package(path, _file_sha256(path), reason, datetime.now(timezone.utc).isoformat())
-    return package
-
-async def _upload_backup_to_google_drive(backup_file: str, reason: str = "manual", queue_id: Optional[str] = None) -> dict:
-    path = Path(backup_file).expanduser().resolve()
-    if not path.exists():
-        raise RuntimeError("Backup file not found for Google Drive upload")
-    if not GOOGLE_DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is not configured")
-    package = await _backup_package_for_file(path, reason)
-    access_token = await _google_service_account_access_token()
-    folder_id = GOOGLE_DRIVE_FOLDER_ID
-    boundary = "pharmacyosbackup"
-    meta = {"name": package.name, "parents": [folder_id], "description": f"PharmacyOS {reason} backup sha256={_file_sha256(package)}"}
-    body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(meta)}\r\n--{boundary}\r\nContent-Type: application/zip\r\n\r\n").encode() + package.read_bytes() + f"\r\n--{boundary}--".encode()
-    loop = asyncio.get_running_loop()
-
-    uploaded = await loop.run_in_executor(
-        None,
-        _google_api_request,
-        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
-        access_token,
-        body,
-        {"Content-Type": f"multipart/related; boundary={boundary}"},
-        "POST"
-    )
-    uploaded_at = datetime.now(timezone.utc).isoformat()
-    await raw_db.backup_status.update_one({"id": "google_drive"}, {"$set": {"id": "google_drive", "status": "Google Drive backup successful", "connection_status": "connected", "last_successful_google_drive_backup": uploaded_at, "last_upload_time": uploaded_at, "last_backup_file": str(path), "last_drive_folder_id": folder_id, "last_drive_file_id": uploaded.get("id")}}, upsert=True)
-    return {"ok": True, "status": "Google Drive backup successful", "message": "Google Drive backup successful", "drive_file_id": uploaded.get("id"), "drive_file_name": uploaded.get("name")}
+        await raw_db.backup_status.delete_many({"id": "google_drive"})
+    except Exception:
+        logger.exception("Failed to remove legacy Google Drive backup status")
+    return int(getattr(result, "deleted_count", 0) or 0)
 
 
 async def _process_pending_backup_queue(destination: Optional[str] = None) -> dict:
@@ -11730,15 +11628,13 @@ async def _process_pending_backup_queue(destination: Optional[str] = None) -> di
         try:
             if dest == "atlas":
                 upload = await _upload_backup_to_atlas(row["backup_file"], row.get("reason", "queued"), row.get("id"))
-            elif dest == "google_drive":
-                upload = await _upload_backup_to_google_drive(row["backup_file"], row.get("reason", "queued"), row.get("id"))
             else:
                 continue
             await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row["id"]}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat(), "result": upload}, "$inc": {"attempts": 1}})
             result["succeeded"] += 1
         except Exception as exc:
             await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row["id"]}, {"$set": _mark_queue_failed_fields(exc), "$inc": {"attempts": 1}})
-            if dest in {"atlas", "google_drive"}:
+            if dest == "atlas":
                 await raw_db.backup_status.update_one(
                     {"id": dest},
                     {"$set": {
@@ -11759,13 +11655,13 @@ async def _create_and_sync_backup(reason: str) -> dict:
     backup = await _create_local_backup(reason)
     if LOCAL_MODE and _local_request_busy():
         logger.info("LOCAL_MODE backup %s queued; cloud sync deferred while system is busy", reason)
-        return {**backup, "atlas_backup_status": "queued_busy", "google_drive_backup_status": "queued_busy", "sync": {"deferred": True, "reason": "busy"}}
+        return {**backup, "atlas_backup_status": "queued_busy", "sync": {"deferred": True, "reason": "busy"}}
     async with _local_backup_sync_lock:
         if LOCAL_MODE and _local_request_busy():
             logger.info("LOCAL_MODE backup %s queued; cloud sync deferred while system became busy", reason)
-            return {**backup, "atlas_backup_status": "queued_busy", "google_drive_backup_status": "queued_busy", "sync": {"deferred": True, "reason": "busy"}}
+            return {**backup, "atlas_backup_status": "queued_busy", "sync": {"deferred": True, "reason": "busy"}}
         sync = await _process_pending_backup_queue()
-    return {**backup, "atlas_backup_status": _destination_status(sync, "atlas"), "google_drive_backup_status": _destination_status(sync, "google_drive"), "sync": sync}
+    return {**backup, "atlas_backup_status": _destination_status(sync, "atlas"), "sync": sync}
 
 
 def _destination_status(sync: dict, destination: str) -> str:
@@ -11809,7 +11705,7 @@ async def _last_backup_metadata() -> Optional[dict]:
 
 
 async def _pending_backup_count(destination: Optional[str] = None) -> int:
-    query = {"status": "pending"}
+    query = {"status": "pending", "destination": "atlas"}
     if destination:
         query["destination"] = destination
     return await raw_db[SYNC_QUEUE_COLLECTION].count_documents(query)
@@ -12126,11 +12022,6 @@ async def backup_run(user: dict = Depends(require_role("admin"))):
 async def backup_health(user: dict = Depends(get_current_user)):
     last_local = await _last_backup_metadata()
     atlas_status = await _last_destination_status("atlas")
-    google_status = await _last_destination_status("google_drive")
-    atlas_configured = bool(ATLAS_BACKUP_MONGO_URL)
-    google_key_configured = _service_account_path_configured()
-    google_key_exists = GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH.is_file()
-    google_folder_configured = bool(GOOGLE_DRIVE_FOLDER_ID)
     return {
         "runtime_mode": RUNTIME_MODE,
         "local_backend_running": True,
@@ -12138,34 +12029,11 @@ async def backup_health(user: dict = Depends(get_current_user)):
         "local_database_path": str(LOCAL_DB_PATH) if LOCAL_MODE else None,
         "local_backup_status": "ok" if last_local else "never_run",
         "atlas_backup_status": atlas_status.get("status", "pending"),
-        "atlas_configuration": "configured" if atlas_configured else "not_configured",
+        "atlas_configuration": "configured" if bool(ATLAS_BACKUP_MONGO_URL) else "not_configured",
         "atlas_connection_status": atlas_status.get("connection_status", "not_tested"),
-        "google_drive_backup_status": google_status.get("status", "pending"),
-        "google_drive_configuration": (
-            "configured"
-            if google_key_configured and google_key_exists and google_folder_configured
-            else "not_configured"
-        ),
-        "google_drive_connection_status": google_status.get(
-            "connection_status",
-            "not_tested" if google_key_configured and google_key_exists and google_folder_configured else "not_configured",
-        ),
-        "google_drive_service_account_key_path": str(GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH),
-        "google_drive_service_account_key_configured": google_key_configured,
-        "google_drive_service_account_key_exists": google_key_exists,
-        "google_drive_folder_id_configured": google_folder_configured,
         "last_local_backup_at": (last_local or {}).get("created_at"),
         "last_atlas_backup_at": atlas_status.get("last_successful_atlas_backup"),
-        "last_google_drive_backup_at": google_status.get("last_successful_google_drive_backup"),
-        "last_google_drive_upload_time": google_status.get("last_upload_time") or google_status.get("last_successful_google_drive_backup"),
-        "google_drive_last_error": (
-            _safe_backup_error(RuntimeError(str(google_status.get("last_error"))))
-            if google_status.get("last_error")
-            else None
-        ),
-        "google_drive_last_failed_at": google_status.get("last_failed_at"),
         "pending_atlas_sync_count": await _pending_backup_count("atlas"),
-        "pending_google_drive_upload_count": await _pending_backup_count("google_drive"),
         "last_backup": last_local,
         "pending_backup_count": await _pending_backup_count(),
         "cloud_sync_status": "online" if await _internet_available() else "queued_offline",
