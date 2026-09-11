@@ -1,12 +1,10 @@
 Option Explicit
 
-Dim shell, exitCode
+Dim shell
 Set shell = CreateObject("WScript.Shell")
 
-exitCode = shell.Run("""D:\pharmacy-app-v2\backend\backend-run.bat""", 0, False)
+shell.Run """D:\pharmacy-app-v2\backend\backend-run.bat""", 0, False
 
-If exitCode <> 0 Then
-    MsgBox "PharmacyOS backend could not be started.", vbCritical, "PharmacyOS"
-End If
+WScript.Sleep 10000
 
-WScript.Quit exitCode
+shell.Run "chrome.exe --app=http://127.0.0.1:8000/", 1, False

@@ -264,6 +264,12 @@ def build_online_store_router(raw_db, *, tenant_id: str, whatsapp_number: str,
                 item["line_total"] = round(float(unit_price) * float(item["quantity"]), 2) if unit_price is not None else None
             except (TypeError, ValueError):
                 item["line_total"] = None
+            print(
+                "### ORDER ITEM DEBUG:",
+                "quantity=", item.get("quantity"),
+                "unit_price=", item.get("unit_price"),
+                "line_total=", item.get("line_total"),
+            )
             checked_items.append(item)
 
         order = {
