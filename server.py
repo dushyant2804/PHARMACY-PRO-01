@@ -122,6 +122,12 @@ LOCAL_DB_PATH = Path(os.environ.get("LOCAL_DB_PATH", ROOT_DIR / "local_data" / "
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", ROOT_DIR / "backups")).resolve()
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 SYNC_QUEUE_COLLECTION = "sync_queue"
+# Backblaze B2 is ONLY for disaster-recovery backup files. It does not replace MongoDB cloud sync.
+B2_APPLICATION_KEY_ID = os.environ.get("B2_APPLICATION_KEY_ID", "").strip()
+B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "").strip()
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "pharmacyos-backups").strip()
+B2_BACKUP_PREFIX = os.environ.get("B2_BACKUP_PREFIX", "pharmacyos/backups").strip("/")
+# Kept only so old deployments do not crash while transitioning away from Atlas backup storage.
 ATLAS_BACKUP_MONGO_URL = os.environ.get("ATLAS_BACKUP_MONGO_URL", "")
 ATLAS_BACKUP_DB_NAME = os.environ.get("ATLAS_BACKUP_DB_NAME", os.environ.get("DB_NAME", "pharmacyos_local_backups"))
 BACKUP_ENCRYPTION_KEY = os.environ.get("BACKUP_ENCRYPTION_KEY", os.environ.get("JWT_SECRET", ""))
@@ -11503,7 +11509,7 @@ async def _queue_backup_destination(destination: str, reason: str, backup_file: 
 
 async def _enqueue_cloud_sync(reason: str, backup_file: Optional[str] = None, checksum: Optional[str] = None) -> None:
     # Google Drive backup was intentionally removed. Cloud backup queue now targets Atlas only.
-    await _queue_backup_destination("atlas", reason, backup_file, checksum)
+    await _queue_backup_destination("b2", reason, backup_file, checksum)
 
 
 def _backup_record_id(checksum: str, reason: str) -> str:
@@ -11554,7 +11560,7 @@ async def _create_local_backup(reason: str = "manual") -> dict:
         "collection_counts": {k: len(v) for k, v in payload["collections"].items()},
         "upload_file_count": len(payload.get("uploads", [])),
     })
-    await _enqueue_cloud_sync(reason, str(backup_file), checksum)
+    await _enqueue_cloud_sync(reason, str(package_file), _file_sha256(package_file))
     return {"ok": True, "backup_file": str(backup_file), "package_file": str(package_file), "sha256": checksum, "size": file_size, "timestamp": payload["exported_at"], "queued_for_cloud_sync": True, "collection_counts": {k: len(v) for k, v in payload["collections"].items()}, "upload_file_count": len(payload.get("uploads", []))}
 
 
@@ -11580,30 +11586,84 @@ def _safe_backup_error(exc: Exception) -> str:
     return message[:500]
 
 
-async def _upload_backup_to_atlas(backup_file: str, reason: str = "manual", queue_id: Optional[str] = None) -> dict:
-    if not ATLAS_BACKUP_MONGO_URL:
-        raise RuntimeError("ATLAS_BACKUP_MONGO_URL is not configured")
-    path, payload, checksum, file_size = _load_backup_file_for_restore(backup_file)
-    record_id = _backup_record_id(checksum, reason)
-    atlas_client = AsyncIOMotorClient(ATLAS_BACKUP_MONGO_URL, serverSelectionTimeoutMS=5000)
+async def _b2_json_request(api_url: str, token: str, operation: str, payload: dict) -> dict:
+    url = api_url.rstrip("/") + "/b2api/v2/" + operation
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST")
+    request.add_header("Authorization", token)
+    request.add_header("Content-Type", "application/json")
     try:
-        await atlas_client.admin.command("ping")
-        atlas_db = atlas_client[ATLAS_BACKUP_DB_NAME]
-        existing = await atlas_db.local_backup_snapshots.find_one({"id": record_id}, {"_id": 0})
-        if existing:
-            status = "already_uploaded"
-        else:
-            await atlas_db.local_backup_snapshots.insert_one({
-                "id": record_id, "reason": reason, "created_at": datetime.now(timezone.utc).isoformat(),
-                "source_exported_at": payload.get("exported_at"), "sha256": checksum, "size": file_size,
-                "mode": payload.get("mode"), "collection_counts": {k: len(v) for k, v in payload.get("collections", {}).items()},
-                "upload_file_count": len(payload.get("uploads", [])), "payload": payload,
-            })
-            status = "uploaded"
-        await raw_db.backup_status.update_one({"id": "atlas"}, {"$set": {"id": "atlas", "status": status, "last_successful_atlas_backup": datetime.now(timezone.utc).isoformat(), "last_backup_file": str(path), "last_sha256": checksum}}, upsert=True)
-        return {"ok": True, "status": status, "record_id": record_id, "sha256": checksum}
-    finally:
-        atlas_client.close()
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Backblaze B2 {operation} failed: {exc}") from exc
+
+
+def _b2_authorize() -> dict:
+    if not B2_APPLICATION_KEY_ID or not B2_APPLICATION_KEY:
+        raise RuntimeError("B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY are not configured")
+    credentials = base64.b64encode(f"{B2_APPLICATION_KEY_ID}:{B2_APPLICATION_KEY}".encode("utf-8")).decode("ascii")
+    request = urllib.request.Request("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", method="GET")
+    request.add_header("Authorization", "Basic " + credentials)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Backblaze B2 authorization failed: {exc}") from exc
+
+
+def _b2_find_bucket(auth: dict) -> dict:
+    buckets = _b2_json_request(auth["apiUrl"], auth["authorizationToken"], "b2_list_buckets", {
+        "accountId": auth["accountId"],
+        "bucketName": B2_BUCKET_NAME,
+    }).get("buckets", [])
+    bucket = next((item for item in buckets if item.get("bucketName") == B2_BUCKET_NAME), None)
+    if not bucket:
+        raise RuntimeError(f"Backblaze B2 bucket not found: {B2_BUCKET_NAME}")
+    return bucket
+
+
+def _b2_get_upload_url(auth: dict, bucket_id: str) -> dict:
+    return _b2_json_request(auth["apiUrl"], auth["authorizationToken"], "b2_get_upload_url", {"bucketId": bucket_id})
+
+
+def _b2_upload_file(path: Path, upload_info: dict, remote_name: str, checksum: str) -> dict:
+    data = path.read_bytes()
+    request = urllib.request.Request(upload_info["uploadUrl"], data=data, method="POST")
+    request.add_header("Authorization", upload_info["authorizationToken"])
+    request.add_header("X-Bz-File-Name", urllib.parse.quote(remote_name, safe="/"))
+    request.add_header("Content-Type", "application/zip")
+    request.add_header("Content-Length", str(len(data)))
+    request.add_header("X-Bz-Content-Sha1", checksum)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Backblaze B2 file upload failed: {exc}") from exc
+
+
+async def _upload_backup_to_b2(backup_file: str, reason: str = "manual", queue_id: Optional[str] = None) -> dict:
+    path = Path(backup_file).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        raise RuntimeError(f"Backup package not found: {path}")
+    if path.stat().st_size <= 0:
+        raise RuntimeError(f"Backup package is empty: {path}")
+    checksum = _file_sha256(path)
+    auth = await asyncio.get_running_loop().run_in_executor(None, _b2_authorize)
+    bucket = await asyncio.get_running_loop().run_in_executor(None, lambda: _b2_find_bucket(auth))
+    upload_info = await asyncio.get_running_loop().run_in_executor(None, lambda: _b2_get_upload_url(auth, bucket["bucketId"]))
+    stamp = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    safe_reason = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(reason or "backup")).strip("-") or "backup"
+    remote_name = f"{B2_BACKUP_PREFIX}/{stamp}/pharmacyos-{safe_reason}-{checksum[:16]}.zip"
+    uploaded = await asyncio.get_running_loop().run_in_executor(None, lambda: _b2_upload_file(path, upload_info, remote_name, checksum))
+    now = datetime.now(timezone.utc).isoformat()
+    await raw_db.backup_status.update_one({"id": "b2"}, {"$set": {
+        "id": "b2", "status": "uploaded", "connection_status": "connected",
+        "last_successful_b2_backup": now, "last_backup_file": str(path),
+        "last_sha256": checksum, "remote_name": remote_name, "bucket": B2_BUCKET_NAME,
+        "file_id": uploaded.get("fileId"),
+    }}, upsert=True)
+    return {"ok": True, "status": "uploaded", "remote_name": remote_name, "file_id": uploaded.get("fileId"), "sha256": checksum, "size": path.stat().st_size}
 
 
 async def _purge_legacy_google_drive_queue() -> int:
@@ -11616,7 +11676,27 @@ async def _purge_legacy_google_drive_queue() -> int:
     return int(getattr(result, "deleted_count", 0) or 0)
 
 
+async def _migrate_legacy_atlas_backup_queue() -> int:
+    """Move old Atlas-backup queue entries to B2 without losing queued backup files."""
+    rows = await raw_db[SYNC_QUEUE_COLLECTION].find({"status": "pending", "destination": "atlas"}, {"_id": 0}).to_list(100)
+    migrated = 0
+    for row in rows:
+        source = Path(str(row.get("backup_file") or "")).expanduser().resolve()
+        package = source.with_suffix(".zip") if source.suffix.lower() == ".json" else source
+        package_exists = package.exists() and package.is_file()
+        fields = {"destination": "b2", "type": "b2_backup", "migrated_from": "atlas"}
+        if package_exists:
+            fields.update({"backup_file": str(package), "backup_sha256": _file_sha256(package)})
+        else:
+            fields["last_error"] = "Legacy Atlas queue entry has no local backup package; create a new backup to replace it."
+        await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row.get("id")}, {"$set": fields})
+        migrated += 1
+    return migrated
+
+
 async def _process_pending_backup_queue(destination: Optional[str] = None) -> dict:
+    if destination in (None, "b2"):
+        await _migrate_legacy_atlas_backup_queue()
     query: Dict[str, Any] = {"status": "pending"}
     if destination:
         query["destination"] = destination
@@ -11626,15 +11706,19 @@ async def _process_pending_backup_queue(destination: Optional[str] = None) -> di
         result["attempted"] += 1
         dest = row.get("destination") or ("atlas" if row.get("type") == "cloud_backup" else row.get("type", "").replace("_backup", ""))
         try:
-            if dest == "atlas":
-                upload = await _upload_backup_to_atlas(row["backup_file"], row.get("reason", "queued"), row.get("id"))
+            if dest == "b2":
+                upload = await _upload_backup_to_b2(row["backup_file"], row.get("reason", "queued"), row.get("id"))
+            elif dest == "atlas":
+                # Legacy Atlas backup queue entries are intentionally left pending rather than
+                # writing backup snapshots into MongoDB. New backups always use B2.
+                continue
             else:
                 continue
             await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row["id"]}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat(), "result": upload}, "$inc": {"attempts": 1}})
             result["succeeded"] += 1
         except Exception as exc:
             await raw_db[SYNC_QUEUE_COLLECTION].update_one({"id": row["id"]}, {"$set": _mark_queue_failed_fields(exc), "$inc": {"attempts": 1}})
-            if dest == "atlas":
+            if dest in {"atlas", "b2"}:
                 await raw_db.backup_status.update_one(
                     {"id": dest},
                     {"$set": {
@@ -11655,13 +11739,14 @@ async def _create_and_sync_backup(reason: str) -> dict:
     backup = await _create_local_backup(reason)
     if LOCAL_MODE and _local_request_busy():
         logger.info("LOCAL_MODE backup %s queued; cloud sync deferred while system is busy", reason)
-        return {**backup, "atlas_backup_status": "queued_busy", "sync": {"deferred": True, "reason": "busy"}}
+        return {**backup, "b2_backup_status": "queued_busy", "atlas_backup_status": "removed", "sync": {"deferred": True, "reason": "busy"}}
     async with _local_backup_sync_lock:
         if LOCAL_MODE and _local_request_busy():
             logger.info("LOCAL_MODE backup %s queued; cloud sync deferred while system became busy", reason)
-            return {**backup, "atlas_backup_status": "queued_busy", "sync": {"deferred": True, "reason": "busy"}}
+            return {**backup, "b2_backup_status": "queued_busy", "atlas_backup_status": "removed", "sync": {"deferred": True, "reason": "busy"}}
         sync = await _process_pending_backup_queue()
-    return {**backup, "atlas_backup_status": _destination_status(sync, "atlas"), "sync": sync}
+    return {**backup, "b2_backup_status": _destination_status(sync, "b2"),
+        "atlas_backup_status": "removed", "sync": sync}
 
 
 def _destination_status(sync: dict, destination: str) -> str:
@@ -11705,7 +11790,7 @@ async def _last_backup_metadata() -> Optional[dict]:
 
 
 async def _pending_backup_count(destination: Optional[str] = None) -> int:
-    query = {"status": "pending", "destination": "atlas"}
+    query = {"status": "pending", "destination": "b2"}
     if destination:
         query["destination"] = destination
     return await raw_db[SYNC_QUEUE_COLLECTION].count_documents(query)
@@ -11874,16 +11959,52 @@ def _local_sync_read_table(table_name: str) -> List[dict]:
 
 
 def _local_sync_document_key(document: dict) -> Tuple[dict, dict]:
+    """Return a stable cloud key and a JSON/BSON-safe document. Prefer the app's id.
+
+    Mongo's generated ObjectId must not become the synchronization identity because
+    SQLite and Mongo then disagree about whether a record is new.
+    """
     safe_doc = _json_safe_mongo_document(document)
-    if safe_doc.get("_id") is not None:
-        return {"_id": safe_doc["_id"]}, safe_doc
-    if safe_doc.get("id") is not None:
-        safe_doc.setdefault("_id", str(safe_doc["id"]))
-        return {"_id": safe_doc["_id"]}, safe_doc
+    if safe_doc.get("id") not in (None, ""):
+        stable_id = str(safe_doc["id"])
+        safe_doc["id"] = stable_id
+        return {"id": stable_id}, safe_doc
+    if safe_doc.get("_id") not in (None, ""):
+        stable_id = str(safe_doc["_id"])
+        safe_doc["_id"] = stable_id
+        return {"_id": stable_id}, safe_doc
     generated_id = hashlib.sha256(json.dumps(safe_doc, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    safe_doc["id"] = generated_id
     safe_doc["_id"] = generated_id
-    safe_doc.setdefault("id", generated_id)
-    return {"_id": generated_id}, safe_doc
+    return {"id": generated_id}, safe_doc
+
+
+def _local_sync_protected_cloud_doc(document: dict, local_tenant_ids: Set[str]) -> bool:
+    # Never remove deployment/system accounts or another tenant's records while
+    # reconciling the local shop's cloud copy.
+    if any(bool(document.get(marker)) for marker in SYSTEM_ACCOUNT_MARKERS):
+        return True
+    tenant_id = document.get("tenant_id")
+    if local_tenant_ids and tenant_id not in (None, "") and str(tenant_id) not in local_tenant_ids:
+        return True
+    return False
+
+
+async def _sync_one_local_document(cloud_collection, document: dict) -> None:
+    filter_doc, safe_doc = _local_sync_document_key(document)
+    if "id" in filter_doc:
+        # Do not attempt to replace an existing Mongo document's immutable _id.
+        # Updating by application id lets old ObjectId-backed records converge too.
+        update_doc = dict(safe_doc)
+        update_doc.pop("_id", None)
+        await cloud_collection.update_one(
+            filter_doc,
+            {"$set": update_doc, "$setOnInsert": {"_id": str(safe_doc["id"])}},
+            upsert=True,
+        )
+    else:
+        await cloud_collection.replace_one(filter_doc, safe_doc, upsert=True)
+
 
 
 async def _local_sync_pending_changes(last_sync_time: Optional[str]) -> int:
@@ -11913,57 +12034,116 @@ async def _local_sync_status_payload() -> dict:
 
 
 async def _push_local_sqlite_to_cloud() -> dict:
+    """Make MongoDB a cloud-access copy of the local SQLite shop data.
+
+    This is deliberately separate from B2 disaster backups. A successful sync
+    reconciles the selected local collections; a partial sync never performs
+    destructive cloud deletions, and the previous sync watermark is retained so
+    failed work remains pending.
+    """
     cloud_url, cloud_db_name = _local_to_cloud_mongo_config()
     started_at = datetime.now(timezone.utc).isoformat()
     cloud_client = AsyncIOMotorClient(cloud_url, serverSelectionTimeoutMS=8000)
     table_results: Dict[str, Any] = {}
     failed_tables: List[str] = []
     total_uploaded = 0
+    total_deleted = 0
+    previous_status = await raw_db.local_sync_status.find_one({"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID}, {"_id": 0})
+    previous_watermark = (previous_status or {}).get("last_sync_time")
     try:
         await cloud_client.admin.command("ping")
         cloud_db = cloud_client[cloud_db_name]
+
         for table_name in LOCAL_TO_CLOUD_SYNC_TABLES:
             if not _local_sync_table_exists(table_name):
-                logger.info("LOCAL_TO_CLOUD_SYNC table=%s skipped reason=local_table_missing", table_name)
-                table_results[table_name] = {"skipped": True, "reason": "local_table_missing", "records_scanned": 0, "records_uploaded": 0, "errors": []}
+                table_results[table_name] = {"skipped": True, "reason": "local_table_missing", "records_scanned": 0, "records_uploaded": 0, "records_deleted": 0, "errors": []}
                 continue
+
             docs = _local_sync_read_table(table_name)
             scanned = len(docs)
             uploaded = 0
+            deleted = 0
             errors: List[str] = []
+            local_keys: Set[str] = set()
+            local_tenant_ids: Set[str] = {str(d.get("tenant_id")) for d in docs if d.get("tenant_id") not in (None, "")}
             logger.info("LOCAL_TO_CLOUD_SYNC table=%s records_scanned=%s", table_name, scanned)
+
             for doc in docs:
                 try:
-                    filter_doc, replacement = _local_sync_document_key(doc)
-                    await cloud_db[table_name].replace_one(filter_doc, replacement, upsert=True)
+                    filter_doc, _ = _local_sync_document_key(doc)
+                    key_value = filter_doc.get("id", filter_doc.get("_id"))
+                    local_keys.add(str(key_value))
+                    await _sync_one_local_document(cloud_db[table_name], doc)
                     uploaded += 1
                 except Exception as exc:
-                    errors.append(str(exc))
+                    errors.append(_safe_backup_error(exc))
                     logger.exception("LOCAL_TO_CLOUD_SYNC table=%s record upload failed", table_name)
+
+            # Only reconcile deletions after every local record in the table has
+            # uploaded successfully. This prevents a transient error from deleting
+            # valid cloud data.
+            if not errors:
+                try:
+                    cloud_docs = await cloud_db[table_name].find({}, {"_id": 1, "id": 1, "tenant_id": 1, "is_demo": 1, "system_seeded": 1, "is_system_seeded": 1, "protected": 1, "is_protected": 1, "is_default": 1, "default_account": 1}).to_list(500000)
+                    for cloud_doc in cloud_docs:
+                        if _local_sync_protected_cloud_doc(cloud_doc, local_tenant_ids):
+                            continue
+                        cloud_key = cloud_doc.get("id")
+                        if cloud_key in (None, ""):
+                            cloud_key = cloud_doc.get("_id")
+                        if cloud_key is None or str(cloud_key) not in local_keys:
+                            if cloud_doc.get("_id") is not None:
+                                await cloud_db[table_name].delete_one({"_id": cloud_doc["_id"]})
+                                deleted += 1
+                except Exception as exc:
+                    errors.append(_safe_backup_error(exc))
+                    logger.exception("LOCAL_TO_CLOUD_SYNC table=%s deletion reconciliation failed", table_name)
+
             if errors:
                 failed_tables.append(table_name)
             total_uploaded += uploaded
-            table_results[table_name] = {"skipped": False, "records_scanned": scanned, "records_uploaded": uploaded, "errors": errors}
-            logger.info("LOCAL_TO_CLOUD_SYNC table=%s records_scanned=%s records_uploaded=%s errors=%s", table_name, scanned, uploaded, len(errors))
+            total_deleted += deleted
+            table_results[table_name] = {
+                "skipped": False, "records_scanned": scanned,
+                "records_uploaded": uploaded, "records_deleted": deleted, "errors": errors,
+            }
+            logger.info("LOCAL_TO_CLOUD_SYNC table=%s scanned=%s uploaded=%s deleted=%s errors=%s", table_name, scanned, uploaded, deleted, len(errors))
+
         finished_at = datetime.now(timezone.utc).isoformat()
         status_value = "success" if not failed_tables else "partial_failure"
+        # On partial failure keep the old watermark. That way pending_changes does
+        # not falsely report failed records as already synchronized.
+        watermark = finished_at if not failed_tables else previous_watermark
+        status_fields = {
+            "id": LOCAL_TO_CLOUD_SYNC_STATUS_ID,
+            "last_sync_time": watermark,
+            "last_attempt_at": finished_at,
+            "last_sync_status": status_value,
+            "records_synced": total_uploaded,
+            "records_deleted": total_deleted,
+            "failed_tables": failed_tables,
+            "started_at": started_at,
+            "database": cloud_db_name,
+            "tables": table_results,
+        }
+        if failed_tables:
+            status_fields["last_error"] = "One or more collections or records failed; retry is required."
         await raw_db.local_sync_status.update_one(
             {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID},
-            {"$set": {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID, "last_sync_time": finished_at, "last_sync_status": status_value, "records_synced": total_uploaded, "failed_tables": failed_tables, "started_at": started_at, "database": cloud_db_name, "tables": table_results}},
+            {"$set": status_fields},
             upsert=True,
         )
         return {**await _local_sync_status_payload(), "ok": not failed_tables, "database": cloud_db_name, "tables": table_results}
     except HTTPException:
         raise
     except Exception as exc:
-        failed_tables = LOCAL_TO_CLOUD_SYNC_TABLES
         logger.exception("LOCAL_TO_CLOUD_SYNC failed before table sync")
         await raw_db.local_sync_status.update_one(
             {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID},
-            {"$set": {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID, "last_sync_time": started_at, "last_sync_status": "failed", "records_synced": 0, "failed_tables": failed_tables, "last_error": str(exc)}},
+            {"$set": {"id": LOCAL_TO_CLOUD_SYNC_STATUS_ID, "last_sync_status": "failed", "last_attempt_at": datetime.now(timezone.utc).isoformat(), "failed_tables": LOCAL_TO_CLOUD_SYNC_TABLES, "last_error": _safe_backup_error(exc)}},
             upsert=True,
         )
-        raise HTTPException(status_code=502, detail=f"Local-to-cloud sync failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Local-to-cloud sync failed: {_safe_backup_error(exc)}") from exc
     finally:
         cloud_client.close()
 
@@ -12021,19 +12201,26 @@ async def backup_run(user: dict = Depends(require_role("admin"))):
 @api_router.get("/backup/status")
 async def backup_health(user: dict = Depends(get_current_user)):
     last_local = await _last_backup_metadata()
-    atlas_status = await _last_destination_status("atlas")
+    b2_status = await _last_destination_status("b2")
     return {
         "runtime_mode": RUNTIME_MODE,
         "local_backend_running": True,
         "local_database_connected": await _database_connected(),
         "local_database_path": str(LOCAL_DB_PATH) if LOCAL_MODE else None,
         "local_backup_status": "ok" if last_local else "never_run",
-        "atlas_backup_status": atlas_status.get("status", "pending"),
-        "atlas_configuration": "configured" if bool(ATLAS_BACKUP_MONGO_URL) else "not_configured",
-        "atlas_connection_status": atlas_status.get("connection_status", "not_tested"),
+        "b2_backup_status": b2_status.get("status", "not_configured"),
+        "b2_configuration": "configured" if bool(B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY and B2_BUCKET_NAME) else "not_configured",
+        "b2_connection_status": b2_status.get("connection_status", "not_tested"),
+        # Compatibility fields keep older Settings/backup UI code working while
+        # the actual backup destination is now B2.
+        "atlas_backup_status": b2_status.get("status", "not_configured"),
+        "atlas_configuration": "replaced_by_backblaze_b2",
+        "atlas_connection_status": b2_status.get("connection_status", "not_tested"),
         "last_local_backup_at": (last_local or {}).get("created_at"),
-        "last_atlas_backup_at": atlas_status.get("last_successful_atlas_backup"),
-        "pending_atlas_sync_count": await _pending_backup_count("atlas"),
+        "last_b2_backup_at": b2_status.get("last_successful_b2_backup"),
+        "last_atlas_backup_at": b2_status.get("last_successful_b2_backup"),
+        "pending_b2_sync_count": await _pending_backup_count("b2"),
+        "pending_atlas_sync_count": await _pending_backup_count("b2"),
         "last_backup": last_local,
         "pending_backup_count": await _pending_backup_count(),
         "cloud_sync_status": "online" if await _internet_available() else "queued_offline",
