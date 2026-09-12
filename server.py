@@ -127,6 +127,13 @@ B2_APPLICATION_KEY_ID = os.environ.get("B2_APPLICATION_KEY_ID", "").strip()
 B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "").strip()
 B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "pharmacyos-backups").strip()
 B2_BACKUP_PREFIX = os.environ.get("B2_BACKUP_PREFIX", "pharmacyos/backups").strip("/")
+_B2_RUNTIME_CACHE = {
+    "auth": None,
+    "bucket": None,
+    "upload_info": None,
+    "cached_at": 0.0,
+}
+_B2_RUNTIME_CACHE_LOCK = threading.Lock()
 # Kept only so old deployments do not crash while transitioning away from Atlas backup storage.
 ATLAS_BACKUP_MONGO_URL = os.environ.get("ATLAS_BACKUP_MONGO_URL", "")
 ATLAS_BACKUP_DB_NAME = os.environ.get("ATLAS_BACKUP_DB_NAME", os.environ.get("DB_NAME", "pharmacyos_local_backups"))
@@ -2255,7 +2262,7 @@ async def _seed_demo_data(now_iso: str) -> None:
         "expenses": [{"id": "demo-expense-1", "category": "Utilities", "amount": 25, "description": "Demo electricity bill", "created_at": now_iso}],
         "daily_summary": [{"id": "demo-summary-1", "date": datetime.now(timezone.utc).date().isoformat(), "total_sales": 10, "cash": 10, "upi": 0, "pending": 0, "expenses": 25, "created_at": now_iso}],
         "daily_sales": [{"id": "demo-sale-1", "medicine_id": "demo-med-1", "medicine_name": "Paracetamol 500mg", "quantity": 5, "unit_type": "unit", "total_amount": 10, "customer_name": "Demo Customer", "payment_status": "paid", "sale_date": datetime.now(timezone.utc).date().isoformat(), "created_at": now_iso}],
-        "settings": [{"id": "demo-settings-main", "key": "main", "business_name": "Demo Pharmacy", "business_address": "Demo shop — isolated sample data", "business_phone": "555-0100", "business_gstin": "", "signature_b64": ""}],
+        "settings": [{"id": "demo-settings-main", "key": "main", "business_name": "Demo Pharmacy", "business_address": "Demo shop - isolated sample data", "business_phone": "555-0100", "business_gstin": "", "signature_b64": ""}],
     }
     for collection_name, documents in demo_documents.items():
         collection = raw_db[collection_name]
@@ -11626,6 +11633,31 @@ def _b2_find_bucket(auth: dict) -> dict:
 def _b2_get_upload_url(auth: dict, bucket_id: str) -> dict:
     return _b2_json_request(auth["apiUrl"], auth["authorizationToken"], "b2_get_upload_url", {"bucketId": bucket_id})
 
+def _b2_get_cached_upload_info() -> dict:
+    now = time.time()
+
+    with _B2_RUNTIME_CACHE_LOCK:
+        cached = _B2_RUNTIME_CACHE
+
+        if (
+            cached.get("auth")
+            and cached.get("bucket")
+            and cached.get("upload_info")
+            and now - cached.get("cached_at", 0.0) < 23 * 60 * 60
+        ):
+            return cached["upload_info"]
+
+        auth = _b2_authorize()
+        bucket = _b2_find_bucket(auth)
+        upload_info = _b2_get_upload_url(auth, bucket["bucketId"])
+
+        cached["auth"] = auth
+        cached["bucket"] = bucket
+        cached["upload_info"] = upload_info
+        cached["cached_at"] = now
+
+        return upload_info
+
 
 def _b2_upload_file(path: Path, upload_info: dict, remote_name: str, checksum: str) -> dict:
     data = path.read_bytes()
@@ -11649,9 +11681,9 @@ async def _upload_backup_to_b2(backup_file: str, reason: str = "manual", queue_i
     if path.stat().st_size <= 0:
         raise RuntimeError(f"Backup package is empty: {path}")
     checksum = hashlib.sha1(path.read_bytes()).hexdigest()
-    auth = await asyncio.get_running_loop().run_in_executor(None, _b2_authorize)
-    bucket = await asyncio.get_running_loop().run_in_executor(None, lambda: _b2_find_bucket(auth))
-    upload_info = await asyncio.get_running_loop().run_in_executor(None, lambda: _b2_get_upload_url(auth, bucket["bucketId"]))
+    upload_info = await asyncio.get_running_loop().run_in_executor(
+        None, _b2_get_cached_upload_info
+    )
     stamp = datetime.now(timezone.utc).strftime("%Y/%m/%d")
     safe_reason = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(reason or "backup")).strip("-") or "backup"
     remote_name = f"{B2_BACKUP_PREFIX}/{stamp}/pharmacyos-{safe_reason}-{checksum[:16]}.zip"
