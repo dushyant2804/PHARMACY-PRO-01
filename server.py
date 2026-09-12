@@ -307,11 +307,11 @@ if LOCAL_MODE:
         raise RuntimeError(f"LOCAL_MODE database could not be opened at {LOCAL_DB_PATH}: {exc}") from exc
     _record_startup_timing("Connect SQLite", time.perf_counter() - _db_init_started, path=LOCAL_DB_PATH)
 else:
-    mongo_url = os.environ['MONGO_URL']
+    mongo_url = os.getenv("MONGO_URL",                  "mongodb://127.0.0.1:27017/pharmacy")
     _db_init_started = time.perf_counter()
     client = AsyncIOMotorClient(mongo_url)
-    raw_db = client[os.environ['DB_NAME']]
-    _record_startup_timing("Create Mongo client", time.perf_counter() - _db_init_started, database=os.environ['DB_NAME'])
+    raw_db = client[os.getenv("DB_NAME", "pharmacy")]
+    _record_startup_timing("Create Mongo client", time.perf_counter() - _db_init_started, database=os.getenv("DB_NAME", "pharmacy"))
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", ROOT_DIR / "uploads")).resolve()
 BRANDING_UPLOAD_DIR = UPLOAD_DIR / "branding"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1382,7 +1382,7 @@ class Medicine(BaseModel):
     mrp: float  # per unit
     pack_size: str = ""
 
-    # 🔥 BASE STOCK (ONLY INITIAL PURCHASE)
+    # ?? BASE STOCK (ONLY INITIAL PURCHASE)
     purchased_units: float= 0
 
     category: str = "OTC"
@@ -1405,7 +1405,7 @@ class MedicineCreate(BaseModel):
     mrp: float
     pack_size: str = ""
 
-    # 🔥 INITIAL STOCK ENTRY ONLY (purchase time)
+    # ?? INITIAL STOCK ENTRY ONLY (purchase time)
     purchased_units: float= 0
 
     category: str = "OTC"
@@ -2255,7 +2255,7 @@ async def _seed_demo_data(now_iso: str) -> None:
         "expenses": [{"id": "demo-expense-1", "category": "Utilities", "amount": 25, "description": "Demo electricity bill", "created_at": now_iso}],
         "daily_summary": [{"id": "demo-summary-1", "date": datetime.now(timezone.utc).date().isoformat(), "total_sales": 10, "cash": 10, "upi": 0, "pending": 0, "expenses": 25, "created_at": now_iso}],
         "daily_sales": [{"id": "demo-sale-1", "medicine_id": "demo-med-1", "medicine_name": "Paracetamol 500mg", "quantity": 5, "unit_type": "unit", "total_amount": 10, "customer_name": "Demo Customer", "payment_status": "paid", "sale_date": datetime.now(timezone.utc).date().isoformat(), "created_at": now_iso}],
-        "settings": [{"id": "demo-settings-main", "key": "main", "business_name": "Demo Pharmacy", "business_address": "Demo shop — isolated sample data", "business_phone": "555-0100", "business_gstin": "", "signature_b64": ""}],
+        "settings": [{"id": "demo-settings-main", "key": "main", "business_name": "Demo Pharmacy", "business_address": "Demo shop � isolated sample data", "business_phone": "555-0100", "business_gstin": "", "signature_b64": ""}],
     }
     for collection_name, documents in demo_documents.items():
         collection = raw_db[collection_name]
@@ -12441,7 +12441,7 @@ class POCreate(BaseModel):
     distributor_name: str
     invoice_ref: str
 
-    po_date: Optional[str] = None   # 👈 ADD THIS
+    po_date: Optional[str] = None   # ?? ADD THIS
 
     items: List[POItem]
 
