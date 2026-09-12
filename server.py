@@ -11648,7 +11648,7 @@ async def _upload_backup_to_b2(backup_file: str, reason: str = "manual", queue_i
         raise RuntimeError(f"Backup package not found: {path}")
     if path.stat().st_size <= 0:
         raise RuntimeError(f"Backup package is empty: {path}")
-    checksum = _file_sha256(path)
+    checksum = hashlib.sha1(path.read_bytes()).hexdigest()
     auth = await asyncio.get_running_loop().run_in_executor(None, _b2_authorize)
     bucket = await asyncio.get_running_loop().run_in_executor(None, lambda: _b2_find_bucket(auth))
     upload_info = await asyncio.get_running_loop().run_in_executor(None, lambda: _b2_get_upload_url(auth, bucket["bucketId"]))
