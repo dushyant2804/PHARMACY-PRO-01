@@ -435,5 +435,8 @@ def _apply_update(doc, update):
     for k, v in update.get("$setOnInsert", {}).items(): doc.setdefault(k, v)
     for k, v in update.get("$inc", {}).items(): doc[k] = (doc.get(k) or 0) + v
     for k, v in update.get("$max", {}).items(): doc[k] = max(doc.get(k, v), v)
-    for k, v in update.get("$push", {}).items(): doc.setdefault(k, []).append(v)
+    for k, v in update.get("$push", {}).items():
+        if not isinstance(doc.get(k), list):
+            doc[k] = []
+        doc[k].append(v)
     for k in update.get("$unset", {}): doc.pop(k, None)
