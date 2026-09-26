@@ -28,6 +28,7 @@ ORDER_STATUSES = {
 TERMINAL_STATUSES = {"COMPLETED", "REJECTED", "CANCELLED"}
 ALLOWED_PRESCRIPTION_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 MAX_PRESCRIPTION_BYTES = 10 * 1024 * 1024
+ALLOWED_PAYMENT_METHODS = {"cash", "upi"}
 _SEQUENCE_LOCK = asyncio.Lock()
 
 
@@ -140,6 +141,12 @@ def make_whatsapp_url(phone_number: str, order: Dict[str, Any]) -> str:
         lines.extend(["", "Prescription: Uploaded on website"])
     if order.get("medicine_request"):
         lines.extend(["", "Medicine availability request:", str(order["medicine_request"])])
+    payment_method = str(order.get("payment_method") or "cash").upper()
+    lines.extend(["", f"Preferred payment: {payment_method}"])
+    if payment_method == "UPI":
+        lines.append("Please send the confirmed UPI payment details/amount here after checking the order.")
+    else:
+        lines.append("Customer prefers cash payment.")
     lines.extend(["", "Please check availability and confirm the order."])
     return f"https://wa.me/{phone}?text={quote(chr(10).join(lines))}"
 
@@ -153,6 +160,8 @@ def _customer_order_response(order: Dict[str, Any]) -> Dict[str, Any]:
         "items": order.get("items") or [],
         "prescription": order.get("prescription"),
         "medicine_request": order.get("medicine_request"),
+        "payment_method": order.get("payment_method") or "cash",
+        "payment_status": order.get("payment_status") or "PENDING",
         "customer_note": order.get("customer_note") or "",
         "created_at": order.get("created_at"),
         "updated_at": order.get("updated_at"),
@@ -244,6 +253,9 @@ def build_online_store_router(raw_db, *, tenant_id: str, whatsapp_number: str,
         items = normalize_order_items(payload.get("items") or [])
         prescription = payload.get("prescription")
         medicine_request = str(payload.get("medicine_request") or "").strip()
+        payment_method = str(payload.get("payment_method") or "cash").strip().lower()
+        if payment_method not in ALLOWED_PAYMENT_METHODS:
+            raise HTTPException(status_code=422, detail="Payment method must be cash or upi")
         if not items and not prescription and not medicine_request:
             raise HTTPException(status_code=422, detail="Add medicines, upload a prescription, or request a medicine")
 
@@ -283,6 +295,8 @@ def build_online_store_router(raw_db, *, tenant_id: str, whatsapp_number: str,
             },
             "items": checked_items, "prescription": prescription,
             "medicine_request": medicine_request or None,
+            "payment_method": payment_method,
+            "payment_status": "PENDING",
             "customer_note": str(payload.get("customer_note") or "").strip(),
             "created_at": _now(), "updated_at": _now(),
         }
