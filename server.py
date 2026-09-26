@@ -4718,69 +4718,262 @@ async def list_distributors(
     status: Optional[Literal["active", "inactive", "return_heavy"]] = None,
     user: dict = Depends(get_current_user),
 ):
-    distributors = await db.distributors.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
-    distributor_ids = [d.get("id") for d in distributors if d.get("id")]
-    transactions_by_distributor = defaultdict(list)
+    """
+    Distributor list with authoritative financial KPIs.
 
-    if distributor_ids:
-        transactions = await db.distributor_transactions.find(
-            {"distributor_id": {"$in": distributor_ids}},
-            {"_id": 0},
-        ).to_list(10000)
-        for txn in transactions:
-            transactions_by_distributor[txn.get("distributor_id")].append(txn)
+    IMPORTANT:
+    These numbers MUST come from the same canonical distributor-ledger
+    pipeline used by GET /ledger/distributor/{did}.
 
+    Do not use _current_distributor_balance() here.
+    Do not calculate distributor KPIs from the raw distributor document.
+    """
+
+    # ---------------------------------------------------------------
+    # 1. Load distributors
+    # ---------------------------------------------------------------
+    distributors = await db.distributors.find(
+        {},
+        {"_id": 0},
+    ).sort("name", 1).to_list(1000)
+
+    # ---------------------------------------------------------------
+    # 2. Load ledger transactions once
+    # ---------------------------------------------------------------
+    all_distributor_transactions = await db.distributor_transactions.find(
+        {},
+        {"_id": 0},
+    ).to_list(10000)
+
+    # ---------------------------------------------------------------
+    # 3. Load purchase orders once
+    # ---------------------------------------------------------------
+    all_purchase_orders = await db.purchase_orders.find(
+        {},
+        {"_id": 0},
+    ).to_list(10000)
+
+    # ---------------------------------------------------------------
+    # 4. Build every distributor's financial data from the
+    #    canonical ledger pipeline.
+    # ---------------------------------------------------------------
     for distributor in distributors:
-        opening_balance_date = _distributor_opening_balance_date(distributor)
+
+        distributor_id = str(
+            distributor.get("id") or ""
+        ).strip()
+
+        # -----------------------------------------------------------
+        # Invalid/legacy distributor without an ID
+        # -----------------------------------------------------------
+        if not distributor_id:
+            distributor["current_balance"] = 0.0
+            distributor["outstanding_balance"] = 0.0
+            distributor["total_payable"] = 0.0
+            distributor["total_receivable_from_distributors"] = 0.0
+            distributor["net_distributor_balance"] = 0.0
+            distributor["total_purchases"] = 0.0
+            distributor["actual_payments"] = 0.0
+            distributor["total_paid"] = 0.0
+            distributor["total_paid_adjusted"] = 0.0
+            distributor["last_purchase_date"] = None
+            distributor["distributor_status"] = (
+                distributor.get("distributor_status") or "active"
+            )
+            continue
+
+        # -----------------------------------------------------------
+        # Opening balance metadata
+        # -----------------------------------------------------------
+        opening_balance_date = _distributor_opening_balance_date(
+            distributor
+        )
+
         if opening_balance_date:
             distributor["opening_balance_date"] = opening_balance_date
 
-        distributor_transactions = _distributor_opening_balance_deduped_transactions(
-            distributor,
-            transactions_by_distributor.get(distributor.get("id"), []),
+        # -----------------------------------------------------------
+        # CANONICAL LEDGER
+        #
+        # This is the important part.
+        #
+        # It uses:
+        #   - existing distributor_transactions
+        #   - Purchase Orders
+        #   - PO matching
+        #   - legacy transaction matching
+        #   - synthetic PO rows where required
+        #   - duplicate purchase-invoice protection
+        #   - distributor identity matching
+        # -----------------------------------------------------------
+        canonical_txns = (
+            await _canonical_distributor_ledger_transactions(
+                distributor=distributor,
+                requested_id=distributor_id,
+                raw_transactions=all_distributor_transactions,
+                purchase_orders=all_purchase_orders,
+            )
         )
-        current_balance = _current_distributor_balance(distributor, distributor_transactions)
-        distributor["current_balance"] = current_balance
-        distributor["outstanding_balance"] = current_balance
-        distributor["total_payable"] = _round_ledger_money(max(current_balance, 0))
-        distributor["total_receivable_from_distributors"] = _round_ledger_money(abs(min(current_balance, 0)))
-        distributor["net_distributor_balance"] = current_balance
-        distributor["distributor_status"] = distributor.get("distributor_status") or "active"
-        purchases = [
-            txn for txn in distributor_transactions
-            if txn.get("type") in {"purchase", "sale", "opening_balance"}
-        ]
-        distributor["total_purchases"] = _round_ledger_money(
-            sum(_safe_float(txn.get("amount")) for txn in purchases)
-        )
-        actual_payments = _round_ledger_money(sum(
-            _safe_float(txn.get("amount"))
-            for txn in distributor_transactions
-            if txn.get("type") == "payment"
-        ))
-        # Reconcile paid/adjusted to the payable side only. Credits beyond the
-        # distributor's purchases are receivables, not additional payments.
-        paid_adjusted = _round_ledger_money(distributor["total_purchases"] - distributor["total_payable"])
-        distributor["actual_payments"] = actual_payments
-        distributor["total_paid"] = paid_adjusted
-        distributor["total_paid_adjusted"] = paid_adjusted
-        purchase_dates = [
-            _distributor_transaction_date(txn).isoformat()
-            for txn in purchases
-            if _distributor_transaction_date(txn)
-        ]
-        distributor["last_purchase_date"] = max(purchase_dates, default=None)
 
+        # -----------------------------------------------------------
+        # Final authoritative deduplication.
+        # -----------------------------------------------------------
+        ledger_txns = _final_distributor_ledger_rows(
+            canonical_txns,
+            distributor_id,
+        )
+
+        # -----------------------------------------------------------
+        # Calculate financial values from the SAME rows that the
+        # individual distributor ledger uses.
+        # -----------------------------------------------------------
+        balance = 0.0
+        total_purchases = 0.0
+        total_paid = 0.0
+        total_adjustments = 0.0
+        purchase_dates = []
+
+        for txn in ledger_txns:
+
+            if not isinstance(txn, dict):
+                continue
+
+            # -------------------------------------------------------
+            # Authoritative balance calculation
+            # -------------------------------------------------------
+            balance, bucket = _apply_distributor_transaction(
+                balance,
+                txn,
+            )
+
+            txn_amount = _safe_float(
+                txn.get("amount", 0)
+            )
+
+            # -------------------------------------------------------
+            # Same bucket rules as the individual ledger
+            # -------------------------------------------------------
+            if bucket == "purchase":
+
+                total_purchases += txn_amount
+
+                txn_date = _distributor_transaction_date(txn)
+
+                if txn_date:
+                    purchase_dates.append(txn_date)
+
+            elif bucket == "adjustment":
+
+                total_adjustments += txn_amount
+
+            else:
+
+                # Payment-side activity
+                total_paid += txn_amount
+
+        # -----------------------------------------------------------
+        # Normalize money
+        # -----------------------------------------------------------
+        balance = _round_ledger_money(balance)
+        total_purchases = _round_ledger_money(total_purchases)
+        total_paid = _round_ledger_money(total_paid)
+        total_adjustments = _round_ledger_money(total_adjustments)
+
+        # -----------------------------------------------------------
+        # Balance interpretation
+        #
+        # Positive = pharmacy owes distributor
+        # Negative = distributor owes pharmacy
+        # -----------------------------------------------------------
+        total_payable = _round_ledger_money(
+            max(balance, 0)
+        )
+
+        total_receivable = _round_ledger_money(
+            abs(min(balance, 0))
+        )
+
+        # -----------------------------------------------------------
+        # Paid/Adjusted
+        #
+        # Keep compatibility with the existing Distributor UI.
+        # -----------------------------------------------------------
+        paid_adjusted = _round_ledger_money(
+            max(total_purchases - total_payable, 0)
+        )
+
+        # -----------------------------------------------------------
+        # Write authoritative values into API response
+        # -----------------------------------------------------------
+        distributor["current_balance"] = balance
+        distributor["outstanding_balance"] = balance
+
+        distributor["total_payable"] = total_payable
+
+        distributor["total_receivable_from_distributors"] = (
+            total_receivable
+        )
+
+        distributor["net_distributor_balance"] = balance
+
+        distributor["total_purchases"] = total_purchases
+
+        distributor["actual_payments"] = total_paid
+
+        distributor["total_paid"] = paid_adjusted
+
+        distributor["total_paid_adjusted"] = paid_adjusted
+
+        distributor["distributor_status"] = (
+            distributor.get("distributor_status") or "active"
+        )
+
+        # -----------------------------------------------------------
+        # Last purchase date
+        # -----------------------------------------------------------
+        if purchase_dates:
+            last_purchase_date = max(purchase_dates)
+
+            distributor["last_purchase_date"] = (
+                last_purchase_date.isoformat()
+                if hasattr(last_purchase_date, "isoformat")
+                else str(last_purchase_date)
+            )
+        else:
+            distributor["last_purchase_date"] = None
+
+    # ---------------------------------------------------------------
+    # Search
+    # ---------------------------------------------------------------
     if search:
         needle = search.strip().lower()
-        distributors = [
-            distributor for distributor in distributors
-            if any(needle in str(distributor.get(field, "")).lower() for field in ("name", "phone", "gstin"))
-        ]
-    if status:
-        distributors = [d for d in distributors if d["distributor_status"] == status]
-    return distributors
 
+        distributors = [
+            distributor
+            for distributor in distributors
+            if any(
+                needle in str(
+                    distributor.get(field, "")
+                ).lower()
+                for field in (
+                    "name",
+                    "phone",
+                    "gstin",
+                )
+            )
+        ]
+
+    # ---------------------------------------------------------------
+    # Status filter
+    # ---------------------------------------------------------------
+    if status:
+        distributors = [
+            distributor
+            for distributor in distributors
+            if distributor.get("distributor_status") == status
+        ]
+
+    return distributors
 
 @api_router.post("/distributors")
 async def create_distributor(d: Distributor, user: dict = Depends(require_role("admin", "pharmacist"))):
