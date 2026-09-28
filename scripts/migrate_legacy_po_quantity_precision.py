@@ -34,7 +34,7 @@ if str(ROOT_DIR) not in sys.path:
 os.environ["PHARMACYOS_MODE"] = "LOCAL_MODE"
 os.environ.setdefault(
     "LOCAL_DB_PATH",
-    str(ROOT_DIR / "local_data" / "pharmacyos.sqlite3"),
+    str(ROOT_DIR.parent / "local_data" / "pharmacyos.sqlite3"),
 )
 
 from server import (  # noqa: E402
@@ -264,7 +264,7 @@ async def main():
         await db.purchase_orders.update_one(
             {"id": row["po_id"]},
             {"$set": {
-                "items": payload.model_dump()["items"],
+                "items": corrected["items"],
                 "sub_total": totals["sub_total"],
                 "scheme_discount": totals["scheme_discount"],
                 "cash_discount": totals["cash_discount"],
