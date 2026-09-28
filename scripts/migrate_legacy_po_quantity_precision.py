@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
@@ -27,6 +28,9 @@ from types import SimpleNamespace
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 os.environ["PHARMACYOS_MODE"] = "LOCAL_MODE"
 os.environ.setdefault(
     "LOCAL_DB_PATH",
