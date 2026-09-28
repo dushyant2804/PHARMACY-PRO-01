@@ -185,6 +185,63 @@ class PurchaseOrderCreatePerformanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(med["available_stock"], 8)
         self.assertEqual(med["quantity_units"], 8)
 
+    async def test_rebuild_merges_same_lot_when_legacy_medicine_ids_differ(self):
+        medicines = Collection([])
+        purchase_orders = Collection([
+            {
+                "id": "po-free",
+                "distributor_id": "dist-1",
+                "distributor_name": "R K PHARMA",
+                "items": [{
+                    "medicine_id": "legacy-id",
+                    "medicine_key": "tusq x+ syp 100 ml::dist-1::ZAEB2550",
+                    "name": "TUSQ X+ SYP 100 ML",
+                    "batch_no": "ZAEB2550",
+                    "expiry_date": "09/27",
+                    "pack_size": "1*1",
+                    "quantity": 4,
+                    "free_quantity": 1,
+                    "purchase_price": 78.59,
+                    "mrp": 103.12,
+                    "gst_rate": 5,
+                }],
+            },
+            {
+                "id": "po-paid",
+                "distributor_id": "dist-1",
+                "distributor_name": "R K PHARMA",
+                "items": [{
+                    "medicine_id": "new-id",
+                    "medicine_key": "tusq x+ syp 100 ml::dist-1::ZAEB2550",
+                    "name": "TUSQ X+ SYP 100 ML",
+                    "batch_no": "ZAEB2550",
+                    "expiry_date": "09/27",
+                    "pack_size": "1*1",
+                    "quantity": 1,
+                    "free_quantity": 0,
+                    "purchase_price": 78.59,
+                    "mrp": 103.12,
+                    "gst_rate": 5,
+                }],
+            },
+        ])
+        fake_db = SimpleNamespace(
+            medicines=medicines,
+            purchase_orders=purchase_orders,
+            invoices=Collection([]),
+            purchase_returns=Collection([]),
+        )
+
+        with patch("server.db", fake_db):
+            result = await rebuild_inventory()
+
+        self.assertEqual(result["medicine_batches_rebuilt"], 1)
+        self.assertEqual(len(medicines.rows), 1)
+        med = medicines.rows[0]
+        self.assertEqual(med["purchase_quantity"], 5)
+        self.assertEqual(med["free_quantity"], 1)
+        self.assertEqual(med["purchased_units"], 6)
+
 class PurchaseOrderUpdateDeletePerformanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_update_po_rebuilds_inventory_from_purchase_orders_only(self):
         from server import POCreate, POItem, update_po
