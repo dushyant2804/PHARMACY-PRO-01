@@ -13291,6 +13291,14 @@ async def _apply_po_inventory_delta(po: dict, selected_returns: Optional[List[di
             "distributor_name": po.get("distributor_name") or item.get("distributor_name") or item.get("distributor") or (existing or {}).get("distributor_name") or (existing or {}).get("distributor"),
             "distributor": po.get("distributor") or po.get("distributor_name") or item.get("distributor") or item.get("distributor_name") or (existing or {}).get("distributor") or (existing or {}).get("distributor_name"),
             "purchased_units": purchased_units,
+            "purchase_quantity": round_qty(
+                _stock_quantity(existing or {}, "purchase_quantity", "purchased_quantity")
+                + round_qty(item.get("quantity", 0))
+            ),
+            "free_quantity": round_qty(
+                _stock_quantity(existing or {}, "free_quantity", "free_qty", "free_units")
+                + round_qty(item.get("free_quantity", 0))
+            ),
             "sold_units": _stock_quantity(existing or {}, "sold_units", "sold_quantity"),
             "purchase_return_units": purchase_return_units,
             "stock_adjustment_units": _stock_adjustment_stock(existing or {}),
@@ -13385,10 +13393,38 @@ async def _delete_inventory_rows_for_medicine_names(medicine_names: Iterable[str
 
 
 def _po_item_group_identity(po: dict, item: dict) -> tuple:
-    medicine_identity = str(item.get("medicine_id") or item.get("name") or "").strip().casefold()
-    distributor_identity = str(po.get("distributor_id") or item.get("distributor_id") or po.get("distributor_name") or po.get("distributor") or item.get("distributor_name") or item.get("distributor") or "").strip().casefold()
+    """Return one stable identity for the physical stock lot represented by a PO item.
+
+    Do not use medicine_id here. Older and newer PO records can legitimately carry
+    different medicine_id values for the same name/distributor/batch. If those
+    rows
+    are grouped separately, both can produce the same medicine_key and the later
+    row silently overwrites the earlier one, which can lose the paid/free scheme.
+    """
+    item_name = str(item.get("name") or item.get("medicine_name") or "").strip().casefold()
+    distributor_identity = str(
+        po.get("distributor_id")
+        or item.get("distributor_id")
+        or po.get("distributor_name")
+        or po.get("distributor")
+        or item.get("distributor_name")
+        or item.get("distributor")
+        or ""
+    ).strip().casefold()
     batch_identity = str(item.get("batch_no") or item.get("batch_number") or "").strip().upper()
-    return medicine_identity, distributor_identity, batch_identity
+    expiry_identity = str(item.get("expiry_date") or "").strip().upper()
+    pack_identity = str(item.get("pack_size") or "").strip().casefold()
+    purchase_price = item.get("purchase_price")
+    mrp = item.get("mrp")
+    return (
+        item_name,
+        distributor_identity,
+        batch_identity,
+        expiry_identity,
+        pack_identity,
+        str(purchase_price if purchase_price is not None else "").strip(),
+        str(mrp if mrp is not None else "").strip(),
+    )
 
 
 async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], updated_pos: Optional[Iterable[dict]] = None) -> dict:
@@ -16478,10 +16514,18 @@ async def _aggregate_po_inventory_by_medicine_key() -> Tuple[dict, list]:
                     "distributor_name": distributor_name or item.get("distributor_name") or item.get("distributor"),
                     "distributor": distributor_name or item.get("distributor") or item.get("distributor_name"),
                     "purchased_units": 0,
+                    "purchase_quantity": 0,
+                    "free_quantity": 0,
                     "sold_units": 0,
                     "purchase_return_units": 0,
                     "stock_adjustment_units": 0,
                 }
+            medicines[key]["purchase_quantity"] = round_qty(
+                medicines[key]["purchase_quantity"] + round_qty(item.get("quantity", 0))
+            )
+            medicines[key]["free_quantity"] = round_qty(
+                medicines[key]["free_quantity"] + round_qty(item.get("free_quantity", 0))
+            )
             medicines[key]["purchased_units"] = round_qty(medicines[key]["purchased_units"] + qty)
     return medicines, unmatched_purchase_orders_log
 
