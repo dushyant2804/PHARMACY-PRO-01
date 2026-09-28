@@ -3225,21 +3225,10 @@ async def list_medicines(
                 "_id": 0,
                 "distributor_id": 1,
                 "distributor_name": 1,
-                "items.name": 1,
-                "items.medicine_name": 1,
-                "items.batch_no": 1,
-                "items.batch_number": 1,
-                "items.batch": 1,
-                "items.medicine_key": 1,
-                "items.quantity": 1,
-                "items.purchase_quantity": 1,
-                "items.free_quantity": 1,
-                "items.free_qty": 1,
-                "items.free_units": 1,
-                "items.purchase_price": 1,
-                "items.mrp": 1,
-                "items.expiry_date": 1,
-                "items.pack_size": 1,
+                # Keep the full items array. The local SQLite Mongo-like adapter
+                # supports dotted projections for dictionaries but not for
+                # fields nested inside arrays such as items.free_quantity.
+                "items": 1,
             }
         ).to_list(10000)
 
