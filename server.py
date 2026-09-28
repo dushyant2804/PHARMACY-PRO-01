@@ -3238,6 +3238,7 @@ async def list_medicines(
         ).to_list(10000)
 
         purchase_order_lot_terms = {}
+        purchase_order_lot_terms_by_name_batch = {}
 
         for po in purchase_orders:
 
@@ -3294,6 +3295,22 @@ async def list_medicines(
                     )
                     terms["free_quantity"] = round_qty(
                         terms["free_quantity"] + round_qty(item.get("free_quantity", 0))
+                    )
+
+                po_name_batch_key = (
+                    str(item.get("name") or "").strip().casefold(),
+                    str(item.get("batch_no") or "").strip().casefold(),
+                )
+                if all(po_name_batch_key):
+                    name_batch_terms = purchase_order_lot_terms_by_name_batch.setdefault(
+                        po_name_batch_key,
+                        {"purchase_quantity": 0, "free_quantity": 0},
+                    )
+                    name_batch_terms["purchase_quantity"] = round_qty(
+                        name_batch_terms["purchase_quantity"] + round_qty(item.get("quantity", 0))
+                    )
+                    name_batch_terms["free_quantity"] = round_qty(
+                        name_batch_terms["free_quantity"] + round_qty(item.get("free_quantity", 0))
                     )
 
     distributor_ids = {
@@ -3519,6 +3536,12 @@ async def list_medicines(
         po_lot_terms = (
             purchase_order_lot_terms.get(m.get("medicine_key"))
             or purchase_order_lot_terms.get(normalized_key)
+            or purchase_order_lot_terms_by_name_batch.get(
+                (
+                    str(m.get("name") or "").strip().casefold(),
+                    str(m.get("batch_no") or "").strip().casefold(),
+                )
+            )
             or {}
         )
 
@@ -3649,8 +3672,22 @@ async def list_medicines(
 
             "actual_cost":
               round(
-                float(m.get("purchase_price") or 0)
-                * (1 + float(m.get("gst_rate") or 0) / 100),
+                (
+                    float(m.get("purchase_price") or 0)
+                    * (1 + float(m.get("gst_rate") or 0) / 100)
+                )
+                * (
+                    float(m.get("purchase_quantity", m.get("quantity", m.get("purchased_units", 0))) or 0)
+                    / (
+                        float(m.get("purchase_quantity", m.get("quantity", m.get("purchased_units", 0))) or 0)
+                        + float(m.get("free_quantity", m.get("free_qty", m.get("free_units", 0))) or 0)
+                    )
+                    if (
+                        float(m.get("purchase_quantity", m.get("quantity", m.get("purchased_units", 0))) or 0)
+                        + float(m.get("free_quantity", m.get("free_qty", m.get("free_units", 0))) or 0)
+                    ) > 0
+                    else 1
+                ),
                 2
               ),
 
