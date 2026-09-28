@@ -54,6 +54,11 @@ class Collection:
 
 
 class QuantityPrecisionTests(unittest.IsolatedAsyncioTestCase):
+    def test_purchase_quantities_preserve_two_decimal_precision(self):
+        self.assertEqual(round_qty(2.75), 2.75)
+        self.assertEqual(round_qty(0.25), 0.25)
+        self.assertEqual(round_qty(2.75 + 0.25), 3.0)
+
     def test_available_stock_rounds_floating_artifact_and_clamps_near_zero(self):
         self.assertEqual(_available_stock({"purchased_units": 7.0, "sold_units": 0.5000000003}), 6.5)
         self.assertEqual(round_qty(-0.00000001), 0.0)
