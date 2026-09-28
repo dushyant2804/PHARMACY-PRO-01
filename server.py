@@ -772,9 +772,9 @@ STANDARD_MEDICINE_CATEGORIES = {"OTC", "H", "H1", "X", "NRX", "G"}
 
 
 def round_qty(value) -> float:
-    """Normalize medicine quantities to one decimal and eliminate negative zero."""
-    rounded = round(float(value or 0), 1)
-    return 0.0 if abs(rounded) < 0.05 else rounded
+    """Normalize medicine quantities to two decimals without losing valid fractional stock."""
+    rounded = round(float(value or 0), 2)
+    return 0.0 if abs(rounded) < 0.005 else rounded
 
 
 def _normalize_inventory_quantities(value):
