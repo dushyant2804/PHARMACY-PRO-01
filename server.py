@@ -3226,10 +3226,16 @@ async def list_medicines(
                 "distributor_id": 1,
                 "distributor_name": 1,
                 "items.name": 1,
+                "items.medicine_name": 1,
                 "items.batch_no": 1,
+                "items.batch_number": 1,
+                "items.batch": 1,
                 "items.medicine_key": 1,
                 "items.quantity": 1,
+                "items.purchase_quantity": 1,
                 "items.free_quantity": 1,
+                "items.free_qty": 1,
+                "items.free_units": 1,
                 "items.purchase_price": 1,
                 "items.mrp": 1,
                 "items.expiry_date": 1,
@@ -3264,9 +3270,30 @@ async def list_medicines(
 
                     item_keys.append(item_medicine_key)
 
+                item_name = (
+                    item.get("name")
+                    or item.get("medicine_name")
+                    or ""
+                ).strip()
+                item_batch = (
+                    item.get("batch_no")
+                    or item.get("batch_number")
+                    or item.get("batch")
+                    or ""
+                ).strip()
+                item_quantity = round_qty(
+                    item.get("quantity", item.get("purchase_quantity", 0))
+                )
+                item_free_quantity = round_qty(
+                    item.get(
+                        "free_quantity",
+                        item.get("free_qty", item.get("free_units", 0)),
+                    )
+                )
+
                 normalized_item_key = normalized_medicine_key(
-                    item.get("name"),
-                    item.get("batch_no"),
+                    item_name,
+                    item_batch,
                     po.get("distributor_id"),
                 )
 
@@ -3291,15 +3318,15 @@ async def list_medicines(
                         },
                     )
                     terms["purchase_quantity"] = round_qty(
-                        terms["purchase_quantity"] + round_qty(item.get("quantity", 0))
+                        terms["purchase_quantity"] + item_quantity
                     )
                     terms["free_quantity"] = round_qty(
-                        terms["free_quantity"] + round_qty(item.get("free_quantity", 0))
+                        terms["free_quantity"] + item_free_quantity
                     )
 
                 po_name_batch_key = (
-                    str(item.get("name") or "").strip().casefold(),
-                    str(item.get("batch_no") or "").strip().casefold(),
+                    item_name.casefold(),
+                    item_batch.casefold(),
                 )
                 if all(po_name_batch_key):
                     name_batch_terms = purchase_order_lot_terms_by_name_batch.setdefault(
@@ -3307,10 +3334,10 @@ async def list_medicines(
                         {"purchase_quantity": 0, "free_quantity": 0},
                     )
                     name_batch_terms["purchase_quantity"] = round_qty(
-                        name_batch_terms["purchase_quantity"] + round_qty(item.get("quantity", 0))
+                        name_batch_terms["purchase_quantity"] + item_quantity
                     )
                     name_batch_terms["free_quantity"] = round_qty(
-                        name_batch_terms["free_quantity"] + round_qty(item.get("free_quantity", 0))
+                        name_batch_terms["free_quantity"] + item_free_quantity
                     )
 
     distributor_ids = {
