@@ -3228,8 +3228,16 @@ async def list_medicines(
                 "items.name": 1,
                 "items.batch_no": 1,
                 "items.medicine_key": 1,
+                "items.quantity": 1,
+                "items.free_quantity": 1,
+                "items.purchase_price": 1,
+                "items.mrp": 1,
+                "items.expiry_date": 1,
+                "items.pack_size": 1,
             }
         ).to_list(10000)
+
+        purchase_order_lot_terms = {}
 
         for po in purchase_orders:
 
@@ -3271,11 +3279,22 @@ async def list_medicines(
 
                         continue
 
-                    if item_key in purchase_order_distributors:
+                    if item_key not in purchase_order_distributors:
+                        purchase_order_distributors[item_key] = distributor_details
 
-                        continue
-
-                    purchase_order_distributors[item_key] = distributor_details
+                    terms = purchase_order_lot_terms.setdefault(
+                        item_key,
+                        {
+                            "purchase_quantity": 0,
+                            "free_quantity": 0,
+                        },
+                    )
+                    terms["purchase_quantity"] = round_qty(
+                        terms["purchase_quantity"] + round_qty(item.get("quantity", 0))
+                    )
+                    terms["free_quantity"] = round_qty(
+                        terms["free_quantity"] + round_qty(item.get("free_quantity", 0))
+                    )
 
     distributor_ids = {
         m.get("distributor_id")
@@ -3496,6 +3515,16 @@ async def list_medicines(
             m.get("name"),
             m.get("batch_no")
         )
+
+        po_lot_terms = (
+            purchase_order_lot_terms.get(m.get("medicine_key"))
+            or purchase_order_lot_terms.get(normalized_key)
+            or {}
+        )
+
+        if po_lot_terms:
+            m["purchase_quantity"] = po_lot_terms.get("purchase_quantity", 0)
+            m["free_quantity"] = po_lot_terms.get("free_quantity", 0)
 
         po_distributor = (
             purchase_order_distributors.get(m.get("medicine_key"))
