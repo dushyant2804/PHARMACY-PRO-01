@@ -3406,10 +3406,30 @@ async def list_medicines(
                 "gst_rate":
                     m.get("gst_rate"),
 
+                "purchase_quantity":
+                    m.get("purchase_quantity", m.get("quantity", m.get("purchased_units", 0))),
+
+                "free_quantity":
+                    m.get("free_quantity", m.get("free_qty", m.get("free_units", 0))),
+
                 "actual_cost":
                   round(
-                    float(m.get("purchase_price") or 0)
-                    * (1 + float(m.get("gst_rate") or 0) / 100),
+                    (
+                        float(m.get("purchase_price") or 0)
+                        * (1 + float(m.get("gst_rate") or 0) / 100)
+                    )
+                    * (
+                        float(m.get("purchase_quantity", m.get("quantity", m.get("purchased_units", 0))) or 0)
+                        / (
+                            float(m.get("purchase_quantity", m.get("quantity", m.get("purchased_units", 0))) or 0)
+                            + float(m.get("free_quantity", m.get("free_qty", m.get("free_units", 0))) or 0)
+                        )
+                        if (
+                            float(m.get("purchase_quantity", m.get("quantity", m.get("purchased_units", 0))) or 0)
+                            + float(m.get("free_quantity", m.get("free_qty", m.get("free_units", 0))) or 0)
+                        ) > 0
+                        else 1
+                    ),
                     2
                   ),
 
@@ -3556,6 +3576,12 @@ async def list_medicines(
             "purchased_units":
                 purchased,
 
+            "purchase_quantity":
+                m.get("purchase_quantity", m.get("quantity", m.get("purchased_units", 0))),
+
+            "free_quantity":
+                m.get("free_quantity", m.get("free_qty", m.get("free_units", 0))),
+
             "sold_units":
                 sold,
 
@@ -3637,6 +3663,8 @@ async def list_medicines(
                 "quantity_units",
                 "available_stock",
                 "purchased_units",
+                "purchase_quantity",
+                "free_quantity",
                 "sold_units",
                 "purchase_return_units",
                 "stock_adjustment_units",
@@ -3681,9 +3709,18 @@ async def list_medicines(
         item["current_stock"] = item["total_stock"]
         item["available_qty"] = item["total_stock"]
         
+        purchase_quantity = float(item.get("purchase_quantity") or 0)
+        free_quantity = float(item.get("free_quantity") or 0)
+        total_scheme_units = purchase_quantity + free_quantity
+        scheme_factor = (
+            purchase_quantity / total_scheme_units
+            if total_scheme_units > 0
+            else 1
+        )
         actual_cost = round(
           float(item.get("purchase_price") or 0) *
-          (1 + float(item.get("gst_rate") or 0) / 100),
+          (1 + float(item.get("gst_rate") or 0) / 100) *
+          scheme_factor,
           2
         )
 
@@ -13335,11 +13372,21 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
                     "distributor_name": distributor_name,
                     "distributor": po_distributor or item.get("distributor") or item.get("distributor_name") or distributor_name,
                     "purchased_units": 0,
+                    "purchase_quantity": 0,
+                    "free_quantity": 0,
                     "sold_units": 0,
                     "purchase_return_units": 0,
                     "stock_adjustment_units": 0,
                 }
-            rebuilt[group_key]["purchased_units"] = round_qty(rebuilt[group_key]["purchased_units"] + qty)
+            rebuilt[group_key]["purchase_quantity"] = round_qty(
+                rebuilt[group_key]["purchase_quantity"] + round_qty(item.get("quantity", 0))
+            )
+            rebuilt[group_key]["free_quantity"] = round_qty(
+                rebuilt[group_key]["free_quantity"] + round_qty(item.get("free_quantity", 0))
+            )
+            rebuilt[group_key]["purchased_units"] = round_qty(
+                rebuilt[group_key]["purchased_units"] + qty
+            )
 
     for medicine in rebuilt.values():
         derivatives = {
