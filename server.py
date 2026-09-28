@@ -5571,6 +5571,15 @@ async def create_invoice(
     items_out = []
     line_total_raw = 0.0
     stock_requests = defaultdict(float)
+    
+    settings = await db.settings.find_one(
+        {"key": "main"},
+        {"_id": 0, "business_gstin": 1},
+    )
+
+    gst_enabled = bool(
+        str((settings or {}).get("business_gstin") or "").strip()
+    )
 
     for item in payload.items:
 
@@ -5670,7 +5679,7 @@ async def create_invoice(
                     it["gst_rate"] / 100.0
                 )
             )
-        )
+        ) if gst_enabled else 0.0
 
         net = item_after - gst_amount
 
@@ -5679,6 +5688,7 @@ async def create_invoice(
 
         final_items.append({
             **it,
+            "gst_rate": it["gst_rate"] if gst_enabled else 0,
             "gst_amount": round(gst_amount, 2),
             "net_amount": _round_invoice_money(net),
             "estimated_profit": _round_invoice_money(item_after - it["purchase_cost"]),
@@ -5717,6 +5727,7 @@ async def create_invoice(
         "subtotal": round(subtotal, 2),
 
         "gst_total": round(gst_total, 2),
+        "gst_enabled": gst_enabled,
 
         "bill_discount": round(bill_disc, 2),
 
