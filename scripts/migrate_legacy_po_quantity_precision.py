@@ -23,6 +23,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -127,9 +128,24 @@ async def main():
         if not changed:
             continue
 
-        # Recalculate PO financial totals from the corrected paid quantities.
-        payload = POCreate.model_validate(updated)
-        totals = _calculate_purchase_order_totals(payload)
+        # Recalculate PO financial totals without rebuilding the item dicts.
+        # Existing PO items may contain legacy fields such as medicine_id and
+        # medicine_key that must remain untouched by this migration.
+        total_items = [
+            SimpleNamespace(
+                purchase_price=item.get("purchase_price", 0),
+                quantity=item.get("quantity", 0),
+                gst_rate=item.get("gst_rate", 5),
+            )
+            for item in updated.get("items", [])
+        ]
+        totals = _calculate_purchase_order_totals(
+            SimpleNamespace(
+                items=total_items,
+                scheme_discount=updated.get("scheme_discount", 0),
+                cash_discount=updated.get("cash_discount", 0),
+            )
+        )
 
         return_credit = dec(
             po.get(
@@ -145,7 +161,7 @@ async def main():
 
         updated.update(
             {
-                "items": payload.model_dump()["items"],
+                "items": updated["items"],
                 "sub_total": totals["sub_total"],
                 "scheme_discount": totals["scheme_discount"],
                 "cash_discount": totals["cash_discount"],
@@ -215,8 +231,21 @@ async def main():
                 ).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             )
 
-        payload = POCreate.model_validate(corrected)
-        totals = _calculate_purchase_order_totals(payload)
+        total_items = [
+            SimpleNamespace(
+                purchase_price=item.get("purchase_price", 0),
+                quantity=item.get("quantity", 0),
+                gst_rate=item.get("gst_rate", 5),
+            )
+            for item in corrected.get("items", [])
+        ]
+        totals = _calculate_purchase_order_totals(
+            SimpleNamespace(
+                items=total_items,
+                scheme_discount=corrected.get("scheme_discount", 0),
+                cash_discount=corrected.get("cash_discount", 0),
+            )
+        )
         return_credit = dec(
             po.get(
                 "purchase_return_adjustment",
