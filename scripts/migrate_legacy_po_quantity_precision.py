@@ -21,7 +21,7 @@ import json
 import os
 from copy import deepcopy
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 
 
@@ -64,7 +64,7 @@ def repair_pair(quantity, free_quantity):
     # We only repair the exact legacy pattern x.8 + 0.2.
     if qty < Decimal("1"):
         return None
-    whole = qty.to_integral_value(rounding="ROUND_FLOOR")
+    whole = qty.to_integral_value(rounding=ROUND_FLOOR)
     expected_legacy_qty = whole + Decimal("0.8")
     if not is_close(qty, expected_legacy_qty) or not is_close(free, Decimal("0.2")):
         return None
@@ -198,22 +198,7 @@ async def main():
 
     print(f"Backup written: {backup_path}")
 
-    for row in affected:
-        await db.purchase_orders.update_one(
-            {"id": row["po_id"]},
-            {"$set": {
-                "items": next(
-                    item for item in (
-                        await db.purchase_orders.find_one(
-                            {"id": row["po_id"]}, {"_id": 0}
-                        )
-                    ).get("items", [])
-                ) if False
-            }},
-        )
-
-    # The loop above intentionally does not perform a write; write the prepared
-    # documents in one clear pass after the backup has been confirmed.
+    # Write the corrected documents only after the backup has been confirmed.
     for row in affected:
         po = row["backup"]
         # Rebuild the corrected PO again from the recorded change list so the
