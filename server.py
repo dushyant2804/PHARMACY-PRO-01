@@ -6221,6 +6221,9 @@ async def update_invoice(
     async def apply_edit(session=None, fallback=False):
         reversed_old = []
         newly_applied = []
+        sale_tx = next((tx for tx in linked_transactions if str(tx.get("type") or "").lower() in {"sale", "credit_sale"}), None)
+        new_sale_tx_id = None
+        invoice_replaced = False
         try:
             for step in reversed(old_deductions):
                 medicine_id = step.get("medicine_id")
@@ -6238,7 +6241,6 @@ async def update_invoice(
             await _apply_fifo_stock_requests(stock_requests, session=session, applied=newly_applied)
             invoice["stock_deductions"] = _stock_deductions_from_steps(newly_applied)
 
-            sale_tx = next((tx for tx in linked_transactions if str(tx.get("type") or "").lower() in {"sale", "credit_sale"}), None)
             if sale_tx:
                 if invoice["due_amount"] > 0 and payload.customer_id:
                     await db.customer_transactions.update_one(
@@ -6257,8 +6259,9 @@ async def update_invoice(
                 else:
                     await db.customer_transactions.delete_one({"id": sale_tx.get("id")}, session=session)
             elif invoice["due_amount"] > 0 and payload.customer_id:
+                new_sale_tx_id = str(uuid.uuid4())
                 await db.customer_transactions.insert_one({
-                    "id": str(uuid.uuid4()),
+                    "id": new_sale_tx_id,
                     "customer_id": payload.customer_id,
                     "type": "sale",
                     "amount": invoice["due_amount"],
@@ -6271,10 +6274,17 @@ async def update_invoice(
                     "created_at": invoice.get("created_at") or now_iso,
                 }, session=session)
 
+            invoice_replaced = True
             await db.invoices.replace_one({"id": inv_id}, invoice, session=session)
             return invoice
         except Exception:
             if fallback:
+                if invoice_replaced:
+                    await db.invoices.replace_one({"id": inv_id}, old_invoice, upsert=True)
+                if sale_tx:
+                    await db.customer_transactions.replace_one({"id": sale_tx.get("id")}, sale_tx, upsert=True)
+                elif new_sale_tx_id:
+                    await db.customer_transactions.delete_one({"id": new_sale_tx_id})
                 for step in reversed(newly_applied):
                     await _set_rounded_stock_delta(
                         step["medicine_id"], "sold_units", -round_qty(step.get("deduct", 0))
