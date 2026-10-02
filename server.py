@@ -6094,6 +6094,8 @@ async def update_invoice(
     old_invoice = await db.invoices.find_one({"id": inv_id}, {"_id": 0})
     if not old_invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="An invoice must contain at least one item")
 
     created_raw = str(old_invoice.get("created_at") or "")
     try:
