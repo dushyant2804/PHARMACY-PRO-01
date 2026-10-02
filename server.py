@@ -6227,6 +6227,9 @@ async def update_invoice(
                 deduct = round_qty(step.get("deduct", 0))
                 if not medicine_id or deduct <= 0:
                     continue
+                medicine = await db.medicines.find_one({"id": medicine_id}, {"_id": 0}, session=session)
+                if not medicine or _stock_quantity(medicine, "sold_units", "sold_quantity") + 1e-9 < deduct:
+                    raise HTTPException(status_code=409, detail="Original stock deductions no longer match inventory; manual reconciliation is required")
                 result = await _set_rounded_stock_delta(medicine_id, "sold_units", -deduct, session=session)
                 if not result or result.modified_count != 1:
                     raise HTTPException(status_code=409, detail="Could not restore the original invoice stock deductions")
