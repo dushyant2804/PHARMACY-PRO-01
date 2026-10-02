@@ -6121,7 +6121,10 @@ async def update_invoice(
     linked_transactions = await db.customer_transactions.find(
         {"invoice_id": inv_id}, {"_id": 0}
     ).to_list(5000)
-    if any(str(tx.get("type") or "").lower() not in {"sale", "credit_sale"} for tx in linked_transactions):
+    invoice_payments = await db.customer_transactions.find(
+        {"invoice_number": old_invoice.get("invoice_no"), "type": "payment"}, {"_id": 0}
+    ).to_list(5000)
+    if invoice_payments or any(str(tx.get("type") or "").lower() not in {"sale", "credit_sale"} for tx in linked_transactions):
         raise HTTPException(
             status_code=409,
             detail="This invoice has linked payment history. Reconcile those payments before editing it.",
