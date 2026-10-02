@@ -1,0 +1,24 @@
+name: Temporary Invoice Edit Validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feature/invoice-edit-protection]
+
+jobs:
+  backend-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Compile backend
+        run: python -m py_compile server.py
+      - name: Run focused regression tests
+        run: pytest -q tests/test_low_stock_workflow.py tests/test_local_first_mode.py
