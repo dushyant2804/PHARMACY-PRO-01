@@ -20,5 +20,5 @@ jobs:
           pip install -r requirements.txt pytest
       - name: Compile backend
         run: python -m py_compile server.py
-      - name: Run focused regression tests
-        run: pytest -q tests/test_low_stock_workflow.py tests/test_local_first_mode.py
+      - name: Test invoice edit authorization
+        run: pytest -q tests/test_invoice_edit_protection.py
