@@ -6136,6 +6136,11 @@ async def update_invoice(
             status_code=409,
             detail="This older invoice has no saved stock-deduction history and cannot be safely edited automatically.",
         )
+    if any(not step.get("medicine_id") or round_qty(step.get("deduct", 0)) <= 0 for step in old_deductions):
+        raise HTTPException(
+            status_code=409,
+            detail="This invoice has incomplete stock-deduction history and cannot be safely edited automatically.",
+        )
 
     settings = await db.settings.find_one({"key": "main"}, {"_id": 0, "business_gstin": 1})
     gst_enabled = bool(str((settings or {}).get("business_gstin") or "").strip())
