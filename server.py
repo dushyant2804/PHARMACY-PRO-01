@@ -6232,7 +6232,7 @@ async def update_invoice(
                     raise HTTPException(status_code=409, detail="Could not restore the original invoice stock deductions")
                 reversed_old.append({"medicine_id": medicine_id, "deduct": deduct})
 
-            newly_applied = await _apply_fifo_stock_requests(stock_requests, session=session)
+            await _apply_fifo_stock_requests(stock_requests, session=session, applied=newly_applied)
             invoice["stock_deductions"] = _stock_deductions_from_steps(newly_applied)
 
             sale_tx = next((tx for tx in linked_transactions if str(tx.get("type") or "").lower() in {"sale", "credit_sale"}), None)
