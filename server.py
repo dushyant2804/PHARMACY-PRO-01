@@ -1625,6 +1625,7 @@ class InvoiceCreate(BaseModel):
     customer_phone: str = ""
     customer_gstin: str = ""
     referring_doctor: str = ""
+    invoice_date: Optional[str] = None
     items: List[InvoiceItem]
     payment_mode: Literal["cash", "upi", "card", "credit", "mixed"] = "cash"
     paid_amount: float = 0.0
@@ -5868,6 +5869,10 @@ async def create_invoice(
         "margin_percentage": _round_invoice_money(((total - sum(item["purchase_cost"] for item in final_items)) / total * 100) if total else 0),
 
         "notes": payload.notes,
+
+        "invoice_date": payload.invoice_date or datetime.now(
+            timezone.utc
+        ).astimezone(timezone(timedelta(hours=5, minutes=30))).date().isoformat(),
 
         "created_at": datetime.now(
             timezone.utc
