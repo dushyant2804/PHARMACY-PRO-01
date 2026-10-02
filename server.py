@@ -1634,6 +1634,10 @@ class InvoiceCreate(BaseModel):
     notes: str = ""
 
 
+class InvoiceEdit(InvoiceCreate):
+    privacy_password: Optional[str] = None
+
+
 class PaymentCreate(BaseModel):
     amount: float
     mode: str = "cash"
@@ -6077,6 +6081,215 @@ async def get_invoice(inv_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Invoice not found")
     return _normalize_invoice(inv, include_internal=_invoice_user_can_view_internal(user))
 
+
+
+
+@api_router.put("/invoices/{inv_id}")
+async def update_invoice(
+    inv_id: str,
+    payload: InvoiceEdit,
+    user: dict = Depends(get_current_user),
+):
+    """Edit an existing invoice without creating a second bill or losing ledger history."""
+    old_invoice = await db.invoices.find_one({"id": inv_id}, {"_id": 0})
+    if not old_invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    created_raw = str(old_invoice.get("created_at") or "")
+    try:
+        created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        created_local_date = created_dt.astimezone(timezone(timedelta(hours=5, minutes=30))).date()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=409, detail="This invoice has no valid creation timestamp and cannot be safely edited")
+
+    today_local = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).date()
+    if created_local_date < today_local:
+        if user.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Only an admin can edit an older invoice")
+        stored_hash = await _privacy_password_hash(user)
+        if not stored_hash:
+            raise HTTPException(status_code=400, detail="Privacy password is not configured")
+        if not payload.privacy_password or not verify_password(payload.privacy_password, stored_hash):
+            raise HTTPException(status_code=403, detail="A valid privacy password is required to edit an older invoice")
+
+    # If payments have already been posted against this invoice, don't rewrite
+    # the bill underneath those immutable payment records.
+    linked_transactions = await db.customer_transactions.find(
+        {"invoice_id": inv_id}, {"_id": 0}
+    ).to_list(5000)
+    if any(str(tx.get("type") or "").lower() not in {"sale", "credit_sale"} for tx in linked_transactions):
+        raise HTTPException(
+            status_code=409,
+            detail="This invoice has linked payment history. Reconcile those payments before editing it.",
+        )
+
+    old_deductions = old_invoice.get("stock_deductions") or []
+    if old_invoice.get("items") and not old_deductions:
+        raise HTTPException(
+            status_code=409,
+            detail="This older invoice has no saved stock-deduction history and cannot be safely edited automatically.",
+        )
+
+    settings = await db.settings.find_one({"key": "main"}, {"_id": 0, "business_gstin": 1})
+    gst_enabled = bool(str((settings or {}).get("business_gstin") or "").strip())
+    subtotal = 0.0
+    gst_total = 0.0
+    items_out = []
+    line_total_raw = 0.0
+    stock_requests = defaultdict(float)
+
+    for item in payload.items:
+        med = await db.medicines.find_one({"name": item.name}, {"_id": 0})
+        if not med:
+            raise HTTPException(status_code=400, detail=f"Medicine not found: {item.name}")
+        upb = max(int(med.get("units_per_box") or item.units_per_box or 1), 1)
+        units_needed = round_qty(item.quantity * (upb if item.unit_type == "box" else 1))
+        stock_requests[item.name] = round_qty(stock_requests[item.name] + units_needed)
+        unit_price = item.mrp * (upb if item.unit_type == "box" else 1)
+        line_base = unit_price * item.quantity
+        taxable = line_base - (line_base * (item.discount_pct / 100.0))
+        line_total_raw += taxable
+        items_out.append({
+            **item.model_dump(),
+            "units_per_box": upb,
+            "units_dispensed": units_needed,
+            "line_total": _round_invoice_money(taxable),
+            "purchase_cost": _round_invoice_money(float(med.get("purchase_price", 0) or 0) * units_needed),
+        })
+
+    bill_disc = float(payload.bill_discount_amount or 0.0)
+    if not bill_disc and payload.bill_discount_pct:
+        bill_disc = line_total_raw * (float(payload.bill_discount_pct) / 100.0)
+    bill_disc = min(bill_disc, line_total_raw)
+    final_items = []
+    for it in items_out:
+        raw = it["line_total"]
+        share = (raw / line_total_raw) if line_total_raw else 0
+        item_after = raw - bill_disc * share
+        gst_amount = item_after - (item_after / (1 + it["gst_rate"] / 100.0)) if gst_enabled else 0.0
+        net = item_after - gst_amount
+        gst_total += gst_amount
+        subtotal += net
+        final_items.append({
+            **it,
+            "gst_rate": it["gst_rate"] if gst_enabled else 0,
+            "gst_amount": round(gst_amount, 2),
+            "net_amount": _round_invoice_money(net),
+            "estimated_profit": _round_invoice_money(item_after - it["purchase_cost"]),
+            "margin_percentage": _round_invoice_money(((item_after - it["purchase_cost"]) / item_after * 100) if item_after else 0),
+        })
+
+    total = round(subtotal + gst_total, 2)
+    paid = _invoice_paid_amount(payload.payment_mode, payload.paid_amount, total)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    invoice = {
+        **old_invoice,
+        "customer_id": payload.customer_id,
+        "customer_name": payload.customer_name,
+        "customer_phone": payload.customer_phone,
+        "customer_gstin": payload.customer_gstin,
+        "referring_doctor": payload.referring_doctor.strip() if payload.referring_doctor else "",
+        "items": final_items,
+        "subtotal": round(subtotal, 2),
+        "gst_total": round(gst_total, 2),
+        "gst_enabled": gst_enabled,
+        "bill_discount": round(bill_disc, 2),
+        "total": total,
+        "payment_mode": payload.payment_mode,
+        "paid_amount": _round_invoice_money(paid),
+        "due_amount": round(total - paid, 2),
+        "purchase_cost": _round_invoice_money(sum(item["purchase_cost"] for item in final_items)),
+        "estimated_profit": _round_invoice_money(total - sum(item["purchase_cost"] for item in final_items)),
+        "margin_percentage": _round_invoice_money(((total - sum(item["purchase_cost"] for item in final_items)) / total * 100) if total else 0),
+        "notes": payload.notes,
+        "invoice_date": payload.invoice_date or old_invoice.get("invoice_date") or created_local_date.isoformat(),
+        "stock_deductions": [],
+        "updated_at": now_iso,
+        "updated_by": user.get("name") or user.get("email") or user.get("id") or "",
+        "edit_history": (old_invoice.get("edit_history") or []) + [{
+            "edited_at": now_iso,
+            "edited_by": user.get("name") or user.get("email") or user.get("id") or "",
+            "old_total": old_invoice.get("total", 0),
+            "new_total": total,
+            "old_customer_name": old_invoice.get("customer_name", ""),
+            "new_customer_name": payload.customer_name,
+        }],
+    }
+
+    async def apply_edit(session=None, fallback=False):
+        reversed_old = []
+        newly_applied = []
+        try:
+            for step in reversed(old_deductions):
+                medicine_id = step.get("medicine_id")
+                deduct = round_qty(step.get("deduct", 0))
+                if not medicine_id or deduct <= 0:
+                    continue
+                result = await _set_rounded_stock_delta(medicine_id, "sold_units", -deduct, session=session)
+                if not result or result.modified_count != 1:
+                    raise HTTPException(status_code=409, detail="Could not restore the original invoice stock deductions")
+                reversed_old.append({"medicine_id": medicine_id, "deduct": deduct})
+
+            newly_applied = await _apply_fifo_stock_requests(stock_requests, session=session)
+            invoice["stock_deductions"] = _stock_deductions_from_steps(newly_applied)
+
+            sale_tx = next((tx for tx in linked_transactions if str(tx.get("type") or "").lower() in {"sale", "credit_sale"}), None)
+            if sale_tx:
+                if invoice["due_amount"] > 0 and payload.customer_id:
+                    await db.customer_transactions.update_one(
+                        {"id": sale_tx.get("id")},
+                        {"$set": {
+                            "customer_id": payload.customer_id,
+                            "amount": invoice["due_amount"],
+                            "reference": invoice["invoice_no"],
+                            "reference_number": invoice["invoice_no"],
+                            "invoice_number": invoice["invoice_no"],
+                            "payment_mode": invoice["payment_mode"],
+                            "notes": "Credit sale",
+                        }},
+                        session=session,
+                    )
+                else:
+                    await db.customer_transactions.delete_one({"id": sale_tx.get("id")}, session=session)
+            elif invoice["due_amount"] > 0 and payload.customer_id:
+                await db.customer_transactions.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "customer_id": payload.customer_id,
+                    "type": "sale",
+                    "amount": invoice["due_amount"],
+                    "reference": invoice["invoice_no"],
+                    "reference_number": invoice["invoice_no"],
+                    "invoice_number": invoice["invoice_no"],
+                    "invoice_id": invoice["id"],
+                    "payment_mode": invoice["payment_mode"],
+                    "notes": "Credit sale",
+                    "created_at": invoice.get("created_at") or now_iso,
+                }, session=session)
+
+            await db.invoices.replace_one({"id": inv_id}, invoice, session=session)
+            return invoice
+        except Exception:
+            if fallback:
+                for step in reversed(newly_applied):
+                    await _set_rounded_stock_delta(
+                        step["medicine_id"], "sold_units", -round_qty(step.get("deduct", 0))
+                    )
+                for step in reversed(reversed_old):
+                    await _set_rounded_stock_delta(
+                        step["medicine_id"], "sold_units", round_qty(step.get("deduct", 0))
+                    )
+            raise
+
+    async def transaction_operation(session):
+        return await apply_edit(session=session, fallback=False)
+
+    async def fallback_operation():
+        return await apply_edit(fallback=True)
+
+    edited = await _run_with_transaction(transaction_operation, fallback_operation)
+    return _normalize_invoice(edited, include_internal=_invoice_user_can_view_internal(user))
 
 @api_router.get("/invoices/{inv_id}/share")
 async def get_invoice_share_payload(inv_id: str, user: dict = Depends(get_current_user)):
