@@ -11081,6 +11081,16 @@ async def _dashboard_purchase_return_summary(start: Optional[str] = None, end: O
 
 
 # ---------------- Dashboard & Reports ----------------
+def _invoice_reporting_date(invoice: dict) -> str:
+    """Business date for an invoice; creation time is only a legacy fallback."""
+    return str(invoice.get("invoice_date") or invoice.get("date") or invoice.get("created_at") or "")[:10]
+
+
+def _invoice_in_date_range(invoice: dict, start: Optional[str], end: Optional[str]) -> bool:
+    day = _invoice_reporting_date(invoice)
+    return bool(day) and (not start or day >= start) and (not end or day <= end)
+
+
 @api_router.get("/dashboard/summary")
 async def dashboard_summary(
     start: Optional[str] = None,
@@ -11117,23 +11127,37 @@ async def dashboard_summary(
     customer_outstanding_today = 0
     customer_outstanding_month = 0
 
-    # SALES
-    invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
+    # SALES: report by the invoice business date, not the record creation timestamp.
+    all_invoices = await db.invoices.find({}, {"_id": 0}).to_list(5000)
+    invoices = [invoice for invoice in all_invoices if _invoice_in_date_range(invoice, start, end)]
 
     total_sales = 0
+    invoice_gross_profit = 0.0
 
     for i in invoices:
         amt = float(i.get("total", 0))
         total_sales += amt
 
+        invoice_profit = 0.0
+        for line in (i.get("items") or []):
+            quantity = _safe_float(line.get("units_dispensed", line.get("quantity", 0)))
+            revenue = _safe_float(line.get("line_total", line.get("net_amount", _safe_float(line.get("mrp")) * quantity)))
+            cost = _safe_float(line.get("purchase_cost"), -1)
+            if cost < 0:
+                cost = _safe_float(line.get("purchase_rate", line.get("purchase_price", 0))) * quantity
+            invoice_profit += revenue - cost
+        invoice_gross_profit += invoice_profit
+
         try:
-            dt = datetime.fromisoformat(i["created_at"]).date()
+            dt = datetime.fromisoformat(_invoice_reporting_date(i)).date()
 
             if dt == today:
                 sales_today += amt
+                profit_today += invoice_profit
 
             if dt.month == current_month and dt.year == current_year:
                 sales_month += amt
+                profit_month += invoice_profit
 
         except Exception:
             pass
@@ -11162,9 +11186,9 @@ async def dashboard_summary(
         except Exception:
             pass
 
-    profit = total_sales - total_expenses
-    profit_today = sales_today - expenses_today
-    profit_month = sales_month - expenses_month
+    profit = invoice_gross_profit - total_expenses
+    profit_today -= expenses_today
+    profit_month -= expenses_month
 
     # STOCK
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
@@ -11365,14 +11389,8 @@ async def dashboard_summary(
     
 @api_router.get("/reports/sales")
 async def sales_report(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
-    q = {}
-    if start or end:
-        q["created_at"] = {}
-        if start:
-            q["created_at"]["$gte"] = start
-        if end:
-            q["created_at"]["$lte"] = end + "T23:59:59"
-    invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
+    all_invoices = await db.invoices.find({}, {"_id": 0}).to_list(5000)
+    invoices = [invoice for invoice in all_invoices if _invoice_in_date_range(invoice, start, end)]
     medicine_ids = {item.get("medicine_id") for invoice in invoices for item in invoice.get("items", []) if item.get("medicine_id")}
     medicines = await db.medicines.find({"id": {"$in": list(medicine_ids)}}, {"_id": 0, "id": 1, "purchase_price": 1}).to_list(len(medicine_ids) or 1)
     costs = {medicine.get("id"): _safe_float(medicine.get("purchase_price")) for medicine in medicines}
@@ -11385,7 +11403,7 @@ async def sales_report(start: Optional[str] = None, end: Optional[str] = None, u
         total_sales += invoice_total
         total_gst += _safe_float(invoice.get("gst_total", invoice.get("total_gst", 0)))
         total_discount += _safe_float(invoice.get("bill_discount", invoice.get("discount", 0)))
-        day = str(invoice.get("created_at") or "")[:10]
+        day = _invoice_reporting_date(invoice)
         if day:
             daily[day] += invoice_total
             monthly[day[:7]] += invoice_total
@@ -11856,7 +11874,7 @@ async def _invoice_item_profit_rows() -> Tuple[List[dict], dict]:
     by_id = {m.get("id"): m for m in medicines}
     rows = []
     for invoice in invoices:
-        sold_on = _analytics_date(invoice.get("created_at") or invoice.get("invoice_date") or invoice.get("date"))
+        sold_on = _analytics_date(invoice.get("invoice_date") or invoice.get("date") or invoice.get("created_at"))
         for item in invoice.get("items", []):
             qty = _invoice_item_quantity(item)
             revenue = _safe_float(item.get("line_total", item.get("net_amount", item.get("mrp", 0) * qty)))
@@ -16403,7 +16421,7 @@ async def _daily_closing_expected(closing_date: str, opening_cash: float = 0) ->
         await invoice_collection.find({}, {"_id": 0}).to_list(5000)
         if invoice_collection else []
     )
-    invoices = [row for row in invoices if str(row.get("created_at", "")).startswith(closing_date)]
+    invoices = [row for row in invoices if _invoice_reporting_date(row) == closing_date]
     expenses = (
         await expense_collection.find({"date": closing_date}, {"_id": 0}).to_list(2000)
         if expense_collection else []
