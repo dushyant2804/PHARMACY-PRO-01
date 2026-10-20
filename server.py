@@ -3460,6 +3460,9 @@ async def list_medicines(
                 "purchase_price":
                     m.get("purchase_price"),
 
+                "discount_percent":
+                    m.get("discount_percent", 0),
+
                 "gst_rate":
                     m.get("gst_rate"),
 
@@ -3473,6 +3476,7 @@ async def list_medicines(
                   round(
                     (
                         float(m.get("purchase_price") or 0)
+                        * (1 - min(100, max(0, float(m.get("discount_percent") or 0))) / 100)
                         * (1 + float(m.get("gst_rate") or 0) / 100)
                     )
                     * (
@@ -3688,6 +3692,9 @@ async def list_medicines(
             "purchase_price":
                 m.get("purchase_price"),
 
+            "discount_percent":
+                m.get("discount_percent", 0),
+
             "gst_rate":
                 m.get("gst_rate"),
 
@@ -3695,6 +3702,7 @@ async def list_medicines(
               round(
                 (
                     float(m.get("purchase_price") or 0)
+                    * (1 - min(100, max(0, float(m.get("discount_percent") or 0))) / 100)
                     * (1 + float(m.get("gst_rate") or 0) / 100)
                 )
                 * (
@@ -3806,6 +3814,7 @@ async def list_medicines(
         )
         actual_cost = round(
           float(item.get("purchase_price") or 0) *
+          (1 - min(100, max(0, float(item.get("discount_percent") or 0))) / 100) *
           (1 + float(item.get("gst_rate") or 0) / 100) *
           scheme_factor,
           2
@@ -8208,6 +8217,57 @@ def _belongs_to_distributor(row: dict, identity_values: Set[str], names: Set[str
     }
     return bool(row_names & names)
 
+def _purchase_order_ledger_payable_amount(po: dict) -> float:
+    """Return the PO payable after recorded purchase-return credits.
+
+    Prefer a saved adjusted payable. If the saved payable is missing or still
+    equals the unadjusted gross despite a recorded return credit, calculate
+    gross minus the credit. The credit fields are aliases for the same credit,
+    so they must never be added together.
+    """
+    if not isinstance(po, dict):
+        return 0.0
+
+    def number(value):
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    gross = None
+    for field in ("grand_total", "total", "amount"):
+        value = number(po.get(field))
+        if value is not None:
+            gross = value
+            break
+
+    credit = 0.0
+    for field in ("purchase_return_credit", "purchase_return_adjustment"):
+        value = number(po.get(field))
+        if value is not None and value > credit:
+            credit = value
+
+    adjusted = None
+    for field in ("final_payable_total", "subtotal_after_purchase_return"):
+        value = number(po.get(field))
+        if value is not None and value >= 0:
+            adjusted = value
+            break
+
+    # Some older or partially-updated PO records retain the gross value in
+    # the adjusted field. Only subtract the credit in that case; an already
+    # reduced payable is used as-is to avoid double deduction.
+    if credit > 0 and gross is not None:
+        if adjusted is None or adjusted >= gross - 0.005:
+            return max(0.0, round(gross - credit, 2))
+
+    if adjusted is not None:
+        return round(adjusted, 2)
+    return round(gross if gross is not None else 0.0, 2)
+
+
 async def _canonical_distributor_ledger_transactions(
     distributor: dict,
     requested_id: Optional[str] = None,
@@ -8277,6 +8337,77 @@ async def _canonical_distributor_ledger_transactions(
             )
         )
     ]
+
+    # Some older PO records have their return IDs linked in purchase_returns,
+    # but their copied payable/credit fields were not persisted on the PO itself.
+    # Rehydrate that accounting information in memory before creating ledger rows.
+    # This is a read-only projection: it does not modify either collection.
+    if active_pos:
+        try:
+            all_returns = await db.purchase_returns.find({}, {"_id": 0}).to_list(10000)
+        except Exception:
+            all_returns = []
+
+        returns_by_id = {
+            str(item.get("id")): item
+            for item in all_returns
+            if isinstance(item, dict) and item.get("id")
+        }
+        returns_by_po = {}
+        for item in all_returns:
+            if not isinstance(item, dict):
+                continue
+            linked_po_id = str(
+                item.get("po_adjustment_id")
+                or item.get("settled_by_po")
+                or ""
+            ).strip()
+            if (
+                linked_po_id
+                and not item.get("deleted_at")
+                and not item.get("voided_at")
+                and str(item.get("settlement_status") or "").lower() != "deleted"
+            ):
+                returns_by_po.setdefault(linked_po_id, []).append(item)
+
+        for po in active_pos:
+            po_id = str(po.get("id") or po.get("purchase_order_id") or "").strip()
+            if not po_id:
+                continue
+
+            saved_credit = max(
+                _to_decimal(po.get("purchase_return_credit")),
+                _to_decimal(po.get("purchase_return_adjustment")),
+            )
+            if saved_credit > 0:
+                continue
+
+            linked_returns = list(returns_by_po.get(po_id, []))
+            for return_id in (po.get("purchase_return_ids") or []):
+                item = returns_by_id.get(str(return_id))
+                if (
+                    item
+                    and item not in linked_returns
+                    and not item.get("deleted_at")
+                    and not item.get("voided_at")
+                    and str(item.get("settlement_status") or "").lower() != "deleted"
+                ):
+                    linked_returns.append(item)
+
+            if linked_returns:
+                credit = _money_float(sum(
+                    (_to_decimal(_purchase_return_credit(item)) for item in linked_returns),
+                    Decimal("0"),
+                ))
+                if credit > 0:
+                    po["purchase_return_credit"] = credit
+                    po["purchase_return_adjustment"] = credit
+                    gross = _to_decimal(
+                        po.get("grand_total", po.get("total", po.get("amount", 0)))
+                    )
+                    adjusted = _money_float(max(Decimal("0"), gross - _to_decimal(credit)))
+                    po["final_payable_total"] = adjusted
+                    po["subtotal_after_purchase_return"] = adjusted
 
     po_by_id = {}
 
@@ -8388,15 +8519,7 @@ async def _canonical_distributor_ledger_transactions(
 
             merged.update({
                 "type": "purchase",
-                "amount": _safe_float(
-                    linked_po.get(
-                        "grand_total",
-                        linked_po.get(
-                            "total",
-                            linked_po.get("amount", 0),
-                        ),
-                    )
-                ),
+                "amount": _purchase_order_ledger_payable_amount(linked_po),
                 "transaction_date": (
                     linked_po.get("po_date")
                     or linked_po.get("date")
@@ -8594,15 +8717,7 @@ async def _canonical_distributor_ledger_transactions(
 
             merged.update({
                 "type": "purchase",
-                "amount": _safe_float(
-                    matching_po.get(
-                        "grand_total",
-                        matching_po.get(
-                            "total",
-                            matching_po.get("amount", 0),
-                        ),
-                    )
-                ),
+                "amount": _purchase_order_ledger_payable_amount(matching_po),
                 "transaction_date": (
                     matching_po.get("po_date")
                     or matching_po.get("date")
@@ -10131,6 +10246,7 @@ async def create_purchase_return(
         "expiry_date": payload.expiry_date,
         "return_quantity": payload.return_quantity,
         "purchase_rate": _money_float(_to_decimal(payload.purchase_rate)),
+        "discount_percent": _money_float(_to_decimal(medicine.get("discount_percent", 0))),
         "gst_rate": _money_float(_to_decimal(medicine.get("gst_rate"))),
         "return_amount": return_amount,
         "reason": payload.reason,
@@ -11399,15 +11515,7 @@ def _purchase_order_as_distributor_transaction(po: dict) -> dict:
 
         "type": "purchase",
 
-        "amount": _safe_float(
-            po.get(
-                "grand_total",
-                po.get(
-                    "total",
-                    po.get("amount", 0),
-                ),
-            )
-        ),
+        "amount": _purchase_order_ledger_payable_amount(po),
 
         "transaction_date": (
             po.get("po_date")
@@ -12993,6 +13101,7 @@ class POItem(BaseModel):
 
     purchase_price: float
     mrp: float
+    discount_percent: float = 0
 
     manufacturer: Optional[str] = None
     category: Optional[str] = None
@@ -13009,6 +13118,7 @@ class POReturnCreditRow(BaseModel):
     expiry_date: str = ""
     return_quantity: float = 0
     purchase_rate: float = 0
+    discount_percent: Optional[float] = None
     gst_rate: Optional[float] = None
     reason: Optional[str] = None
     notes: str = ""
@@ -13089,41 +13199,48 @@ def _money_float(value: Decimal) -> float:
 
 
 def _calculate_purchase_order_totals(payload: POCreate) -> dict:
-    """Calculate PO totals with order discount applied slab-wise before GST."""
+    """Calculate line-level discounts before GST, then apply any bill-level cash discount."""
     slab_subtotals: Dict[Decimal, Decimal] = defaultdict(Decimal)
+    slab_line_discounts: Dict[Decimal, Decimal] = defaultdict(Decimal)
 
     for item in payload.items:
-        # Free quantity is intentionally excluded from the PO taxable subtotal.
-        line_subtotal = _round_money(_to_decimal(item.purchase_price) * _to_decimal(item.quantity))
-        gst_rate = _to_decimal(item.gst_rate)
+        quantity = max(Decimal("0"), _to_decimal(item.quantity))
+        price = max(Decimal("0"), _to_decimal(item.purchase_price))
+        gst_rate = max(Decimal("0"), _to_decimal(item.gst_rate))
+        discount_percent = min(Decimal("100"), max(Decimal("0"), _to_decimal(item.discount_percent)))
+        line_subtotal = _round_money(price * quantity)
+        line_discount = min(line_subtotal, _round_money(line_subtotal * discount_percent / Decimal("100")))
         slab_subtotals[gst_rate] += line_subtotal
+        slab_line_discounts[gst_rate] += line_discount
 
     sub_total_raw = sum(slab_subtotals.values(), Decimal("0"))
     sub_total = _round_money(sub_total_raw)
-    scheme_discount = _round_money(_to_decimal(payload.scheme_discount))
-    cash_discount = _round_money(_to_decimal(payload.cash_discount))
+    scheme_discount = _round_money(sum(slab_line_discounts.values(), Decimal("0")))
+    after_line_discount = max(Decimal("0"), sub_total - scheme_discount)
+    cash_discount = min(after_line_discount, _round_money(max(Decimal("0"), _to_decimal(payload.cash_discount))))
     total_discount = scheme_discount + cash_discount
-    taxable_total = sub_total - total_discount
 
     gst_breakup = []
     total_cgst = Decimal("0")
     total_sgst = Decimal("0")
+    taxable_total = Decimal("0")
 
     for gst_rate in sorted(slab_subtotals):
         slab_subtotal = slab_subtotals[gst_rate]
-        slab_discount = (
-            total_discount * slab_subtotal / sub_total_raw
-            if sub_total_raw
-            else Decimal("0")
+        line_discount = slab_line_discounts[gst_rate]
+        slab_after_line_discount = max(Decimal("0"), slab_subtotal - line_discount)
+        slab_cash_discount = (
+            cash_discount * slab_after_line_discount / after_line_discount
+            if after_line_discount > 0 else Decimal("0")
         )
-        slab_taxable = slab_subtotal - slab_discount
+        slab_discount = line_discount + slab_cash_discount
+        slab_taxable = max(Decimal("0"), slab_subtotal - slab_discount)
         slab_gst = slab_taxable * gst_rate / Decimal("100")
         slab_cgst = _round_money(slab_gst / Decimal("2"))
         slab_sgst = _round_money(slab_gst / Decimal("2"))
-
+        taxable_total += slab_taxable
         total_cgst += slab_cgst
         total_sgst += slab_sgst
-
         gst_breakup.append({
             "gst_rate": _money_float(gst_rate),
             "sub_total": _money_float(slab_subtotal),
@@ -13134,6 +13251,9 @@ def _calculate_purchase_order_totals(payload: POCreate) -> dict:
             "gst": _money_float(slab_cgst + slab_sgst),
         })
 
+    taxable_total = _round_money(taxable_total)
+    total_cgst = _round_money(total_cgst)
+    total_sgst = _round_money(total_sgst)
     total = _round_money(taxable_total + total_cgst + total_sgst)
     grand_total_decimal = total.quantize(WHOLE_RUPEE, rounding=ROUND_HALF_UP)
     round_off = grand_total_decimal - total
@@ -13157,6 +13277,13 @@ def _purchase_return_credit(item: dict) -> float:
     return _money_float(
         _to_decimal(item.get("return_quantity")) * _to_decimal(item.get("purchase_rate"))
     )
+
+
+def _po_purchase_return_credit(item: dict) -> float:
+    """PO settlement credit uses the same net-of-line-discount rate as the purchase."""
+    percent = min(Decimal("100"), max(Decimal("0"), _to_decimal(item.get("discount_percent"))))
+    gross = _to_decimal(item.get("return_quantity")) * _to_decimal(item.get("purchase_rate"))
+    return _money_float(gross * (Decimal("1") - percent / Decimal("100")))
 
 
 async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[str] = None) -> Tuple[List[dict], float]:
@@ -13250,8 +13377,9 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
             "medicine_id": medicine.get("id"), "medicine_key": medicine.get("medicine_key") or row.medicine_key,
             "medicine_name": row.medicine_name, "batch_number": row.batch_number, "expiry_date": row.expiry_date,
             "return_quantity": row.return_quantity, "purchase_rate": _money_float(_to_decimal(row.purchase_rate)),
+            "discount_percent": _money_float(_to_decimal(row.discount_percent)),
             "gst_rate": _money_float(_to_decimal(row.gst_rate if row.gst_rate is not None else medicine.get("gst_rate"))),
-            "return_amount": _purchase_return_credit(row.model_dump()), "reason": row.reason or "Other", "notes": row.notes,
+            "return_amount": _po_purchase_return_credit(row.model_dump()), "reason": row.reason or "Other", "notes": row.notes,
             "adjust_distributor_ledger": False, "ledger_adjusted": False, "ledger_transaction_id": None,
             "settlement_status": "unsettled", "settled_by_po": None, "settled_at": None,
             "settlement_reference": None, "settled_return_value": 0.0,
@@ -13276,7 +13404,13 @@ async def _resolve_po_purchase_returns(payload: POCreate, allow_po_id: Optional[
             raise HTTPException(status_code=409, detail="Purchase return credit is already assigned to another purchase order")
         if item.get("ledger_adjusted") or item.get("adjust_distributor_ledger"):
             raise HTTPException(status_code=409, detail="Purchase return credit is already reflected in the distributor ledger")
-        item["return_amount"] = _purchase_return_credit(item)
+        if item.get("discount_percent") in (None, ""):
+            return_medicine = await db.medicines.find_one(
+                {"id": item.get("medicine_id")}, {"_id": 0}
+            ) if item.get("medicine_id") else None
+            item["discount_percent"] = (return_medicine or {}).get("discount_percent", 0)
+        item["discount_percent"] = _money_float(_to_decimal(item.get("discount_percent")))
+        item["return_amount"] = _po_purchase_return_credit(item)
         item["purchase_rate"] = _money_float(_to_decimal(item.get("purchase_rate")))
         if item.get("gst_rate") is not None:
             item["gst_rate"] = _money_float(_to_decimal(item.get("gst_rate")))
@@ -13725,6 +13859,9 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
                     "category": item.get("category"),
                     "mrp": item.get("mrp"),
                     "purchase_price": item.get("purchase_price"),
+                    "discount_percent": 0.0,
+                    "_discount_percent_weight": 0.0,
+                    "_discount_percent_weighted_total": 0.0,
                     "pack_size": item.get("pack_size"),
                     "gst_rate": item.get("gst_rate"),
                     "distributor_id": distributor_id,
@@ -13746,8 +13883,15 @@ async def _rebuild_inventory_for_po_medicines(medicine_names: Iterable[str], upd
             rebuilt[group_key]["purchased_units"] = round_qty(
                 rebuilt[group_key]["purchased_units"] + qty
             )
+            paid_subtotal = max(0.0, _safe_float(item.get("quantity")) * _safe_float(item.get("purchase_price")))
+            line_discount_percent = min(100.0, max(0.0, _safe_float(item.get("discount_percent"))))
+            rebuilt[group_key]["_discount_percent_weight"] += paid_subtotal
+            rebuilt[group_key]["_discount_percent_weighted_total"] += paid_subtotal * line_discount_percent
 
     for medicine in rebuilt.values():
+        discount_weight = medicine.pop("_discount_percent_weight", 0.0)
+        weighted_discount = medicine.pop("_discount_percent_weighted_total", 0.0)
+        medicine["discount_percent"] = round(weighted_discount / discount_weight, 4) if discount_weight > 0 else 0.0
         derivatives = {
             "available_stock": _available_stock(medicine),
             "quantity_units": _available_stock(medicine),
@@ -13801,7 +13945,15 @@ async def create_po(
             **i.model_dump(),
             "quantity": round_qty(i.quantity),
             "free_quantity": round_qty(i.free_quantity),
-            "item_total": _money_float(_to_decimal(i.purchase_price) * _to_decimal(i.quantity)),
+            "discount_percent": float(min(Decimal("100"), max(Decimal("0"), _to_decimal(i.discount_percent)))),
+            "line_discount_amount": _money_float(
+                _round_money(_to_decimal(i.purchase_price) * _to_decimal(i.quantity))
+                * min(Decimal("100"), max(Decimal("0"), _to_decimal(i.discount_percent))) / Decimal("100")
+            ),
+            "item_total": _money_float(
+                _round_money(_to_decimal(i.purchase_price) * _to_decimal(i.quantity))
+                * (Decimal("1") - min(Decimal("100"), max(Decimal("0"), _to_decimal(i.discount_percent))) / Decimal("100"))
+            ),
             "medicine_key": _stock_lot_key(
                 i.name, i.batch_no, payload.distributor_id, payload.distributor_name,
                 normalize_expiry(i.expiry_date), i.pack_size, i.purchase_price, i.mrp,
@@ -13954,7 +14106,15 @@ async def update_po(
             **i.model_dump(),
             "quantity": round_qty(i.quantity),
             "free_quantity": round_qty(i.free_quantity),
-            "item_total": _money_float(_to_decimal(i.purchase_price) * _to_decimal(i.quantity)),
+            "discount_percent": float(min(Decimal("100"), max(Decimal("0"), _to_decimal(i.discount_percent)))),
+            "line_discount_amount": _money_float(
+                _round_money(_to_decimal(i.purchase_price) * _to_decimal(i.quantity))
+                * min(Decimal("100"), max(Decimal("0"), _to_decimal(i.discount_percent))) / Decimal("100")
+            ),
+            "item_total": _money_float(
+                _round_money(_to_decimal(i.purchase_price) * _to_decimal(i.quantity))
+                * (Decimal("1") - min(Decimal("100"), max(Decimal("0"), _to_decimal(i.discount_percent))) / Decimal("100"))
+            ),
             "medicine_key": _stock_lot_key(
                 i.name, i.batch_no, payload.distributor_id, payload.distributor_name,
                 normalize_expiry(i.expiry_date), i.pack_size, i.purchase_price, i.mrp,
