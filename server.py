@@ -11432,8 +11432,7 @@ async def dashboard_summary(
     
 @api_router.get("/reports/sales")
 async def sales_report(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
-    all_invoices = await db.invoices.find({}, {"_id": 0}).to_list(5000)
-    invoices = [invoice for invoice in all_invoices if _invoice_in_date_range(invoice, start, end)]
+    invoices = await _load_invoices_for_business_date_range(start, end)
     medicine_ids = {item.get("medicine_id") for invoice in invoices for item in invoice.get("items", []) if item.get("medicine_id")}
     medicines = await db.medicines.find({"id": {"$in": list(medicine_ids)}}, {"_id": 0, "id": 1, "purchase_price": 1}).to_list(len(medicine_ids) or 1)
     costs = {medicine.get("id"): _safe_float(medicine.get("purchase_price")) for medicine in medicines}
