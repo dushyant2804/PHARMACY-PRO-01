@@ -264,7 +264,7 @@ class LocalSQLiteDatabase:
 
         indexed_fields = {
             "medicines": ["id", "medicine_key", "name", "batch_no", "barcode", "manufacturer", "category", "expiry_date", "distributor_id"],
-            "invoices": ["id", "invoice_no", "customer_id", "created_at", "payment_mode"],
+            "invoices": ["id", "invoice_no", "customer_id", "invoice_date", "date", "created_at", "payment_mode"],
             "purchase_orders": ["id", "po_no", "distributor_id", "created_at", "po_date", "invoice_ref"],
             "customers": ["id", "name", "mobile", "phone", "created_at"],
             "distributors": ["id", "name", "mobile", "phone", "created_at"],

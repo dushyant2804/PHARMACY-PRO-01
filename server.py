@@ -11081,6 +11081,52 @@ async def _dashboard_purchase_return_summary(start: Optional[str] = None, end: O
 
 
 # ---------------- Dashboard & Reports ----------------
+def _invoice_reporting_date(invoice: dict) -> str:
+    """Business date for an invoice; creation time is only a legacy fallback."""
+    return str(invoice.get("invoice_date") or invoice.get("date") or invoice.get("created_at") or "")[:10]
+
+
+def _invoice_in_date_range(invoice: dict, start: Optional[str], end: Optional[str]) -> bool:
+    day = _invoice_reporting_date(invoice)
+    return bool(day) and (not start or day >= start) and (not end or day <= end)
+
+
+async def _load_invoices_for_business_date_range(start: Optional[str] = None, end: Optional[str] = None) -> List[dict]:
+    """Load invoices by business date efficiently, with created_at fallback for legacy invoices."""
+    if not start and not end:
+        return await db.invoices.find({}, {"_id": 0}).to_list(5000)
+
+    invoice_date_query = {}
+    created_at_query = {}
+    if start:
+        invoice_date_query["$gte"] = start
+        created_at_query["$gte"] = start + "T00:00:00"
+    if end:
+        invoice_date_query["$lte"] = end + "T23:59:59"
+        next_day = (datetime.fromisoformat(end).date() + timedelta(days=1)).isoformat()
+        created_at_query["$lt"] = next_day + "T00:00:00"
+
+    business_date_rows = await db.invoices.find(
+        {"invoice_date": invoice_date_query}, {"_id": 0}
+    ).to_list(5000)
+    legacy_date_rows = await db.invoices.find(
+        {"created_at": created_at_query}, {"_id": 0}
+    ).to_list(5000)
+
+    unique = {}
+    for invoice in business_date_rows + legacy_date_rows:
+        key = str(
+            invoice.get("id")
+            or invoice.get("invoice_number")
+            or (invoice.get("created_at"), _invoice_reporting_date(invoice), invoice.get("total"))
+        )
+        unique[key] = invoice
+    return [
+        invoice for invoice in unique.values()
+        if _invoice_in_date_range(invoice, start, end)
+    ]
+
+
 @api_router.get("/dashboard/summary")
 async def dashboard_summary(
     start: Optional[str] = None,
@@ -11097,7 +11143,8 @@ async def dashboard_summary(
         if end:
             q["created_at"]["$lte"] = end
 
-    today = datetime.now(timezone.utc).date()
+    # PharmacyOS invoice dates use India local time (IST), not UTC.
+    today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).date()
     current_month = today.month
     current_year = today.year
 
@@ -11117,23 +11164,36 @@ async def dashboard_summary(
     customer_outstanding_today = 0
     customer_outstanding_month = 0
 
-    # SALES
-    invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
+    # SALES: report by the invoice business date, not the record creation timestamp.
+    invoices = await _load_invoices_for_business_date_range(start, end)
 
     total_sales = 0
+    invoice_gross_profit = 0.0
 
     for i in invoices:
         amt = float(i.get("total", 0))
         total_sales += amt
 
+        invoice_profit = 0.0
+        for line in (i.get("items") or []):
+            quantity = _safe_float(line.get("units_dispensed", line.get("quantity", 0)))
+            revenue = _safe_float(line.get("line_total", line.get("net_amount", _safe_float(line.get("mrp")) * quantity)))
+            cost = _safe_float(line.get("purchase_cost"), -1)
+            if cost < 0:
+                cost = _safe_float(line.get("purchase_rate", line.get("purchase_price", 0))) * quantity
+            invoice_profit += revenue - cost
+        invoice_gross_profit += invoice_profit
+
         try:
-            dt = datetime.fromisoformat(i["created_at"]).date()
+            dt = datetime.fromisoformat(_invoice_reporting_date(i)).date()
 
             if dt == today:
                 sales_today += amt
+                profit_today += invoice_profit
 
             if dt.month == current_month and dt.year == current_year:
                 sales_month += amt
+                profit_month += invoice_profit
 
         except Exception:
             pass
@@ -11162,9 +11222,9 @@ async def dashboard_summary(
         except Exception:
             pass
 
-    profit = total_sales - total_expenses
-    profit_today = sales_today - expenses_today
-    profit_month = sales_month - expenses_month
+    profit = invoice_gross_profit - total_expenses
+    profit_today -= expenses_today
+    profit_month -= expenses_month
 
     # STOCK
     medicines = await db.medicines.find({}, {"_id": 0}).to_list(5000)
@@ -11273,26 +11333,32 @@ async def dashboard_summary(
     customer_outstanding = sum(max(0.0, balance) for balance in customer_balances.values())
 
     # DISTRIBUTOR OUTSTANDING
+    # Use the same canonical, deduplicated ledger pipeline as the distributor page.
     distributors = await db.distributors.find({}, {"_id": 0}).to_list(1000)
-
-    distributor_outstanding = 0
-
-    for d in distributors:
-
-        txns = await db.distributor_transactions.find(
-            {"distributor_id": d["id"]},
-            {"_id": 0}
-        ).to_list(1000)
-
-        bal = _current_distributor_balance(d, txns)
-
-        if bal > 0:
-            distributor_outstanding += bal
-
+    all_distributor_transactions = await db.distributor_transactions.find(
+        {}, {"_id": 0}
+    ).to_list(10000)
     purchase_orders = await db.purchase_orders.find(
-        {},
-        {"_id": 0}
-    ).to_list(5000)
+        {}, {"_id": 0}
+    ).to_list(10000)
+
+    distributor_outstanding = 0.0
+    for distributor in distributors:
+        distributor_id = str(distributor.get("id") or "").strip()
+        if not distributor_id:
+            continue
+        canonical_txns = await _canonical_distributor_ledger_transactions(
+            distributor=distributor,
+            requested_id=distributor_id,
+            raw_transactions=all_distributor_transactions,
+            purchase_orders=purchase_orders,
+        )
+        ledger_txns = _final_distributor_ledger_rows(canonical_txns, distributor_id)
+        # Reuse the same opening-balance deduplication and transaction rules
+        # used by the distributor ledger itself.
+        balance = _current_distributor_balance(distributor, ledger_txns)
+        if balance > 0:
+            distributor_outstanding += balance
 
     total_purchase_amount = sum(
         float(po.get("grand_total", 0))
@@ -11365,14 +11431,7 @@ async def dashboard_summary(
     
 @api_router.get("/reports/sales")
 async def sales_report(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
-    q = {}
-    if start or end:
-        q["created_at"] = {}
-        if start:
-            q["created_at"]["$gte"] = start
-        if end:
-            q["created_at"]["$lte"] = end + "T23:59:59"
-    invoices = await db.invoices.find(q, {"_id": 0}).to_list(5000)
+    invoices = await _load_invoices_for_business_date_range(start, end)
     medicine_ids = {item.get("medicine_id") for invoice in invoices for item in invoice.get("items", []) if item.get("medicine_id")}
     medicines = await db.medicines.find({"id": {"$in": list(medicine_ids)}}, {"_id": 0, "id": 1, "purchase_price": 1}).to_list(len(medicine_ids) or 1)
     costs = {medicine.get("id"): _safe_float(medicine.get("purchase_price")) for medicine in medicines}
@@ -11385,7 +11444,7 @@ async def sales_report(start: Optional[str] = None, end: Optional[str] = None, u
         total_sales += invoice_total
         total_gst += _safe_float(invoice.get("gst_total", invoice.get("total_gst", 0)))
         total_discount += _safe_float(invoice.get("bill_discount", invoice.get("discount", 0)))
-        day = str(invoice.get("created_at") or "")[:10]
+        day = _invoice_reporting_date(invoice)
         if day:
             daily[day] += invoice_total
             monthly[day[:7]] += invoice_total
@@ -11856,7 +11915,7 @@ async def _invoice_item_profit_rows() -> Tuple[List[dict], dict]:
     by_id = {m.get("id"): m for m in medicines}
     rows = []
     for invoice in invoices:
-        sold_on = _analytics_date(invoice.get("created_at") or invoice.get("invoice_date") or invoice.get("date"))
+        sold_on = _analytics_date(invoice.get("invoice_date") or invoice.get("date") or invoice.get("created_at"))
         for item in invoice.get("items", []):
             qty = _invoice_item_quantity(item)
             revenue = _safe_float(item.get("line_total", item.get("net_amount", item.get("mrp", 0) * qty)))
@@ -16403,7 +16462,7 @@ async def _daily_closing_expected(closing_date: str, opening_cash: float = 0) ->
         await invoice_collection.find({}, {"_id": 0}).to_list(5000)
         if invoice_collection else []
     )
-    invoices = [row for row in invoices if str(row.get("created_at", "")).startswith(closing_date)]
+    invoices = [row for row in invoices if _invoice_reporting_date(row) == closing_date]
     expenses = (
         await expense_collection.find({"date": closing_date}, {"_id": 0}).to_list(2000)
         if expense_collection else []
