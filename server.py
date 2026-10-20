@@ -11091,6 +11091,41 @@ def _invoice_in_date_range(invoice: dict, start: Optional[str], end: Optional[st
     return bool(day) and (not start or day >= start) and (not end or day <= end)
 
 
+async def _load_invoices_for_business_date_range(start: Optional[str] = None, end: Optional[str] = None) -> List[dict]:
+    """Load invoices by business date efficiently, with created_at fallback for legacy invoices."""
+    if not start and not end:
+        return await db.invoices.find({}, {"_id": 0}).to_list(5000)
+
+    invoice_date_query = {}
+    created_at_query = {}
+    if start:
+        invoice_date_query["$gte"] = start
+        created_at_query["$gte"] = start + "T00:00:00"
+    if end:
+        invoice_date_query["$lte"] = end + "T23:59:59"
+        created_at_query["$lte"] = end + "T23:59:59"
+
+    business_date_rows = await db.invoices.find(
+        {"invoice_date": invoice_date_query}, {"_id": 0}
+    ).to_list(5000)
+    legacy_date_rows = await db.invoices.find(
+        {"created_at": created_at_query}, {"_id": 0}
+    ).to_list(5000)
+
+    unique = {}
+    for invoice in business_date_rows + legacy_date_rows:
+        key = str(
+            invoice.get("id")
+            or invoice.get("invoice_number")
+            or (invoice.get("created_at"), _invoice_reporting_date(invoice), invoice.get("total"))
+        )
+        unique[key] = invoice
+    return [
+        invoice for invoice in unique.values()
+        if _invoice_in_date_range(invoice, start, end)
+    ]
+
+
 @api_router.get("/dashboard/summary")
 async def dashboard_summary(
     start: Optional[str] = None,
@@ -11129,8 +11164,7 @@ async def dashboard_summary(
     customer_outstanding_month = 0
 
     # SALES: report by the invoice business date, not the record creation timestamp.
-    all_invoices = await db.invoices.find({}, {"_id": 0}).to_list(5000)
-    invoices = [invoice for invoice in all_invoices if _invoice_in_date_range(invoice, start, end)]
+    invoices = await _load_invoices_for_business_date_range(start, end)
 
     total_sales = 0
     invoice_gross_profit = 0.0
