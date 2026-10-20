@@ -13,8 +13,22 @@ class Cursor:
 class Collection:
     def __init__(self, rows): self.rows = rows
     def find(self, query=None, projection=None):
-        rows = self.rows
-        if query and "id" in query and isinstance(query["id"], dict): rows = [r for r in rows if r.get("id") in query["id"].get("$in", [])]
+        def matches(row, criteria):
+            for field, expected in (criteria or {}).items():
+                actual = row.get(field)
+                if isinstance(expected, dict):
+                    for operator, value in expected.items():
+                        if operator == "$in" and actual not in value: return False
+                        if operator == "$gte" and (actual is None or actual < value): return False
+                        if operator == "$gt" and (actual is None or actual <= value): return False
+                        if operator == "$lte" and (actual is None or actual > value): return False
+                        if operator == "$lt" and (actual is None or actual >= value): return False
+                        if operator == "$eq" and actual != value: return False
+                        if operator == "$ne" and actual == value: return False
+                elif actual != expected:
+                    return False
+            return True
+        rows = [row for row in self.rows if matches(row, query or {})]
         return Cursor(rows)
 
 
