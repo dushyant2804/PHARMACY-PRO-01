@@ -52,6 +52,45 @@ class ReportsIntelligenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["monthly_profit_trend"][0]["profit"], 16.01)
         self.assertEqual(result["top_profit_medicines"][0]["medicine"], "Unknown")
 
+    async def test_backdated_invoices_use_invoice_date_for_sales_and_dashboard_profit(self):
+        today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).date()
+        backdated = (today - timedelta(days=3)).isoformat()
+        today_key = today.isoformat()
+        invoices = Collection([
+            {
+                "id": "backdated-created-today",
+                "invoice_date": backdated,
+                "created_at": today_key + "T09:00:00+00:00",
+                "total": 100,
+                "items": [{"medicine_id": "m1", "name": "A", "quantity": 1, "line_total": 100, "purchase_cost": 70}],
+            },
+            {
+                "id": "today-created-yesterday",
+                "invoice_date": today_key,
+                "created_at": backdated + "T09:00:00+00:00",
+                "total": 50,
+                "items": [{"medicine_id": "m1", "name": "A", "quantity": 1, "line_total": 50, "purchase_cost": 20}],
+            },
+        ])
+        empty = Collection([])
+        db = SimpleNamespace(
+            invoices=invoices, expenses=empty, medicines=empty,
+            customer_transactions=empty, distributors=empty,
+            distributor_transactions=empty, purchase_orders=empty,
+            purchase_returns=empty, regular_patients=empty,
+        )
+        with patch("server.db", db):
+            report = await sales_report(start=today_key, end=today_key, user={})
+            dashboard = await dashboard_summary(user={})
+
+        self.assertEqual(report["total_sales"], 50.0)
+        self.assertEqual(report["invoice_count"], 1)
+        self.assertEqual(report["daily"], [{"date": today_key, "total": 50.0}])
+        self.assertEqual(dashboard["sales_today"], 50.0)
+        self.assertEqual(dashboard["profit_today"], 30.0)
+        self.assertEqual(dashboard["sales_total"], 150.0)
+        self.assertEqual(dashboard["profit_total"], 60.0)
+
     async def test_expiry_value_at_risk(self):
         medicines = Collection([{"id":"expired","purchased_units":3,"sold_units":1,"purchase_price":10.125,"mrp":20,"expiry_date":iso(2)}, {"id":"near","purchased_units":1,"sold_units":0,"purchase_price":5.555,"mrp":10,"expiry_date":iso(-20)}])
         with patch("server.db", SimpleNamespace(medicines=medicines)):
