@@ -11354,10 +11354,9 @@ async def dashboard_summary(
             purchase_orders=purchase_orders,
         )
         ledger_txns = _final_distributor_ledger_rows(canonical_txns, distributor_id)
-        balance = 0.0
-        for txn in ledger_txns:
-            if isinstance(txn, dict):
-                balance, _bucket = _apply_distributor_transaction(balance, txn)
+        # Reuse the same opening-balance deduplication and transaction rules
+        # used by the distributor ledger itself.
+        balance = _current_distributor_balance(distributor, ledger_txns)
         if balance > 0:
             distributor_outstanding += balance
 
