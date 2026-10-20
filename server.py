@@ -11103,7 +11103,8 @@ async def _load_invoices_for_business_date_range(start: Optional[str] = None, en
         created_at_query["$gte"] = start + "T00:00:00"
     if end:
         invoice_date_query["$lte"] = end + "T23:59:59"
-        created_at_query["$lte"] = end + "T23:59:59"
+        next_day = (datetime.fromisoformat(end).date() + timedelta(days=1)).isoformat()
+        created_at_query["$lt"] = next_day + "T00:00:00"
 
     business_date_rows = await db.invoices.find(
         {"invoice_date": invoice_date_query}, {"_id": 0}
