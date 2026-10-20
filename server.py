@@ -11107,7 +11107,8 @@ async def dashboard_summary(
         if end:
             q["created_at"]["$lte"] = end
 
-    today = datetime.now(timezone.utc).date()
+    # PharmacyOS invoice dates use India local time (IST), not UTC.
+    today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).date()
     current_month = today.month
     current_year = today.year
 
@@ -11297,26 +11298,33 @@ async def dashboard_summary(
     customer_outstanding = sum(max(0.0, balance) for balance in customer_balances.values())
 
     # DISTRIBUTOR OUTSTANDING
+    # Use the same canonical, deduplicated ledger pipeline as the distributor page.
     distributors = await db.distributors.find({}, {"_id": 0}).to_list(1000)
-
-    distributor_outstanding = 0
-
-    for d in distributors:
-
-        txns = await db.distributor_transactions.find(
-            {"distributor_id": d["id"]},
-            {"_id": 0}
-        ).to_list(1000)
-
-        bal = _current_distributor_balance(d, txns)
-
-        if bal > 0:
-            distributor_outstanding += bal
-
+    all_distributor_transactions = await db.distributor_transactions.find(
+        {}, {"_id": 0}
+    ).to_list(10000)
     purchase_orders = await db.purchase_orders.find(
-        {},
-        {"_id": 0}
-    ).to_list(5000)
+        {}, {"_id": 0}
+    ).to_list(10000)
+
+    distributor_outstanding = 0.0
+    for distributor in distributors:
+        distributor_id = str(distributor.get("id") or "").strip()
+        if not distributor_id:
+            continue
+        canonical_txns = await _canonical_distributor_ledger_transactions(
+            distributor=distributor,
+            requested_id=distributor_id,
+            raw_transactions=all_distributor_transactions,
+            purchase_orders=purchase_orders,
+        )
+        ledger_txns = _final_distributor_ledger_rows(canonical_txns, distributor_id)
+        balance = 0.0
+        for txn in ledger_txns:
+            if isinstance(txn, dict):
+                balance, _bucket = _apply_distributor_transaction(balance, txn)
+        if balance > 0:
+            distributor_outstanding += balance
 
     total_purchase_amount = sum(
         float(po.get("grand_total", 0))
