@@ -14639,6 +14639,7 @@ def _normalize_daily_sale(entry: dict) -> dict:
     )
 
     gross = _money(cash + upi + card + outstanding)
+    total_collection = _money(item.get("total_collection", cash + upi + card))
 
     notes = item.get("notes", [])
 
@@ -14665,6 +14666,7 @@ def _normalize_daily_sale(entry: dict) -> dict:
         "outstanding_sales": outstanding,
         "gross_sales": gross,
         "total_paid": _money(cash + upi + card),
+        "total_collection": total_collection,
         "total_outstanding": outstanding,
         "total_amount": gross,
         "notes": notes,
@@ -14763,6 +14765,114 @@ async def _create_register_audit(
 # =============================================================================
 # REGISTER API
 # =============================================================================
+
+@api_router.get("/register/financial-summary")
+async def get_register_financial_summary(
+    start_date: str,
+    end_date: str,
+    user: dict = Depends(get_current_user),
+):
+    """Financial report sourced only from Register daily sales and expenses."""
+    try:
+        start_day = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_day = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="start_date and end_date must use YYYY-MM-DD format")
+
+    if end_day < start_day:
+        raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
+
+    sales = await db.daily_sales.find(
+        {"sale_date": {"$gte": start_date, "$lte": end_date}},
+        {"_id": 0},
+    ).to_list(10000)
+    expenses = await db.expenses.find(
+        {"date": {"$gte": start_date, "$lte": end_date}},
+        {"_id": 0},
+    ).to_list(10000)
+
+    daily = {}
+    for raw_sale in sales:
+        sale = _normalize_daily_sale(raw_sale)
+        date = sale.get("sale_date")
+        if not date:
+            continue
+        daily[date] = {
+            "date": date,
+            "cash_sales": _money(sale.get("cash_sales", 0)),
+            "upi_sales": _money(sale.get("upi_sales", 0)),
+            "card_sales": _money(sale.get("card_sales", 0)),
+            "credit_sales": _money(sale.get("outstanding_sales", 0)),
+            "gross_sales": _money(sale.get("gross_sales", 0)),
+            "total_collection": _money(sale.get("total_collection", sale.get("cash_sales", 0) + sale.get("upi_sales", 0) + sale.get("card_sales", 0))),
+            "total_expenses": 0,
+        }
+
+    for expense in expenses:
+        date = expense.get("date")
+        if not date:
+            continue
+        row = daily.setdefault(date, {
+            "date": date,
+            "cash_sales": 0,
+            "upi_sales": 0,
+            "card_sales": 0,
+            "credit_sales": 0,
+            "gross_sales": 0,
+            "total_collection": 0,
+            "total_expenses": 0,
+        })
+        row["total_expenses"] = _money(row["total_expenses"] + _money(expense.get("amount", 0)))
+
+    daily_rows = sorted(daily.values(), key=lambda row: row["date"])
+    for row in daily_rows:
+        row["net_collection"] = _money(row["total_collection"] - row["total_expenses"])
+        row["profit"] = _money(row["gross_sales"] - row["total_expenses"])
+
+    monthly = {}
+    for row in daily_rows:
+        month_key = row["date"][:7]
+        month = monthly.setdefault(month_key, {
+            "month_key": month_key,
+            "gross_sales": 0,
+            "total_collection": 0,
+            "total_expenses": 0,
+            "working_days": 0,
+        })
+        month["gross_sales"] = _money(month["gross_sales"] + row["gross_sales"])
+        month["total_collection"] = _money(month["total_collection"] + row["total_collection"])
+        month["total_expenses"] = _money(month["total_expenses"] + row["total_expenses"])
+        if row["gross_sales"] or row["total_collection"] or row["total_expenses"]:
+            month["working_days"] += 1
+
+    monthly_rows = []
+    for month in sorted(monthly):
+        row = monthly[month]
+        row["net_profit"] = _money(row["gross_sales"] - row["total_expenses"])
+        row["collection_profit"] = _money(row["total_collection"] - row["total_expenses"])
+        row["month_label"] = datetime.strptime(month, "%Y-%m").strftime("%b %Y")
+        monthly_rows.append(row)
+
+    gross_sales = _money(sum(row.get("gross_sales", 0) for row in daily_rows))
+    total_collection = _money(sum(row.get("total_collection", 0) for row in daily_rows))
+    total_expenses = _money(sum(row.get("total_expenses", 0) for row in daily_rows))
+    working_days = len([row for row in sales if row.get("sale_date")])
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "summary": {
+            "gross_sales": gross_sales,
+            "total_collection": total_collection,
+            "total_expenses": total_expenses,
+            "net_profit": _money(gross_sales - total_expenses),
+            "collection_profit": _money(total_collection - total_expenses),
+            "average_daily_sales": _money(gross_sales / working_days) if working_days else 0,
+            "working_days": working_days,
+        },
+        "daily": daily_rows,
+        "monthly": monthly_rows,
+    }
+
 
 @api_router.get("/register/years")
 async def list_register_financial_years(
@@ -14876,6 +14986,11 @@ async def get_register_financial_year(
             cash + upi + card + credit
         )
 
+        month_collection = _money(sum(
+            _money(row.get("total_collection", _money(row.get("cash_sales", 0)) + _money(row.get("upi_sales", 0)) + _money(row.get("card_sales", 0))))
+            for row in month_sales
+        ))
+
         months.append({
             "month_key": month_key,
             "month_label": datetime(
@@ -14899,10 +15014,10 @@ async def get_register_financial_year(
             "card_sales": card,
             "credit_sales": credit,
             "gross_sales": gross,
+            "total_collection": month_collection,
             "total_expenses": expense_total,
-            "net_profit": _money(
-                gross - expense_total
-            ),
+            "net_profit": _money(gross - expense_total),
+            "collection_profit": _money(month_collection - expense_total),
         })
 
 
@@ -14927,12 +15042,19 @@ async def get_register_financial_year(
             sum(row["gross_sales"] for row in months)
         ),
 
+        "total_collection": _money(
+            sum(row.get("total_collection", 0) for row in months)
+        ),
+
         "total_expenses": _money(
             sum(row["total_expenses"] for row in months)
         ),
 
         "net_profit": _money(
             sum(row["net_profit"] for row in months)
+        ),
+        "collection_profit": _money(
+            sum(row.get("collection_profit", 0) for row in months)
         ),
     }
 
@@ -14950,86 +15072,6 @@ async def get_register_financial_year(
 
         "months": months,
     }
-
-
-@api_router.get("/register/{financial_year}/{month_key}")
-async def get_register_month(
-    financial_year: str,
-    month_key: str,
-    user: dict = Depends(get_current_user),
-):
-    try:
-        month_date = datetime.strptime(
-            month_key,
-            "%Y-%m"
-        )
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="month_key must use YYYY-MM format",
-        )
-
-    expected_fy = _financial_year_for_date(
-        month_date.date()
-    )
-
-    if financial_year != expected_fy:
-        raise HTTPException(
-            status_code=400,
-            detail="Month does not belong to financial year",
-        )
-
-    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-
-    if month_key == current_month:
-        status = "open"
-    elif month_key < current_month:
-        status = "closed"
-    else:
-        status = "future"
-
-    unlock_expires_at = None
-
-    if status == "closed":
-       unlocks = await db.register_unlocks.find(
-        {
-            "financial_year": financial_year,
-            "month_key": month_key,
-            "user_id": user.get("id"),
-        },
-        {
-            "_id": 0
-        }
-    ).sort(
-        "created_at",
-        -1,
-    ).to_list(100)
-
-    now = datetime.now(timezone.utc)
-
-    for unlock in unlocks:
-        expiry = unlock.get("expires_at")
-
-        if not expiry:
-           continue
-
-        try:
-           expiry_time = datetime.fromisoformat(
-               expiry
-           )
-
-           if expiry_time.tzinfo is None:
-               expiry_time = expiry_time.replace(
-                   tzinfo=timezone.utc
-               )
-
-        except Exception:
-            continue
-
-        if now < expiry_time:
-            status = "open"
-            unlock_expires_at = expiry
-            break
 
 
 @api_router.get("/register/{financial_year}/{month_key}")
@@ -15204,6 +15246,7 @@ async def get_register_month(
                 "card_sales": 0,
                 "credit_sales": 0,
                 "gross_sales": 0,
+                "total_collection": 0,
                 "expenses": 0,
                 "net": 0,
                 "has_closing": False,
@@ -15245,6 +15288,9 @@ async def get_register_month(
 
         row["gross_sales"] = _money(
             sale.get("gross_sales", 0)
+        )
+        row["total_collection"] = _money(
+            sale.get("total_collection", row["cash_sales"] + row["upi_sales"] + row["card_sales"])
         )
 
         if sale.get("notes"):
@@ -15291,7 +15337,7 @@ async def get_register_month(
 
     for row in days.values():
         row["net"] = _money(
-            row.get("gross_sales", 0)
+            row.get("total_collection", 0)
             - row.get("expenses", 0)
         )
 
@@ -15330,10 +15376,15 @@ async def get_register_month(
     total_expenses = _money(
         sum(row.get("expenses", 0) for row in day_rows)
     )
+    total_collection = _money(
+        sum(row.get("total_collection", 0) for row in day_rows)
+    )
 
     net_collection = _money(
-        gross_sales - total_expenses
+        total_collection - total_expenses
     )
+    sales_profit = _money(gross_sales - total_expenses)
+    collection_profit = _money(total_collection - total_expenses)
 
     # ---------------------------------------------------------
     # Highest sales day
@@ -15380,8 +15431,8 @@ async def get_register_month(
     # ---------------------------------------------------------
 
     average_daily_sales = _money(
-        gross_sales / len(day_rows)
-    ) if day_rows else 0
+        gross_sales / len(sales)
+    ) if sales else 0
 
     # ---------------------------------------------------------
     # Final response
@@ -15400,15 +15451,17 @@ async def get_register_month(
             "card_sales": total_card,
             "credit_sales": total_credit,
             "gross_sales": gross_sales,
+            "total_collection": total_collection,
             "total_expenses": total_expenses,
-            "net_profit": net_collection,
+            "net_profit": sales_profit,
+            "collection_profit": collection_profit,
 
             "highest_sales_day": highest_sales_day,
             "highest_expense_day": highest_expense_day,
 
             "average_daily_sales": average_daily_sales,
 
-            "working_days": len(day_rows),
+            "working_days": len(sales),
 
             "remaining_days": 0,
 
@@ -15523,8 +15576,13 @@ async def get_register_day(
         )
     )
 
+    total_collection = _money(
+        sale.get("total_collection", cash_sales + upi_sales + card_sales)
+        if sale else 0
+    )
+
     net_collection = _money(
-        gross_sales - total_expenses
+        total_collection - total_expenses
     )
 
     # ---------------------------------------------------------
@@ -15593,6 +15651,8 @@ async def get_register_day(
         "credit_sales": credit_sales,
 
         "gross_sales": gross_sales,
+
+        "total_collection": total_collection,
 
         "total_expenses": total_expenses,
 
@@ -15679,6 +15739,21 @@ async def save_register_day(
 
         "card_sales": _money(
             payload.get("card_sales", 0)
+        ),
+
+        "total_collection": _money(
+            payload.get(
+                "total_collection",
+                existing.get("total_collection",
+                    _money(payload.get("cash_sales", 0))
+                    + _money(payload.get("upi_sales", 0))
+                    + _money(payload.get("card_sales", 0))
+                ) if existing else (
+                    _money(payload.get("cash_sales", 0))
+                    + _money(payload.get("upi_sales", 0))
+                    + _money(payload.get("card_sales", 0))
+                ),
+            )
         ),
 
         "outstanding_sales": _money(
@@ -15872,6 +15947,7 @@ async def get_register_month_summary(
     upi_sales = 0
     card_sales = 0
     credit_sales = 0
+    total_collection = 0
 
     highest_sales_day = None
     highest_sales_amount = 0
@@ -15883,6 +15959,10 @@ async def get_register_month_summary(
         upi_sales += row.get("upi_sales", 0)
         card_sales += row.get("card_sales", 0)
         credit_sales += row.get("outstanding_sales", 0)
+        total_collection += _money(row.get(
+            "total_collection",
+            row.get("cash_sales", 0) + row.get("upi_sales", 0) + row.get("card_sales", 0),
+        ))
 
         if row.get("gross_sales", 0) > highest_sales_amount:
             highest_sales_amount = row.get("gross_sales", 0)
@@ -15928,10 +16008,14 @@ async def get_register_month_summary(
             "credit_sales": _money(credit_sales),
 
             "gross_sales": gross_sales,
+            "total_collection": _money(total_collection),
             "total_expenses": _money(total_expenses),
 
             "net_profit": _money(
                 gross_sales - total_expenses
+            ),
+            "collection_profit": _money(
+                total_collection - total_expenses
             ),
 
             "highest_sales_day": highest_sales_day,
