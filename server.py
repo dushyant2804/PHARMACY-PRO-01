@@ -14639,6 +14639,7 @@ def _normalize_daily_sale(entry: dict) -> dict:
     )
 
     gross = _money(cash + upi + card + outstanding)
+    total_collection = _money(item.get("total_collection", cash + upi + card))
 
     notes = item.get("notes", [])
 
@@ -14665,6 +14666,7 @@ def _normalize_daily_sale(entry: dict) -> dict:
         "outstanding_sales": outstanding,
         "gross_sales": gross,
         "total_paid": _money(cash + upi + card),
+        "total_collection": total_collection,
         "total_outstanding": outstanding,
         "total_amount": gross,
         "notes": notes,
@@ -15523,8 +15525,13 @@ async def get_register_day(
         )
     )
 
+    total_collection = _money(
+        sale.get("total_collection", cash_sales + upi_sales + card_sales)
+        if sale else 0
+    )
+
     net_collection = _money(
-        gross_sales - total_expenses
+        total_collection - total_expenses
     )
 
     # ---------------------------------------------------------
@@ -15593,6 +15600,8 @@ async def get_register_day(
         "credit_sales": credit_sales,
 
         "gross_sales": gross_sales,
+
+        "total_collection": total_collection,
 
         "total_expenses": total_expenses,
 
@@ -15679,6 +15688,21 @@ async def save_register_day(
 
         "card_sales": _money(
             payload.get("card_sales", 0)
+        ),
+
+        "total_collection": _money(
+            payload.get(
+                "total_collection",
+                existing.get("total_collection",
+                    _money(payload.get("cash_sales", 0))
+                    + _money(payload.get("upi_sales", 0))
+                    + _money(payload.get("card_sales", 0))
+                ) if existing else (
+                    _money(payload.get("cash_sales", 0))
+                    + _money(payload.get("upi_sales", 0))
+                    + _money(payload.get("card_sales", 0))
+                ),
+            )
         ),
 
         "outstanding_sales": _money(
@@ -15872,6 +15896,7 @@ async def get_register_month_summary(
     upi_sales = 0
     card_sales = 0
     credit_sales = 0
+    total_collection = 0
 
     highest_sales_day = None
     highest_sales_amount = 0
@@ -15883,6 +15908,10 @@ async def get_register_month_summary(
         upi_sales += row.get("upi_sales", 0)
         card_sales += row.get("card_sales", 0)
         credit_sales += row.get("outstanding_sales", 0)
+        total_collection += _money(row.get(
+            "total_collection",
+            row.get("cash_sales", 0) + row.get("upi_sales", 0) + row.get("card_sales", 0),
+        ))
 
         if row.get("gross_sales", 0) > highest_sales_amount:
             highest_sales_amount = row.get("gross_sales", 0)
@@ -15928,10 +15957,14 @@ async def get_register_month_summary(
             "credit_sales": _money(credit_sales),
 
             "gross_sales": gross_sales,
+            "total_collection": _money(total_collection),
             "total_expenses": _money(total_expenses),
 
             "net_profit": _money(
                 gross_sales - total_expenses
+            ),
+            "collection_profit": _money(
+                total_collection - total_expenses
             ),
 
             "highest_sales_day": highest_sales_day,
