@@ -14878,6 +14878,11 @@ async def get_register_financial_year(
             cash + upi + card + credit
         )
 
+        month_collection = _money(sum(
+            _money(row.get("total_collection", _money(row.get("cash_sales", 0)) + _money(row.get("upi_sales", 0)) + _money(row.get("card_sales", 0))))
+            for row in month_sales
+        ))
+
         months.append({
             "month_key": month_key,
             "month_label": datetime(
@@ -14901,10 +14906,10 @@ async def get_register_financial_year(
             "card_sales": card,
             "credit_sales": credit,
             "gross_sales": gross,
+            "total_collection": month_collection,
             "total_expenses": expense_total,
-            "net_profit": _money(
-                gross - expense_total
-            ),
+            "net_profit": _money(gross - expense_total),
+            "collection_profit": _money(month_collection - expense_total),
         })
 
 
@@ -14929,12 +14934,19 @@ async def get_register_financial_year(
             sum(row["gross_sales"] for row in months)
         ),
 
+        "total_collection": _money(
+            sum(row.get("total_collection", 0) for row in months)
+        ),
+
         "total_expenses": _money(
             sum(row["total_expenses"] for row in months)
         ),
 
         "net_profit": _money(
             sum(row["net_profit"] for row in months)
+        ),
+        "collection_profit": _money(
+            sum(row.get("collection_profit", 0) for row in months)
         ),
     }
 
@@ -15206,6 +15218,7 @@ async def get_register_month(
                 "card_sales": 0,
                 "credit_sales": 0,
                 "gross_sales": 0,
+                "total_collection": 0,
                 "expenses": 0,
                 "net": 0,
                 "has_closing": False,
@@ -15247,6 +15260,9 @@ async def get_register_month(
 
         row["gross_sales"] = _money(
             sale.get("gross_sales", 0)
+        )
+        row["total_collection"] = _money(
+            sale.get("total_collection", row["cash_sales"] + row["upi_sales"] + row["card_sales"])
         )
 
         if sale.get("notes"):
@@ -15293,7 +15309,7 @@ async def get_register_month(
 
     for row in days.values():
         row["net"] = _money(
-            row.get("gross_sales", 0)
+            row.get("total_collection", 0)
             - row.get("expenses", 0)
         )
 
@@ -15332,10 +15348,15 @@ async def get_register_month(
     total_expenses = _money(
         sum(row.get("expenses", 0) for row in day_rows)
     )
+    total_collection = _money(
+        sum(row.get("total_collection", 0) for row in day_rows)
+    )
 
     net_collection = _money(
-        gross_sales - total_expenses
+        total_collection - total_expenses
     )
+    sales_profit = _money(gross_sales - total_expenses)
+    collection_profit = _money(total_collection - total_expenses)
 
     # ---------------------------------------------------------
     # Highest sales day
@@ -15402,8 +15423,10 @@ async def get_register_month(
             "card_sales": total_card,
             "credit_sales": total_credit,
             "gross_sales": gross_sales,
+            "total_collection": total_collection,
             "total_expenses": total_expenses,
-            "net_profit": net_collection,
+            "net_profit": sales_profit,
+            "collection_profit": collection_profit,
 
             "highest_sales_day": highest_sales_day,
             "highest_expense_day": highest_expense_day,
