@@ -15511,8 +15511,8 @@ async def get_register_month(
     # ---------------------------------------------------------
 
     average_daily_sales = _money(
-        gross_sales / len(day_rows)
-    ) if day_rows else 0
+        gross_sales / len(sales)
+    ) if sales else 0
 
     # ---------------------------------------------------------
     # Final response
@@ -15541,7 +15541,7 @@ async def get_register_month(
 
             "average_daily_sales": average_daily_sales,
 
-            "working_days": len(day_rows),
+            "working_days": len(sales),
 
             "remaining_days": 0,
 
